@@ -52,7 +52,9 @@ fun main() {
     eq(&t, "lower case digits", theme_parse_color("#abcdef", &c[0]) as i64, 1);
     eq(&t, "  value", c[0] as i64, 0xFFABCDEF);
     eq(&t, "no #", theme_parse_color("22C55E", &c[0]) as i64, 0);
-    eq(&t, "too short", theme_parse_color("#22C5", &c[0]) as i64, 0);
+    eq(&t, "#ARGB short form", theme_parse_color("#22C5", &c[0]) as i64, 1);
+    eq(&t, "  value", c[0] as i64, 0x2222CC55);
+    eq(&t, "five digits", theme_parse_color("#22C55", &c[0]) as i64, 0);
     eq(&t, "not hex", theme_parse_color("#22C5ZZ", &c[0]) as i64, 0);
 
     // a partial theme on the light base

@@ -200,6 +200,15 @@ Space around the node, on all sides; it counts in the parent's layout.
 Corner radius in pixels (boxes are square by default; buttons, inputs and
 checkboxes have a small default radius, -1 restores it).
 
+### `ui_rgb(text: str) -> i64`
+
+A colour written as text, for the ui_background / ui_color / ui_border family: "#RRGGBB" (opaque),
+"#AARRGGBB" (alpha first, like the 0xAARRGGBB numbers), or the short forms "#RGB" and "#ARGB".
+Anything else gives 0, which every colour setter reads as "none / inherit".
+
+  ui_background(&ui, box, ui_rgb("#1E3A8A"));
+  ui_color(&ui, title, ui_rgb("#FFF"));
+
 ### `ui_color(ui: ptr<Ui>, id: i32, argb: i64) -> bool`
 
 Text colour (0xAARRGGBB). It is inherited: set it on a box and everything

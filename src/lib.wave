@@ -51,7 +51,7 @@ import("./core")::{
     core_scroll_get, core_textarea, core_dropdown, core_dropdown_set, core_dropdown_get, core_dropdown_open, core_overlay, core_tooltip, core_left, core_menu, core_slider, core_slider_set, core_slider_get, core_radio, core_tab, core_progress, core_set_time, core_wake_ms, core_focus_next, core_activated, core_focused_msg, core_scroll_box_xy, core_scroll_h, core_scroll_set_x, core_scroll_get_x, core_style, core_layout, core_rect, core_set_pointer, core_hit, core_paint, core_changed, core_cmds,
     core_fe, core_theme, core_set_theme,
 };
-pub import("./theme")::{Theme, theme_light, theme_dark, theme_scale};
+pub import("./theme")::{Theme, theme_light, theme_dark, theme_scale, color_parse};
 pub import("./dirlist")::{DirList, dirlist_new, dirlist_free, dirlist_read, dirlist_count, dirlist_name, dirlist_is_dir, path_cwd, path_push, path_pop};
 pub import("./core")::{OVERLAY_AT, OVERLAY_BELOW, OVERLAY_ABOVE, OVERLAY_RIGHT, OVERLAY_MATCH_WIDTH, OVERLAY_FULL};
 import("./render")::{render};
@@ -312,6 +312,19 @@ pub fun ui_margin(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, i
 // Corner radius in pixels (boxes are square by default; buttons, inputs and
 // checkboxes have a small default radius, -1 restores it).
 pub fun ui_radius(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_RADIUS, px); }
+// A colour written as text, for the ui_background / ui_color / ui_border family: "#RRGGBB" (opaque),
+// "#AARRGGBB" (alpha first, like the 0xAARRGGBB numbers), or the short forms "#RGB" and "#ARGB".
+// Anything else gives 0, which every colour setter reads as "none / inherit".
+//
+//   ui_background(&ui, box, ui_rgb("#1E3A8A"));
+//   ui_color(&ui, title, ui_rgb("#FFF"));
+pub fun ui_rgb(text: str) -> i64 {
+    var c: array<u32, 1>;
+    c[0] = 0;
+    if (!color_parse(text, &c[0])) { return 0; }
+    return c[0] as i64;
+}
+
 // Text colour (0xAARRGGBB). It is inherited: set it on a box and everything
 // inside uses it unless a child sets its own.
 pub fun ui_color(ui: ptr<Ui>, id: i32, argb: i64) -> bool { return ui_style(ui, id, UI_P_COLOR, argb); }

@@ -162,7 +162,7 @@ while (running) {
 
 **스타일** (모두 노드 id를 받음): `ui_padding`, `ui_gap`, `ui_width`, `ui_height`, `ui_grow`,
 `ui_align`(`UI_START | UI_CENTER | UI_END | UI_STRETCH`), `ui_justify`(`UI_BETWEEN` 추가), `ui_direction`,
-`ui_background`, `ui_border`, `ui_margin`, `ui_radius`, `ui_color`(글자색).
+`ui_background`, `ui_border`, `ui_margin`, `ui_radius`, `ui_color`(글자색). 색은 `ui_rgb`로 글자로 쓸 수 있습니다: `ui_background(ui, box, ui_rgb("#1E3A8A"))` (`#RRGGBB`, `#AARRGGBB`, `#RGB`, `#ARGB`).
 `ui_layout(w, h)`가 트리를 배치하고, `ui_rect(id)`가 노드의 사각형을 읽습니다.
 
 **마우스.** `ui_click(x, y, mods)`는 맞힌 버튼 / 체크박스의 메시지 또는 `UI_NO_MSG`를 돌려주고, 입력창에 포커스를 주며 스크롤바 드래그를
@@ -262,7 +262,7 @@ Ui 안에 저장되는 정수(`ui_slider_get`으로 읽고 `ui_slider_set`으로
 
 ## 테스트
 
-`WUI_TASK=wtest`는 Wave 단위 테스트(`tests/core_test.wave`, 859개 검사: 레이아웃, 히트 테스트, 입력 편집과 선택, 그리기, 양방향 스크롤 상자,
+`WUI_TASK=wtest`는 Wave 단위 테스트(`tests/core_test.wave`, 891개 검사: 레이아웃, 히트 테스트, 입력 편집과 선택, 그리기, 양방향 스크롤 상자,
 스크롤바 드래그, 스크롤 키, 메뉴, 툴팁, 드롭다운, 오버레이, 슬라이더)를 실행합니다. `tests/dirlist_test.wave`(32개 검사)는 디렉터리 목록과 경로
 도우미를 확인하고, `winplat/`의 `cargo test`는 그 디렉터리 함수를 확인합니다. 테스트는 폰트가 없는 텍스트 엔진을 써서 글자 하나가 8px 너비,
 한 줄이 16px 높이입니다. `WUI_TASK=xtest`는 X11 백엔드 테스트(`tests/window_x11_test.wave`)를 실행합니다: 키와 수정 키 매핑, 텍스트 이벤트,

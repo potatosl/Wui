@@ -19,31 +19,12 @@ import("wjson")::{JsonDoc, Json, JsonWriter, JSON_STRICT, json_parse_bytes, json
                   json_is_string, json_is_number, json_as_str, json_i64_or, json_str_or, json_free, json_writer_new,
                   json_writer_free, json_writer_finish, json_begin_object, json_end_object, json_field_str,
                   json_field_i64, json_str_is_null};
-import("./theme")::{Theme, theme_light, theme_dark};
+import("./theme")::{Theme, theme_light, theme_dark, color_parse};
 import("./wjson_glue");                    // the one C symbol wjson wants (no C++ layer needed)
 
-fun hex_digit(c: u8) -> i32 {
-    if (c >= 48 && c <= 57) { return (c - 48) as i32; }
-    if (c >= 65 && c <= 70) { return (c - 55) as i32; }
-    if (c >= 97 && c <= 102) { return (c - 87) as i32; }
-    return -1;
-}
-
-// "#RRGGBB" (opaque) or "#AARRGGBB" -> 0xAARRGGBB. False when it is neither.
+// "#RRGGBB", "#AARRGGBB", "#RGB" or "#ARGB" -> 0xAARRGGBB (see color_parse). False when it is none of them.
 pub fun theme_parse_color(text: str, result: ptr<u32>) -> bool {
-    var p: ptr<u8> = text as ptr<u8>;
-    if (p[0] != 35) { return false; }
-    var n: i32 = 0;
-    var v: u32 = 0;
-    while (p[1 + n] != 0) {
-        var d: i32 = hex_digit(p[1 + n]);
-        if (d < 0 || n >= 8) { return false; }
-        v = (v << 4) | (d as u32);
-        n += 1;
-    }
-    if (n == 6) { result[0] = 0xFF000000 | v; return true; }
-    if (n == 8) { result[0] = v; return true; }
-    return false;
+    return color_parse(text, result);
 }
 
 // The colour at `key`: a "#..." string or a number; `cur` when it is missing or malformed.

@@ -159,3 +159,40 @@ pub fun theme_scale(t: ptr<Theme>, percent: i32) {
     t.font_size = scaled(t.font_size, percent);
 }
 
+fun hex_digit(c: u8) -> i32 {
+    if (c >= 48 && c <= 57) { return (c - 48) as i32; }
+    if (c >= 65 && c <= 70) { return (c - 55) as i32; }
+    if (c >= 97 && c <= 102) { return (c - 87) as i32; }
+    return -1;
+}
+
+// A colour written as text -> 0xAARRGGBB in result[0]. Accepts "#RRGGBB" (opaque), "#AARRGGBB" (alpha
+// first, like the 0xAARRGGBB numbers), and the short forms "#RGB" and "#ARGB" (each digit doubled:
+// "#F80" is "#FFFF8800"). Upper or lower case. False (result untouched) when it is none of these.
+pub fun color_parse(text: str, result: ptr<u32>) -> bool {
+    var p: ptr<u8> = text as ptr<u8>;
+    if (p[0] != 35) { return false; }
+    var n: i32 = 0;
+    var v: u32 = 0;
+    while (p[1 + n] != 0) {
+        var d: i32 = hex_digit(p[1 + n]);
+        if (d < 0 || n >= 8) { return false; }
+        v = (v << 4) | (d as u32);
+        n += 1;
+    }
+    if (n == 6) { result[0] = 0xFF000000 | v; return true; }
+    if (n == 8) { result[0] = v; return true; }
+    if (n == 3 || n == 4) {                            // short form: double every digit
+        var wide: u32 = 0;
+        var k: i32 = 0;
+        while (k < n) {
+            var shift: u32 = ((n - 1 - k) * 4) as u32;
+            var digit: u32 = (v >> shift) & 15;
+            wide = (wide << 8) | (digit << 4) | digit;
+            k += 1;
+        }
+        if (n == 3) { result[0] = 0xFF000000 | wide; } else { result[0] = wide; }
+        return true;
+    }
+    return false;
+}

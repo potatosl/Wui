@@ -17,7 +17,7 @@ import("wui::core")::{Ctx, core_new, core_free, core_clear, core_column, core_ro
                       P_FONT_SIZE, P_BOLD, P_PADDING, P_WIDTH, P_HEIGHT, P_GROW, P_ALIGN, P_JUSTIFY, P_BACKGROUND, P_BORDER, P_MARGIN, P_RADIUS, P_COLOR, P_GAP,
                       CENTER, END, STRETCH, BETWEEN,
                       core_theme, core_set_theme};
-import("wui::theme")::{Theme, theme_light, theme_dark, theme_scale, COLOR_BUTTON, COLOR_BUTTON_HOVER, COLOR_FIELD, COLOR_FIELD_FOCUS,
+import("wui::theme")::{Theme, color_parse, theme_light, theme_dark, theme_scale, COLOR_BUTTON, COLOR_BUTTON_HOVER, COLOR_FIELD, COLOR_FIELD_FOCUS,
                        COLOR_PLACEHOLDER, COLOR_SELECTION, COLOR_SCROLL_THUMB, COLOR_ACCENT, FIELD_PAD_X, RADIUS_BUTTON};
 import("wui::font")::{FontEngine, font_new, font_free};
 import("wui::render")::{TEXT_BOLD, DrawCmd, DRAW_CMD_SIZE, CMD_FILL, CMD_BORDER, CMD_TEXT, CMD_CLIP, CMD_CLIP_END, CMD_LINE,
@@ -2234,6 +2234,42 @@ fun test_a_left_button_starts_at_the_edge_and_is_cut(t: ptr<T>) {
     core_free(c);
 }
 
+// ---- colour text ---------------------------------------------------------------------------------
+
+fun parse_color(t: ptr<T>, text: str, want: i64) {
+    var c: array<u32, 1>;
+    c[0] = 7;
+    eq(t, text, color_parse(text, &c[0]) as i64, 1);
+    eq(t, text, c[0] as i64, want);
+}
+
+fun reject_color(t: ptr<T>, text: str) {
+    var c: array<u32, 1>;
+    c[0] = 7;
+    eq(t, text, color_parse(text, &c[0]) as i64, 0);
+    eq(t, text, c[0] as i64, 7);
+}
+
+fun test_colour_text(t: ptr<T>) {
+    begin(t, "colour_text");
+    parse_color(t, "#1E3A8A", 0xFF1E3A8A);
+    parse_color(t, "#801E3A8A", 0x801E3A8A);
+    parse_color(t, "#abcdef", 0xFFABCDEF);
+    parse_color(t, "#F80", 0xFFFF8800);
+    parse_color(t, "#fff", 0xFFFFFFFF);
+    parse_color(t, "#8F00", 0x88FF0000);
+    parse_color(t, "#000000", 0xFF000000);
+    reject_color(t, "1E3A8A");
+    reject_color(t, "#");
+    reject_color(t, "#12");
+    reject_color(t, "#12345");
+    reject_color(t, "#1234567");
+    reject_color(t, "#123456789");
+    reject_color(t, "#12G456");
+    reject_color(t, "#1E3A8A ");
+    reject_color(t, "");
+}
+
 fun test_dropdown_layout_value_and_paint(t: ptr<T>) {
     begin(t, "dropdown_layout_value_and_paint");
     var c: ptr<Ctx> = new_ctx(t);
@@ -2757,6 +2793,7 @@ fun main() {
     test_menus_switch_on_hover_while_one_is_open(&t);
     test_menu_keyboard(&t);
     test_a_left_button_starts_at_the_edge_and_is_cut(&t);
+    test_colour_text(&t);
     test_dropdown_layout_value_and_paint(&t);
     test_dropdown_opens_and_picks_with_the_mouse(&t);
     test_clicking_elsewhere_closes_the_list(&t);

@@ -168,7 +168,7 @@ use as a parent or to style. The first parent is `UI_ROOT`.
 
 **Style** (all take a node id): `ui_padding`, `ui_gap`, `ui_width`, `ui_height`, `ui_grow`,
 `ui_align` (`UI_START | UI_CENTER | UI_END | UI_STRETCH`), `ui_justify` (adds `UI_BETWEEN`),
-`ui_direction`, `ui_background`, `ui_border`, `ui_margin`, `ui_radius`, `ui_color` (text).
+`ui_direction`, `ui_background`, `ui_border`, `ui_margin`, `ui_radius`, `ui_color` (text). Colours can be written as text with `ui_rgb`: `ui_background(ui, box, ui_rgb("#1E3A8A"))` (`#RRGGBB`, `#AARRGGBB`, `#RGB`, `#ARGB`).
 `ui_layout(w, h)` lays the tree out; `ui_rect(id)` reads a node's rectangle.
 
 **Mouse.** `ui_click(x, y, mods)` returns the message of the button / checkbox hit, or
@@ -300,7 +300,7 @@ buffer. See the `*_headless.wave` examples.
 
 ## Tests
 
-`WUI_TASK=wtest` runs the Wave unit tests (`tests/core_test.wave`, 859 checks: layout, hit testing,
+`WUI_TASK=wtest` runs the Wave unit tests (`tests/core_test.wave`, 891 checks: layout, hit testing,
 input editing and selection, painting, scroll boxes in both directions, scrollbar drag, scroll keys, menus, tooltips, drop-downs, overlays, sliders). `tests/dirlist_test.wave` (32 checks) covers the directory listing and path helpers. `cargo test` in `winplat/` covers its directory functions. They use a
 font-less text engine, so every character is 8 px wide and a line 16 px high. `WUI_TASK=xtest`
 runs the X11 backend tests (`tests/window_x11_test.wave`): key and modifier mapping, text events,
