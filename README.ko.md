@@ -1,17 +1,22 @@
-<p align="center">
-  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
-</p>
+<div align="center">
 
-# Wui
+<img src="docs/wui.svg" alt="Wui" height="90">
 
-[![CI](https://github.com/potatosl/Wui/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/Wui/actions/workflows/ci.yml)
+<hr>
+
+**Wave로 만든 Wave용 작은 선언형 GUI 라이브러리.**
+
+창을 "상태를 받아 화면을 만드는 함수"로 기술하면, Wui가 배치하고 그려서 보여 줍니다.
+
+[안내서](docs/GUIDE.ko.md) · [API](docs/API.md) · [예제](examples) · [빌드](docs/BUILDING.ko.md) · [변경 내역](CHANGELOG.md)
+
+[![CI](https://github.com/potatosl/Wui/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/Wui/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/potatosl/Wui?color=6654F1)](LICENSE) [![Made for Wave](https://img.shields.io/badge/made%20for-Wave-6654F1)](https://wave-lang.dev)
 
 [English](README.md) | **한국어**
 
-[Wave](https://wave-lang.dev)로 만든 Wave용 작은 GUI 라이브러리입니다.
+</div>
 
-창을 "상태를 받아 화면을 만드는 함수"로 기술합니다. 이벤트가 올 때마다 Wui가 여러분이 만든 트리를 받아서
-배치하고, 자체 소프트웨어 렌더러로 그려서 보여 줍니다. GPU 코드도, 밑에 깔린 위젯 툴킷도 없고, Wave 컴파일러
+이벤트가 올 때마다 Wui가 여러분의 코드가 만든 트리를 받아서 배치하고, 자체 소프트웨어 렌더러로 그려서 보여 줍니다. GPU 코드도, 밑에 깔린 위젯 툴킷도 없고, Wave 컴파일러
 말고는 설치할 것이 없습니다(Linux에서는 libX11 라이브러리도 필요합니다).
 
 ## 맛보기
@@ -105,3 +110,7 @@ Wui는 아직 어립니다. 1.0 이전에는 마이너 버전에서 API가 바�
 ## 라이선스
 
 [MPL-2.0](LICENSE). JSON 테마에 쓰는 [wjson](https://github.com/potatosl/wjson)도 MPL-2.0입니다.
+
+<p align="center">
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" height="28"></a>
+</p>

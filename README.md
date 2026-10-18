@@ -1,17 +1,22 @@
-<p align="center">
-  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
-</p>
+<div align="center">
 
-# Wui
+<img src="docs/wui.svg" alt="Wui" height="90">
 
-[![CI](https://github.com/potatosl/Wui/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/Wui/actions/workflows/ci.yml)
+<hr>
+
+**A small declarative GUI library for Wave, written in Wave.**
+
+Describe your window as a function of your state; Wui lays it out, paints it and shows it.
+
+[Guide](docs/GUIDE.md) · [API](docs/API.md) · [Examples](examples) · [Building](docs/BUILDING.md) · [Changelog](CHANGELOG.md)
+
+[![CI](https://github.com/potatosl/Wui/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/Wui/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/potatosl/Wui?color=6654F1)](LICENSE) [![Made for Wave](https://img.shields.io/badge/made%20for-Wave-6654F1)](https://wave-lang.dev)
 
 **English** | [한국어](README.ko.md)
 
-A small GUI library for [Wave](https://wave-lang.dev), written in Wave.
+</div>
 
-You describe your window as a function of your state. After every event Wui takes the tree you built,
-lays it out, paints it with its own software renderer and shows it. There is no GPU code, no
+After every event Wui takes the tree your code built, lays it out, paints it with its own software renderer and shows it. There is no GPU code, no
 widget toolkit underneath, and nothing to install besides the Wave compiler (and libX11 on Linux).
 
 ## A taste
@@ -109,3 +114,7 @@ and ideas are welcome as issues; for security problems see [SECURITY.md](SECURIT
 ## License
 
 [MPL-2.0](LICENSE). [wjson](https://github.com/potatosl/wjson), used for JSON themes, is MPL-2.0 too.
+
+<p align="center">
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" height="28"></a>
+</p>
