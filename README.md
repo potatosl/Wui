@@ -1,3 +1,7 @@
+<p align="center">
+  <a href="https://github.com/wavefnd/Wave"><img src="docs/wave.svg" alt="Wave" width="220"></a>
+</p>
+
 # Wui
 
 **English** | [한국어](README.ko.md)
