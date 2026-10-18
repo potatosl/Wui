@@ -1,12 +1,12 @@
 <p align="center">
-  <a href="https://github.com/wavefnd/Wave"><img src="docs/wave.svg" alt="Wave" width="220"></a>
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
 </p>
 
 # Wui
 
 [English](README.md) | **한국어**
 
-[Wave](https://github.com/wavefnd/Wave) 언어로 만든 작은 선언형 GUI 라이브러리입니다. 이벤트가 일어날 때마다
+[Wave](https://wave-lang.dev) 언어로 만든 작은 선언형 GUI 라이브러리입니다. 이벤트가 일어날 때마다
 화면을 다시 기술하면(상태를 위젯 트리로 바꾸는 함수), Wui가 레이아웃을 계산하고, 픽셀 버퍼에 그려서, 창에 보여 줍니다.
 
 ```

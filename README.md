@@ -1,12 +1,12 @@
 <p align="center">
-  <a href="https://github.com/wavefnd/Wave"><img src="docs/wave.svg" alt="Wave" width="220"></a>
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
 </p>
 
 # Wui
 
 **English** | [한국어](README.ko.md)
 
-A small declarative GUI library for [Wave](https://github.com/wavefnd/Wave). You describe the
+A small declarative GUI library for [Wave](https://wave-lang.dev). You describe the
 screen again after every event (a function from your state to a tree of widgets); Wui lays it
 out, paints it into a pixel buffer and shows it in a window.
 
