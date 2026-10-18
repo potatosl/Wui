@@ -5,6 +5,10 @@ before 1.0 the API may change in minor releases (see `docs/VERSIONING.md`).
 
 ## Unreleased
 
+### Changed
+- The README is now a short introduction with an example; the details moved to `docs/GUIDE.md`,
+  `docs/BUILDING.md` and `docs/ARCHITECTURE.md` (each also in Korean).
+
 ### Added
 - `ui_rgb("#RRGGBB")`: colours written as text (`#RRGGBB`, `#AARRGGBB`, `#RGB`, `#ARGB`), usable with every
   colour setter. The parser (`color_parse`) lives in `src/theme.wave` and no longer needs wjson.
