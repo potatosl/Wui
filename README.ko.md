@@ -39,7 +39,15 @@ Wui는 Wave로 작성되어 있습니다. 예외는 Windows와 macOS 창 백엔�
 
 ## 내 프로젝트에서 쓰기
 
-Wui는 Wave 소스 폴더입니다. 설치할 것이 없습니다. 내려받아서(또는 저장소를 클론해서) `wavec`에 `--dep`로 알려 주면 됩니다.
+Wui는 Wave 소스 폴더입니다. 쉬운 방법은 설치 스크립트입니다(Linux, FreeBSD, macOS. 짧으니 먼저 읽어 보세요).
+
+```
+curl -fsSL https://raw.githubusercontent.com/potatosl/Wui/main/install.sh | sh
+~/.wui/bin/wui-wavec run app.wave          # 또는: wui-wavec app.wave -o app
+```
+
+소스를 `~/.wui`에 두고, 이 시스템에 맞는 `--dep`와 링크 플래그를 붙여 주는 `wavec` 래퍼 `wui-wavec`를 만듭니다(macOS에서는
+먼저 cargo로 창 크레이트를 빌드합니다). 손으로 하려면 소스를 내려받아(또는 저장소를 클론해서) `wavec`에 `--dep`로 알려 주면 됩니다.
 
 ```
 curl -L https://github.com/potatosl/Wui/archive/refs/heads/main.tar.gz | tar xz            # -> Wui-main/
@@ -68,7 +76,9 @@ wavec build app.wave --dep=wui=./Wui-main build/cargo/release/libwui_win.a --lin
 (`vex`는 `wavec`의 std가 `~/.wave/lib/wave/std`에 있다고 가정합니다. 설치 위치가 다르면 `VEX_WAVEC`를 지정하세요.)
 
 **컴파일러.** `wavec` 0.2.1-pre-beta와 Wave `master`의 nightly 빌드(`0.0.1-alpha-dev`, 커밋 d9fe76d, std 호환
-리비전 5)로 Linux x86_64에서 시험했습니다. 다른 타깃은 컴파일만 해 봤습니다(아래 빌드 참고). 버전 정책: `docs/VERSIONING.md`.
+리비전 5)로 Linux x86_64에서 시험했습니다. 다른 타깃은 컴파일만 해 봤습니다(아래 빌드 참고). 버전 정책: `docs/VERSIONING.md`. macOS arm64에서는 기본값 `-O0`을 유지하세요.
+`-O2`면 Wave std의 `std::mem::alloc` 안에서 실패합니다(Wave 이슈 #933, wjson CI에서 발견). CI는 push마다 돕니다(`.github/workflows/ci.yml`).
+macOS와 Windows 작업은 네이티브로 빌드하고 링크하며, 아직은 실패해도 되도록 해 두었습니다.
 
 **배포용 압축 파일 만들기.** `WUI_TASK=package wavec --std-root=$HOME/.wave/bin/std run build.wave`가
 `dist/wui-<version>.tar.gz`를 만듭니다(`WUI_VERSION`으로 버전 지정). 라이브러리, `winplat/`, 문서, 예제, 테스트,

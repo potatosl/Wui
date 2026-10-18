@@ -1,0 +1,180 @@
+# SPDX-License-Identifier: MPL-2.0
+# Linux is the gate: unit tests, every example, cross-compilation to the Windows and macOS targets, the
+# release archive and the installer. The macOS and Windows jobs build and link natively for the first
+# time (the backends there have never been run), so they are allowed to fail until they are known good.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# The workflow only reads the repository; nothing here needs a write token.
+permissions:
+  contents: read
+
+env:
+  # Not called WAVE_VERSION on purpose: Wave's own installer refuses to run when that variable is set.
+  WUI_WAVE_RELEASE: v0.2.1-pre-beta
+  # SHA-256 of the release archive, as published for that tag. Update together with WUI_WAVE_RELEASE.
+  WUI_WAVE_LINUX_SHA256: 4e5daf46a93414e00b8ea073eda09e4b7aa7d248cc03f2aeb965a36fc9b0fef0
+
+jobs:
+  linux:
+    runs-on: ubuntu-26.04
+    steps:
+      # Actions are pinned to a commit, not a movable tag (v7.0.1).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin
+          rustc --version
+      - name: Install wavec
+        run: |
+          curl -sSfL -o wave.tar.gz \
+            "https://github.com/wavefnd/Wave/releases/download/${WUI_WAVE_RELEASE}/wave-${WUI_WAVE_RELEASE}-x86_64-linux-gnu.tar.gz"
+          echo "${WUI_WAVE_LINUX_SHA256}  wave.tar.gz" | sha256sum --check --strict -
+          mkdir -p "$HOME/wave" && tar -xzf wave.tar.gz -C "$HOME/wave" --strip-components=1
+          echo "$HOME/wave" >> "$GITHUB_PATH"
+          echo "WAVE_STD=$HOME/wave/std" >> "$GITHUB_ENV"
+      - name: Window crate tests (cargo)
+        run: cargo test --manifest-path winplat/Cargo.toml
+      # Wave unit tests, theme JSON tests, X11 backend tests (the display tests skip without a display).
+      - name: Build and test
+        run: wavec --std-root="$WAVE_STD" run build.wave
+      - name: Build every example
+        run: WUI_TASK=examples wavec --std-root="$WAVE_STD" run build.wave
+      # Compiles winplat and every example for the other targets (no linking, so no SDK needed).
+      - name: Cross-compile (Windows and macOS targets)
+        run: |
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin; do
+            WUI_TASK=check WUI_TARGET=$target wavec --std-root="$WAVE_STD" run build.wave
+          done
+      - name: Release archive
+        run: |
+          WUI_TASK=package wavec --std-root="$WAVE_STD" run build.wave
+          tar -tzf dist/wui-0.1.0.tar.gz | grep -q 'wui-0.1.0/src/lib.wave'
+      # The curl installer: install this very commit and use the wrapper.
+      - name: Install script
+        run: |
+          git archive --format=tar.gz --prefix=Wui/ -o "$RUNNER_TEMP/wui.tar.gz" HEAD
+          WUI_TARBALL="$RUNNER_TEMP/wui.tar.gz" WUI_DIR="$RUNNER_TEMP/wui-install" sh install.sh
+          cat > "$RUNNER_TEMP/hello.wave" <<'WAVE'
+          import("wui")::{Ui, ui_new, ui_free, ui_clear, ui_column, ui_text, ui_layout, ui_render, UI_ROOT};
+          import("std::mem::alloc")::{mem_alloc, mem_free};
+
+          fun main() {
+              var ui: Ui = ui_new();
+              ui_clear(&ui);
+              var page: i32 = ui_column(&ui, UI_ROOT, 10, 6);
+              ui_text(&ui, page, "hello");
+              ui_layout(&ui, 160, 80);
+              var px: ptr<u8> = mem_alloc(160 * 80 * 4);
+              println("rendered={}", ui_render(&ui, px, 160, 80));
+              mem_free(px, 160 * 80 * 4);
+              ui_free(&ui);
+          }
+          WAVE
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wui-install/bin/wui-wavec" run hello.wave | tee hello.out
+          grep -qx "rendered=1" hello.out
+
+  macos:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # The macOS backend has never been run: show the result without blocking.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-26
+            wave_target: aarch64-apple-darwin
+            wave_sha256: 06808b7274bde65c89dcf96e103384b93329327d4626bebde9151a7a53eb060b
+          - name: macos-x64
+            os: macos-26-intel
+            wave_target: x86_64-apple-darwin
+            wave_sha256: 9b03c80665a47016d04fbaa827109cb71baea472b3188a3ab170d6593dd59058
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustc --version
+      - name: Install wavec
+        run: |
+          curl -sSfL -o wave.tar.gz \
+            "https://github.com/wavefnd/Wave/releases/download/${WUI_WAVE_RELEASE}/wave-${WUI_WAVE_RELEASE}-${{ matrix.wave_target }}.tar.gz"
+          echo "${{ matrix.wave_sha256 }}  wave.tar.gz" | shasum -a 256 --check -
+          mkdir -p "$HOME/wave" && tar -xzf wave.tar.gz -C "$HOME/wave" --strip-components=1
+          echo "$HOME/wave" >> "$GITHUB_PATH"
+          echo "WAVE_STD=$HOME/wave/std" >> "$GITHUB_ENV"
+      - name: Unit tests
+        run: WUI_TASK=wtest wavec --std-root="$WAVE_STD" run build.wave
+      # Builds winplat with cargo and links every example against it: the first real link of the Cocoa backend.
+      - name: Build and link every example
+        run: WUI_TASK=examples wavec --std-root="$WAVE_STD" run build.wave
+
+  windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # The Win32 backend has never been run: show the result without blocking.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2025
+            wave_target: x86_64-pc-windows-msvc
+            wave_sha256: a7367d17dbc507726524b483c7cdcfe66f12b92d5801559c4937c7b016d7e271
+            vcvars_arch: x64
+          - name: windows-arm64
+            os: windows-11-arm
+            wave_target: aarch64-pc-windows-msvc
+            wave_sha256: a12a82ae6c9e338375d41cb27c0d2f7bd94b96269b4bbf29583c0593b71d496c
+            vcvars_arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustc --version
+      - name: Install wavec
+        shell: pwsh
+        run: |
+          $url = "https://github.com/wavefnd/Wave/releases/download/$env:WUI_WAVE_RELEASE/wave-$env:WUI_WAVE_RELEASE-${{ matrix.wave_target }}.zip"
+          Invoke-WebRequest -Uri $url -OutFile wave.zip
+          $hash = (Get-FileHash wave.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "${{ matrix.wave_sha256 }}") { throw "wavec archive hash mismatch: $hash" }
+          Expand-Archive wave.zip -DestinationPath "$env:RUNNER_TEMP\wave"
+          $root = (Get-ChildItem "$env:RUNNER_TEMP\wave" | Select-Object -First 1).FullName
+          Add-Content $env:GITHUB_PATH $root
+          Add-Content $env:GITHUB_ENV "WAVE_STD=$root\std"
+      # Link.exe, the Windows SDK libraries and their environment variables, as a Developer Prompt sets them.
+      - name: Visual Studio environment
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vcvars_arch }} && set" | ForEach-Object {
+            if ($_ -match '^(.*?)=(.*)$') { Add-Content $env:GITHUB_ENV "$($matches[1])=$($matches[2])" }
+          }
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          $env:WUI_TASK = "wtest"
+          wavec --std-root="$env:WAVE_STD" run build.wave
+      - name: Build and link every example
+        shell: pwsh
+        run: |
+          $env:WUI_TASK = "examples"
+          wavec --std-root="$env:WAVE_STD" run build.wave

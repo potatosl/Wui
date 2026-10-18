@@ -405,7 +405,7 @@ fun main() -> i32 {
     } else {
         task_wtest(&b);
         task_jtest(&b);
-        task_xtest(&b);
+        if (TARGET_OS == 0) { task_xtest(&b); }          // the X11 backend tests need X11 (Linux / FreeBSD)
         if (FAILED == 0) { step("all tests passed"); }
     }
     buffer_free(&b);

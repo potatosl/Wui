@@ -41,8 +41,16 @@ address of a function - so those parts are a small Rust crate (`winplat/`) with 
 
 ## Use it in your project
 
-Wui is a folder of Wave sources: there is nothing to install. Download it (or clone the repository),
-then point `wavec` at it with `--dep`:
+Wui is a folder of Wave sources. The easy way is the installer (Linux, FreeBSD, macOS; read it first, it is short):
+
+```
+curl -fsSL https://raw.githubusercontent.com/potatosl/Wui/main/install.sh | sh
+~/.wui/bin/wui-wavec run app.wave          # or: wui-wavec app.wave -o app
+```
+
+It puts the sources in `~/.wui` and writes `wui-wavec`, a wrapper around `wavec` with the right `--dep` and link
+flags for your system (on macOS it builds the window crate with cargo first). Or do it by hand: download the
+sources (or clone the repository) and point `wavec` at them with `--dep`:
 
 ```
 curl -L https://github.com/potatosl/Wui/archive/refs/heads/main.tar.gz | tar xz            # -> Wui-main/
@@ -72,7 +80,9 @@ flags and Wave has no in-source link directive, so the final link against libX11
 
 **Compilers.** Tested with `wavec` 0.2.1-pre-beta and with the nightly build of Wave `master`
 (`0.0.1-alpha-dev`, commit d9fe76d, std compatibility revision 5) on Linux x86_64; the other targets
-were only compiled (see Build). Versioning: `docs/VERSIONING.md`.
+were only compiled (see Build). Versioning: `docs/VERSIONING.md`. On macOS arm64 keep the default `-O0`:
+with `-O2` Wave's std fails inside `std::mem::alloc` (Wave issue #933, found by wjson's CI). CI runs on every push
+(`.github/workflows/ci.yml`); its macOS and Windows jobs build and link natively and are still allowed to fail.
 
 **Making the archive.** `WUI_TASK=package wavec --std-root=$HOME/.wave/bin/std run build.wave` writes
 `dist/wui-<version>.tar.gz` (`WUI_VERSION` sets the version): the library, `winplat/`, docs, examples,
