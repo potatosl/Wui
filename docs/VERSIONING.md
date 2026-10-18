@@ -14,9 +14,10 @@ While the major version is `0` (now), minor releases (`0.x.0`) may change the pu
 
 | Target | Status |
 |---|---|
-| Linux x86_64 / aarch64 (X11) | tested |
-| Windows x86_64 and ARM64 (Win32) | compiles; never run |
-| macOS Intel and Apple silicon (Cocoa) | compiles; never run |
+| Linux x86_64 (X11) | tested |
+| Linux aarch64 (X11) | same code; untested |
+| Windows x86_64 and ARM64 (Win32) | builds, links and passes the unit tests in CI; no window opened yet |
+| macOS Intel and Apple silicon (Cocoa) | builds, links and passes the unit tests in CI; no window opened yet |
 | FreeBSD (X11) | same code as Linux; untested |
 
 A platform is called "supported" once someone has run the examples on a real machine; until then a release note says "untested" for it.

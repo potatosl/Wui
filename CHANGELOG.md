@@ -11,7 +11,8 @@ before 1.0 the API may change in minor releases (see `docs/VERSIONING.md`).
 - `install.sh`: installs Wui into `~/.wui` and a `wui-wavec` wrapper that compiles a program against it
   (Linux, FreeBSD, macOS).
 - GitHub Actions CI: unit tests, every example, cross-compilation to the four Windows / macOS targets, and the
-  release archive and installer on Linux; macOS and Windows jobs that build and link natively.
+  release archive and installer on Linux; Windows (x64, ARM64) and macOS (Intel, Apple silicon) jobs that
+  build, link every example and run the unit tests natively.
 
 ## 0.1.0
 
@@ -31,7 +32,8 @@ First public version.
 ### Platforms
 - Linux and FreeBSD: X11 backend in Wave (libX11), with input methods and clipboard. Tested on Linux x86_64.
 - Windows (x86_64, ARM64) and macOS (Intel, Apple silicon): backends in the Rust crate `winplat/`. They
-  compile for all four targets; they had not been run on a real machine at the time of this release.
+  build, link and pass the unit tests (including the directory reader) on all four targets in CI. No window
+  had been opened on a real Windows or Mac at the time of this release.
 
 ### Tooling
 - `build.wave` build driver: tests, examples, benchmark, cross-target check (`WUI_TASK=check`), release

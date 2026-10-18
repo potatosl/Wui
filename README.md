@@ -32,7 +32,7 @@ address of a function - so those parts are a small Rust crate (`winplat/`) with 
 | `src/font.wave`, `src/fontdb.wave` | TrueType (glyf) and OpenType-CFF reader, anti-aliased glyph rasterizer with a cache; finds the OS's own fonts (wui bundles none) |
 | `src/unicode.wave` | generated letter / digit table for word movement in inputs |
 | `src/window/x11.wave` | X11 window, events, input method (Hangul / CJK composition), clipboard - libX11 through `extern(c)` |
-| `src/window/win32.wave`, `winplat/` | Windows (x86_64, ARM64) and macOS (Intel, Apple silicon) windows: a Rust crate with a C ABI that the Wave wrapper calls (`platform/win32.rs` user32 / gdi32, `platform/macos.rs` Cocoa through the Objective-C runtime, frameworks loaded with dlopen). **Compiles for all four targets, never run on a real Windows or Mac** |
+| `src/window/win32.wave`, `winplat/` | Windows (x86_64, ARM64) and macOS (Intel, Apple silicon) windows: a Rust crate with a C ABI that the Wave wrapper calls (`platform/win32.rs` user32 / gdi32, `platform/macos.rs` Cocoa through the Objective-C runtime, frameworks loaded with dlopen). **Builds, links and passes the unit tests on all four targets in CI (GitHub's Windows and macOS runners); no window has been opened on a real Windows or Mac yet** |
 | `src/dirlist.wave`, `src/dir/posix.wave`, `src/dir/native.wave` | directory listing for file pickers: libc `readdir` on Linux / FreeBSD, `winplat` (`std::fs`) on Windows / macOS |
 | `src/window/none.wave` | stand-in for any other target: `win_ok()` is false |
 | `src/theme.wave`, `src/theme_json.wave` | the `Theme` (colours, radii, paddings) and, optionally, themes as JSON files with wjson |
@@ -79,10 +79,10 @@ flags and Wave has no in-source link directive, so the final link against libX11
 `wavec`'s std at `~/.wave/lib/wave/std`; set `VEX_WAVEC` if your install differs.)
 
 **Compilers.** Tested with `wavec` 0.2.1-pre-beta and with the nightly build of Wave `master`
-(`0.0.1-alpha-dev`, commit d9fe76d, std compatibility revision 5) on Linux x86_64; the other targets
-were only compiled (see Build). Versioning: `docs/VERSIONING.md`. On macOS arm64 keep the default `-O0`:
+(`0.0.1-alpha-dev`, commit d9fe76d, std compatibility revision 5) on Linux x86_64. CI also builds,
+links and runs the unit tests on Windows x64 / ARM64 and macOS Intel / Apple silicon (see Build). Versioning: `docs/VERSIONING.md`. On macOS arm64 keep the default `-O0`:
 with `-O2` Wave's std fails inside `std::mem::alloc` (Wave issue #933, found by wjson's CI). CI runs on every push
-(`.github/workflows/ci.yml`); its macOS and Windows jobs build and link natively and are still allowed to fail.
+(`.github/workflows/ci.yml`); its Windows and macOS jobs build, link and test natively.
 
 **Making the archive.** `WUI_TASK=package wavec --std-root=$HOME/.wave/bin/std run build.wave` writes
 `dist/wui-<version>.tar.gz` (`WUI_VERSION` sets the version): the library, `winplat/`, docs, examples,

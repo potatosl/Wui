@@ -17,8 +17,8 @@ Limits and behaviour worth knowing:
 - Text inputs hold at most 4096 bytes. Clipboard transfers larger than that are cut.
 - Theme JSON is parsed by [wjson](https://github.com/potatosl/wjson) (strict parser with a depth limit); a
   malformed theme leaves the current theme unchanged.
-- The Windows and macOS backends (`winplat/`) are `unsafe` Rust at the OS boundary and have not been run on
-  real machines yet.
+- The Windows and macOS backends (`winplat/`) are `unsafe` Rust at the OS boundary. CI builds and tests them on
+  GitHub's runners, but no window has been opened on a real Windows or Mac yet.
 
 Supply chain: Wui has no package dependencies. `third_party/wjson` is a copy of wjson's Wave sources (see
 `third_party/wjson/SOURCE.md` for the commit); CI pins its actions to a commit, verifies the SHA-256 of the

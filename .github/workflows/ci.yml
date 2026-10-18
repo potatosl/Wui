@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
-# Linux is the gate: unit tests, every example, cross-compilation to the Windows and macOS targets, the
-# release archive and the installer. The macOS and Windows jobs build and link natively for the first
-# time (the backends there have never been run), so they are allowed to fail until they are known good.
+# Linux: unit tests, every example, cross-compilation to the Windows and macOS targets, the release archive
+# and the installer. macOS and Windows: native build, link of every example and the unit tests (the runners
+# have no desktop, so no window is opened there).
 name: CI
 
 on:
@@ -85,8 +85,6 @@ jobs:
   macos:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    # The macOS backend has never been run: show the result without blocking.
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -117,15 +115,13 @@ jobs:
           echo "WAVE_STD=$HOME/wave/std" >> "$GITHUB_ENV"
       - name: Unit tests
         run: WUI_TASK=wtest wavec --std-root="$WAVE_STD" run build.wave
-      # Builds winplat with cargo and links every example against it: the first real link of the Cocoa backend.
+      # Builds winplat with cargo and links every example against it.
       - name: Build and link every example
         run: WUI_TASK=examples wavec --std-root="$WAVE_STD" run build.wave
 
   windows:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    # The Win32 backend has never been run: show the result without blocking.
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

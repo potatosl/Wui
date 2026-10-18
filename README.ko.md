@@ -30,7 +30,7 @@ Wui는 Wave로 작성되어 있습니다. 예외는 Windows와 macOS 창 백엔�
 | `src/font.wave`, `src/fontdb.wave` | TrueType(glyf)와 OpenType-CFF 읽기, 캐시가 있는 안티에일리어싱 글리프 래스터라이저, OS가 가진 폰트 찾기 (Wui는 폰트를 포함하지 않음) |
 | `src/unicode.wave` | 입력창의 단어 이동에 쓰는 글자 / 숫자 표(생성됨) |
 | `src/window/x11.wave` | X11 창, 이벤트, 입력기(한글 / CJK 조합), 클립보드 - `extern(c)`로 libX11 사용 |
-| `src/window/win32.wave`, `winplat/` | Windows(x86_64, ARM64)와 macOS(Intel, Apple silicon) 창: Wave 래퍼가 호출하는 C ABI의 Rust 크레이트 (`platform/win32.rs` user32 / gdi32, `platform/macos.rs` Objective-C 런타임으로 쓰는 Cocoa, 프레임워크는 dlopen으로 로드). **네 타깃 모두 컴파일은 되지만 실제 Windows나 Mac에서 실행해 본 적은 없습니다** |
+| `src/window/win32.wave`, `winplat/` | Windows(x86_64, ARM64)와 macOS(Intel, Apple silicon) 창: Wave 래퍼가 호출하는 C ABI의 Rust 크레이트 (`platform/win32.rs` user32 / gdi32, `platform/macos.rs` Objective-C 런타임으로 쓰는 Cocoa, 프레임워크는 dlopen으로 로드). **네 타깃 모두 CI(GitHub의 Windows·macOS 러너)에서 빌드, 링크, 단위 테스트가 통과하지만, 실제 Windows나 Mac에서 창을 띄워 본 적은 아직 없습니다** |
 | `src/dirlist.wave`, `src/dir/posix.wave`, `src/dir/native.wave` | 파일 선택기용 디렉터리 목록: Linux / FreeBSD는 libc `readdir`, Windows / macOS는 `winplat`(`std::fs`) |
 | `src/window/none.wave` | 그 밖의 타깃용 자리표시: `win_ok()`가 false |
 | `src/theme.wave`, `src/theme_json.wave` | `Theme`(색, 모서리 반지름, 여백)과, 선택적으로 wjson을 쓰는 JSON 테마 파일 |
@@ -76,9 +76,9 @@ wavec build app.wave --dep=wui=./Wui-main build/cargo/release/libwui_win.a --lin
 (`vex`는 `wavec`의 std가 `~/.wave/lib/wave/std`에 있다고 가정합니다. 설치 위치가 다르면 `VEX_WAVEC`를 지정하세요.)
 
 **컴파일러.** `wavec` 0.2.1-pre-beta와 Wave `master`의 nightly 빌드(`0.0.1-alpha-dev`, 커밋 d9fe76d, std 호환
-리비전 5)로 Linux x86_64에서 시험했습니다. 다른 타깃은 컴파일만 해 봤습니다(아래 빌드 참고). 버전 정책: `docs/VERSIONING.md`. macOS arm64에서는 기본값 `-O0`을 유지하세요.
+리비전 5)로 Linux x86_64에서 시험했습니다. CI에서는 Windows x64 / ARM64와 macOS Intel / Apple silicon에서도 빌드, 링크, 단위 테스트를 돌립니다(아래 빌드 참고). 버전 정책: `docs/VERSIONING.md`. macOS arm64에서는 기본값 `-O0`을 유지하세요.
 `-O2`면 Wave std의 `std::mem::alloc` 안에서 실패합니다(Wave 이슈 #933, wjson CI에서 발견). CI는 push마다 돕니다(`.github/workflows/ci.yml`).
-macOS와 Windows 작업은 네이티브로 빌드하고 링크하며, 아직은 실패해도 되도록 해 두었습니다.
+Windows와 macOS 작업도 네이티브로 빌드, 링크, 테스트합니다.
 
 **배포용 압축 파일 만들기.** `WUI_TASK=package wavec --std-root=$HOME/.wave/bin/std run build.wave`가
 `dist/wui-<version>.tar.gz`를 만듭니다(`WUI_VERSION`으로 버전 지정). 라이브러리, `winplat/`, 문서, 예제, 테스트,

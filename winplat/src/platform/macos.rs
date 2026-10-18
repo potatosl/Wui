@@ -12,8 +12,8 @@
 // size of the window in points, pointer coordinates are multiplied by `scale`,
 // and `dpi_percent` reports it (200 on Retina) so a program can scale its theme.
 //
-// NOTE: written without access to a Mac; it is type-checked for aarch64 / x86_64
-// but has never been run. Not supported yet: input methods (Korean / Chinese /
+// NOTE: written without access to a Mac; CI builds and links it for aarch64 / x86_64
+// but no window has been opened by it yet. Not supported yet: input methods (Korean / Chinese /
 // Japanese composition: only what `characters` delivers arrives as text), a
 // menu bar (Cmd+Q is handled as a close event).
 
