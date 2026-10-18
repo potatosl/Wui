@@ -191,7 +191,7 @@ fun wave_build(b: ptr<Buffer>, source: str, output: str, extra: str) -> bool {
     add_link_flags(b);
     add(b, extra);
     add(b, " -o ");
-    add_path(b, output);
+    add_exe(b, output);                    // wavec writes exactly the name it is given: Windows needs the .exe
     return must(b);
 }
 
