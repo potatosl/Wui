@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Tree building: the core_* calls an app's view makes to add nodes (boxes, text, buttons, inputs,
+// sliders, drop-downs, menus, scroll boxes, overlays) and to style them.
+
+import("./ctx")::{add_node, intern, new_node, scroll_slot, slider_slot, valid};
+import("./field")::{field_get};
+import("./types")::{AUTO, BETWEEN, Ctx, DIR_ROW, Field, K_BOX, K_BUTTON, K_CHECKBOX, K_DROPDOWN, K_INPUT,
+    K_PROGRESS, K_SLIDER, K_TEXT, K_TEXTAREA, NONE, Node, P_ALIGN, P_BACKGROUND, P_BOLD, P_BORDER, P_COLOR,
+    P_DIRECTION, P_FONT_SIZE, P_GAP, P_GROW, P_HEIGHT, P_JUSTIFY, P_MARGIN, P_PADDING, P_RADIUS, P_WIDTH, START,
+    STRETCH, clamp_i64, max_i32};
+
+pub fun container(c: ptr<Ctx>, parent: i32, row: bool, padding: i32, gap: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var id: i32 = add_node(c, parent, K_BOX);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.row = row;
+    n.padding = max_i32(padding, 0);
+    n.gap = max_i32(gap, 0);
+    return id;
+}
+
+// A box (container): the plain form, a vertical box with no padding. Direction,
+// padding and gap can be set later with core_style.
+pub fun core_box(c: ptr<Ctx>, parent: i32) -> i32 {
+    return container(c, parent, false, 0, 0);
+}
+
+// Starts an overlay. `anchor` is a node of the main tree (for the relative placements;
+// pass NONE with OVERLAY_AT). It is moved back inside the window when it would stick out.
+pub fun core_overlay(c: ptr<Ctx>, anchor: i32, placement: i32, dx: i32, dy: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var id: i32 = new_node(c, NONE, K_BOX, false);
+    var n: ptr<Node> = &c.nodes[id];
+    n.overlay = true;
+    n.in_ov = true;
+    n.ov_anchor = anchor;
+    n.ov_place = placement;
+    n.ov_dx = dx;
+    n.ov_dy = dy;
+    return id;
+}
+
+pub fun core_column(c: ptr<Ctx>, parent: i32, padding: i32, spacing: i32) -> i32 {
+    return container(c, parent, false, padding, spacing);
+}
+
+pub fun core_row(c: ptr<Ctx>, parent: i32, padding: i32, spacing: i32) -> i32 {
+    return container(c, parent, true, padding, spacing);
+}
+
+pub fun scroll_box(c: ptr<Ctx>, parent: i32, scroll_id: i32, horizontal: bool) -> i32 {
+    if (scroll_id < 0 || c == null) { return NONE; }
+    scroll_slot(c, scroll_id);
+    var id: i32 = add_node(c, parent, K_BOX);
+    if (id == NONE) { return NONE; }
+    c.nodes[id].scroll_id = scroll_id;
+    c.nodes[id].scroll_x = horizontal;
+    return id;
+}
+
+// A vertically scrolling box. `scroll_id` (>= 0) is chosen by the caller and
+// must stay the same from frame to frame: the offset lives in the context under
+// that id. Give the box a height (P_HEIGHT or P_GROW); its content may be taller
+// and is clipped and scrolled with the mouse wheel (core_scroll).
+pub fun core_scroll_box(c: ptr<Ctx>, parent: i32, scroll_id: i32) -> i32 {
+    return scroll_box(c, parent, scroll_id, false);
+}
+
+// A scroll box that also scrolls horizontally when its content is wider than
+// the box (core_scroll_h, a horizontal scrollbar, Left / Right keys). Give it a
+// width as well as a height, as a vertical scroll box needs a height: stretch it
+// in a column (P_ALIGN = STRETCH on the parent), grow it in a row (P_GROW), or
+// fix its width (P_WIDTH). Without one it has no width at all.
+pub fun core_scroll_box_xy(c: ptr<Ctx>, parent: i32, scroll_id: i32) -> i32 {
+    return scroll_box(c, parent, scroll_id, true);
+}
+
+// Sets one style property (P_*) of node `id`. Colors are 0xAARRGGBB; width and
+// height -1 mean auto. Returns 1 on success, 0 for a bad id / property.
+pub fun core_style(c: ptr<Ctx>, id: i32, prop: i32, value: i64) -> i32 {
+    if (c == null || !valid(c, id)) { return 0; }
+    var n: ptr<Node> = &c.nodes[id];
+    var px: i32 = clamp_i64(value, -1, 1048576) as i32;
+    if (prop == P_DIRECTION) { n.row = value == DIR_ROW; }
+    else if (prop == P_PADDING) { n.padding = max_i32(px, 0); }
+    else if (prop == P_GAP) { n.gap = max_i32(px, 0); }
+    else if (prop == P_WIDTH) { if (px < 0) { n.width = AUTO; } else { n.width = px; } }
+    else if (prop == P_HEIGHT) { if (px < 0) { n.height = AUTO; } else { n.height = px; } }
+    else if (prop == P_GROW) { n.grow = max_i32(px, 0); }
+    else if (prop == P_ALIGN) { if (value < START || value > STRETCH) { return 0; } n.align = value; }
+    else if (prop == P_JUSTIFY) { if (value < START || value > BETWEEN) { return 0; } n.justify = value; }
+    else if (prop == P_BACKGROUND) { n.background = value as u32; }
+    else if (prop == P_BORDER) { n.border = value as u32; }
+    else if (prop == P_MARGIN) { n.margin = max_i32(px, 0); }
+    else if (prop == P_RADIUS) { if (px < 0) { n.radius = AUTO; } else { n.radius = px; } }
+    else if (prop == P_COLOR) { n.color = value as u32; }
+    else if (prop == P_FONT_SIZE) { n.font_size = clamp_i64(value, 0, 96) as i32; }
+    else if (prop == P_BOLD) { if (value < 0) { n.bold = 0; } else if (value == 0) { n.bold = 2; } else { n.bold = 1; } }
+    else { return 0; }
+    return 1;
+}
+
+pub fun core_text(c: ptr<Ctx>, parent: i32, text: ptr<u8>, len: i64) -> i32 {
+    if (c == null) { return NONE; }
+    var start: i64 = intern(c, text, len);
+    var id: i32 = add_node(c, parent, K_TEXT);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.text_start = start;
+    n.text_len = c.ntexts - start;
+    return id;
+}
+
+// Makes the label of button / tab `id` start at the left edge (LEFT_PAD px in) instead of being centred;
+// text wider than the button is cut at its edge either way. Used for table cells and tree rows.
+pub fun core_left(c: ptr<Ctx>, id: i32) {
+    if (c == null || !valid(c, id)) { return; }
+    c.nodes[id].left = true;
+}
+
+// Gives node `id` a tooltip: a small box with `text` that appears next to the pointer
+// after it has rested on the node for TIP_DELAY_MS (the core builds it as an overlay).
+pub fun core_tooltip(c: ptr<Ctx>, id: i32, text: ptr<u8>, len: i64) {
+    if (c == null || !valid(c, id)) { return; }
+    var start: i64 = intern(c, text, len);
+    c.nodes[id].tip_start = start;
+    c.nodes[id].tip_len = c.ntexts - start;
+}
+
+// A button that yields `msg` (>= 0) when clicked.
+pub fun core_button(c: ptr<Ctx>, parent: i32, text: ptr<u8>, len: i64, msg: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var start: i64 = intern(c, text, len);
+    var id: i32 = add_node(c, parent, K_BUTTON);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.text_start = start;
+    n.text_len = c.ntexts - start;
+    n.msg = msg;
+    return id;
+}
+
+// A checkbox with a label. `checked` is the current state, owned by the app
+// (Elm style): clicking yields `msg` (>= 0), the app flips its state and
+// rebuilds the view.
+pub fun core_checkbox(c: ptr<Ctx>, parent: i32, text: ptr<u8>, len: i64, checked: bool, msg: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var start: i64 = intern(c, text, len);
+    var id: i32 = add_node(c, parent, K_CHECKBOX);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.text_start = start;
+    n.text_len = c.ntexts - start;
+    n.msg = msg;
+    n.checked = checked;
+    return id;
+}
+
+// A radio button: a checkbox drawn as a circle, for "one of several" choices. `selected`
+// is the app's state; a click (or Enter / Space on the focused one) yields `msg` and
+// the app selects that choice and rebuilds. Tab walks through the choices of a group.
+pub fun core_radio(c: ptr<Ctx>, parent: i32, text: ptr<u8>, len: i64, selected: bool, msg: i32) -> i32 {
+    var id: i32 = core_checkbox(c, parent, text, len, selected, msg);
+    if (id != NONE) { c.nodes[id].radio = true; }
+    return id;
+}
+
+// A tab: a flat button that shows `selected` with an underline. The app keeps which
+// tab is selected and shows the matching content.
+pub fun core_tab(c: ptr<Ctx>, parent: i32, text: ptr<u8>, len: i64, selected: bool, msg: i32) -> i32 {
+    var id: i32 = core_button(c, parent, text, len, msg);
+    if (id != NONE) {
+        c.nodes[id].tab = true;
+        c.nodes[id].checked = selected;
+    }
+    return id;
+}
+
+// A progress bar showing `value` out of `max` (the app's state; the bar is not interactive).
+pub fun core_progress(c: ptr<Ctx>, parent: i32, value: i32, max: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var id: i32 = add_node(c, parent, K_PROGRESS);
+    if (id == NONE) { return NONE; }
+    c.nodes[id].val = value;
+    c.nodes[id].vmax = max;
+    return id;
+}
+
+// A slider: a handle on a groove for a whole number from `min` to `max`. The value lives
+// in the Ui under `slider_id` (like an input's text; ids are shared with inputs, so
+// pick different numbers): it starts at `min`, a click or drag moves it, and so do
+// Left / Right, Home / End and PageUp / PageDown when it has the focus. Read it with
+// core_slider_get, set it with core_slider_set.
+pub fun core_slider(c: ptr<Ctx>, parent: i32, slider_id: i32, min: i32, max: i32) -> i32 {
+    if (c == null || slider_id < 0) { return NONE; }
+    slider_slot(c, slider_id, min);
+    var id: i32 = add_node(c, parent, K_SLIDER);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.input_id = slider_id;
+    n.val = min;
+    n.vmax = max;
+    if (max < min) { n.vmax = min; }
+    return id;
+}
+
+// A multi-line text input, `rows` lines tall (change that with P_HEIGHT / P_GROW). It is an
+// input in every other respect: its text lives in the Ui under `input_id` (core_input_set /
+// core_input_get, newlines included), selection, clipboard and focus work the same. Enter types
+// a newline (Ctrl+Enter submits); Up / Down move between lines keeping the column; Home / End go to
+// the line's start / end (with Ctrl: the whole text's); PageUp / PageDown move a page; the wheel
+// scrolls. Lines are not wrapped: a long one scrolls sideways.
+pub fun core_textarea(c: ptr<Ctx>, parent: i32, input_id: i32, placeholder: ptr<u8>, len: i64, rows: i32) -> i32 {
+    if (c == null || input_id < 0) { return NONE; }
+    var start: i64 = intern(c, placeholder, len);
+    var f: ptr<Field> = field_get(c, input_id);
+    f.multi = true;
+    var id: i32 = add_node(c, parent, K_TEXTAREA);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.text_start = start;
+    n.text_len = c.ntexts - start;
+    n.input_id = input_id;
+    n.val = rows;
+    return id;
+}
+
+// A drop-down: a box showing the chosen option; clicking it (or Enter / Space while it has
+// the focus) opens a list under it. `options` is one text with the options separated
+// by newlines ("Red\nGreen\nBlue"). The choice - the number of the option, from 0 - lives in
+// the Ui under `dropdown_id` (the same id space as inputs and sliders): read it with
+// core_dropdown_get, set it with core_dropdown_set. Up / Down change the choice while the
+// list is closed and move the highlight while it is open; Enter picks, Escape closes.
+pub fun core_dropdown(c: ptr<Ctx>, parent: i32, dropdown_id: i32, options: ptr<u8>, len: i64) -> i32 {
+    if (c == null || dropdown_id < 0) { return NONE; }
+    var start: i64 = intern(c, options, len);
+    slider_slot(c, dropdown_id, 0);
+    var id: i32 = add_node(c, parent, K_DROPDOWN);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.input_id = dropdown_id;
+    n.text_start = start;
+    n.text_len = c.ntexts - start;
+    return id;
+}
+
+// A menu: a flat label that opens a list of items. `items` is the label, then the items, separated
+// by newlines ("File\nOpen\nSave\n-\nQuit"; a line of "-" is a separator). Picking item number k
+// (from 0, separators count) yields the message msg_base + k, from core_click like a button, or from
+// core_activated when it was picked with the keyboard. Put menus in a row to make a menu bar.
+// `menu_id` is a control id like a drop-down's.
+pub fun core_menu(c: ptr<Ctx>, parent: i32, menu_id: i32, items: ptr<u8>, len: i64, msg_base: i32) -> i32 {
+    var id: i32 = core_dropdown(c, parent, menu_id, items, len);
+    if (id == NONE) { return NONE; }
+    c.nodes[id].menu = true;
+    c.nodes[id].msg = msg_base;
+    return id;
+}
+
+// A single-line text input. `input_id` (>= 0) is chosen by the caller and must
+// stay the same from frame to frame: it finds the text and caret again after
+// the tree is rebuilt. `placeholder` is shown while the input is empty and unfocused.
+pub fun core_input(c: ptr<Ctx>, parent: i32, input_id: i32, placeholder: ptr<u8>, len: i64) -> i32 {
+    if (c == null || input_id < 0) { return NONE; }
+    var start: i64 = intern(c, placeholder, len);
+    field_get(c, input_id);
+    var id: i32 = add_node(c, parent, K_INPUT);
+    if (id == NONE) { return NONE; }
+    var n: ptr<Node> = &c.nodes[id];
+    n.text_start = start;
+    n.text_len = c.ntexts - start;
+    n.input_id = input_id;
+    return id;
+}
+
+// Writes x, y, w, h of node `id` into res[0..4]. Returns 1 on success.
+pub fun core_rect(c: ptr<Ctx>, id: i32, res: ptr<i32>) -> i32 {
+    if (c == null || res == null || !valid(c, id)) { return 0; }
+    var n: ptr<Node> = &c.nodes[id];
+    res[0] = n.x;
+    res[1] = n.y;
+    res[2] = n.w;
+    res[3] = n.h;
+    return 1;
+}

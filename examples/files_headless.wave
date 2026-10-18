@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Renders the file dialog without a window to build/files_*.ppm: the dialog listing the src
+// folder of this repository (relative to where you run it), with a file selected, and after going
+// into a folder and back up.
+// Run with:  WUI_RUN=files_headless wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, ui_new, ui_free, ui_render, ui_set_time, dirlist_new, dirlist_free, path_push, dirlist_count, dirlist_name};
+import("std::fs::file")::{write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./files_view")::{Model, files_view, files_update, files_reload, MSG_OPEN, MSG_ENTRY, MSG_UP, PATH_CAP};
+
+const W: i32 = 460;
+const H: i32 = 420;
+
+fun save(ui: ptr<Ui>, name: str) {
+    var pixels: ptr<u8> = mem_alloc((W * H * 4) as i64);
+    ui_render(ui, pixels, W, H);
+    var n: i32 = W * H;
+    var rgb: ptr<u8> = mem_alloc((n * 3) as i64);
+    var i: i32 = 0;
+    while (i < n) {
+        rgb[i * 3] = pixels[i * 4 + 2];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4];
+        i += 1;
+    }
+    var header: str = "P6\n460 420\n255\n";
+    var hp: ptr<u8> = header as ptr<u8>;
+    var hlen: i64 = 0;
+    while (hp[hlen] != 0) { hlen += 1; }
+    var total: i64 = hlen + (n as i64) * 3;
+    var img: ptr<u8> = mem_alloc(total);
+    var k: i64 = 0;
+    while (k < hlen) { img[k] = hp[k]; k += 1; }
+    var j: i64 = 0;
+    while (j < (n as i64) * 3) { img[hlen + j] = rgb[j]; j += 1; }
+    write(name, img, total);
+    mem_free(img, total);
+    mem_free(rgb, (n * 3) as i64);
+    mem_free(pixels, (W * H * 4) as i64);
+}
+
+fun main() {
+    var ui: Ui = ui_new();
+    var m: Model = Model { open: false, path: mem_alloc(PATH_CAP), list: dirlist_new(), selected: -1, chosen: mem_alloc(PATH_CAP) };
+    m.chosen[0] = 0;
+    var start: str = "src";
+    var sp: ptr<u8> = start as ptr<u8>;
+    var i: i32 = 0;
+    while (sp[i] != 0) { m.path[i] = sp[i]; i += 1; }
+    m.path[i] = 0;
+    ui_set_time(&ui, 0);
+    files_update(&m, MSG_OPEN);
+    files_view(&ui, &m, W, H);
+    save(&ui, "build/files_src.ppm");
+    // select the third entry (a file), then go up to the repository root
+    files_update(&m, MSG_ENTRY + 2);
+    files_view(&ui, &m, W, H);
+    save(&ui, "build/files_selected.ppm");
+    files_update(&m, MSG_UP);
+    files_view(&ui, &m, W, H);
+    save(&ui, "build/files_root.ppm");
+    println("{} entries in the root", dirlist_count(&m.list));
+    ui_free(&ui);
+    dirlist_free(&m.list);
+    println("wrote build/files_src.ppm, files_selected.ppm, files_root.ppm");
+}

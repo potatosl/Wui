@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Window backend for targets without one (macOS has no backend yet): xw_open
+// answers null, so programs print "cannot open a window" and exit. The rest of
+// the API only has to exist so that wui compiles there; headless use (laying a
+// view out and rendering it into your own buffer) works everywhere.
+
+pub const TEXT_MAX: i32 = 32;
+
+pub struct XEv {
+    kind: i32;
+    x: i32;
+    y: i32;
+    a: i32;
+    width: i32;
+    height: i32;
+    mods: i32;
+    text: ptr<u8>;
+    text_len: i32;
+}
+
+pub struct XW {
+    unused: i32;
+}
+
+pub fun x11_new_event() -> ptr<XEv> { return null; }
+pub fun x11_free_event(e: ptr<XEv>) {}
+pub fun xw_open(title: ptr<u8>, len: i64, width: i32, height: i32, visible: bool) -> ptr<XW> { return null; }
+pub fun xw_close(w: ptr<XW>) {}
+pub fun xw_width(w: ptr<XW>) -> i32 { return 0; }
+pub fun xw_height(w: ptr<XW>) -> i32 { return 0; }
+pub fun xw_pixels(w: ptr<XW>) -> ptr<u32> { return null; }
+pub fun xw_pending(w: ptr<XW>) -> bool { return false; }
+pub fun xw_next_event(w: ptr<XW>, outp: ptr<XEv>) -> i32 { return 0; }
+pub fun xw_next_event_timeout(w: ptr<XW>, outp: ptr<XEv>, ms: i32) -> i32 { return 0; }
+pub fun xw_dpi_percent(w: ptr<XW>) -> i32 { return 100; }
+pub fun xw_present(w: ptr<XW>) {}
+pub fun xw_clipboard_set(w: ptr<XW>, text: ptr<u8>, len: i64) {}
+pub fun xw_clipboard_get(w: ptr<XW>, buf: ptr<u8>, cap: i64) -> i64 { return -1; }

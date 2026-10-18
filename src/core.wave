@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// wui core in pure Wave: the view tree, layout, text inputs, scrolling,
+// pointer state and draw-list generation.
+//
+// The tree is rebuilt every frame by the app's `view` function through the
+// `core_*` calls below; nodes are plain `i32` ids. Buttons carry a message
+// number: `core_hit` turns a pointer position into the message of the button
+// under it, which the app's `update` function then handles (Elm style, no
+// callbacks).
+//
+// This module only produces a draw list (`DrawCmd`, see render.wave); render.wave
+// rasterizes it. Text metrics come from the font engine the context was made with.
+//
+// Every pointer argument must be null or valid; null / bad ids are ignored and
+// answered with NONE (-1) or 0 rather than crashing.
+
+// This file is only the front door: the code lives in the src/core/ folder, one file per concern, and is
+// re-exported here under the names the rest of wui (and the tests) import.
+//
+//   core/types     constants, Node / Field / Ctx, small helpers
+//   core/field     text field editing (UTF-8, caret, selection)
+//   core/ctx       context lifecycle, node allocation, id-keyed state tables
+//   core/build     the core_* calls that make the tree
+//   core/pick      hit testing and scrollbar geometry
+//   core/widgets   sliders, drop-downs, menus, tooltips
+//   core/arrange   measure / arrange (layout)
+//   core/textarea  multi-line text areas
+//   core/scroll    wheel, keys, scrollbar dragging
+//   core/focus     Tab order, activation, caret blink
+//   core/input     clicks, drags, text and keys
+//   core/paint     draw-list generation
+
+pub import("./core/types")::{NONE, INPUT_CHANGED, INPUT_SUBMIT, INPUT_COPY, INPUT_CUT, INPUT_PASTE, INPUT_ACTIVATED,
+    INPUT_FOCUS_MOVED, P_DIRECTION, P_PADDING, P_GAP, P_WIDTH, P_HEIGHT, P_GROW, P_ALIGN, P_JUSTIFY, P_BACKGROUND,
+    P_BORDER, P_MARGIN, P_RADIUS, P_COLOR, P_FONT_SIZE, P_BOLD, DIR_COLUMN, DIR_ROW, START, CENTER, END, STRETCH,
+    BETWEEN, OVERLAY_AT, OVERLAY_BELOW, OVERLAY_ABOVE, OVERLAY_RIGHT, OVERLAY_MATCH_WIDTH, OVERLAY_FULL, Ctx,
+    core_theme, core_set_theme, core_fe};
+pub import("./core/field")::{core_input_set, core_input_get};
+pub import("./core/ctx")::{core_engine, core_new, core_free, core_clear};
+pub import("./core/build")::{core_box, core_overlay, core_column, core_row, core_scroll_box, core_scroll_box_xy,
+    core_style, core_text, core_left, core_tooltip, core_button, core_checkbox, core_radio, core_tab, core_progress,
+    core_slider, core_textarea, core_dropdown, core_menu, core_input, core_rect};
+pub import("./core/widgets")::{core_slider_set, core_slider_get, core_dropdown_set, core_dropdown_get,
+    core_dropdown_open};
+pub import("./core/arrange")::{core_layout};
+pub import("./core/scroll")::{core_scroll, core_scroll_h, core_scroll_key, core_scroll_set, core_scroll_set_x,
+    core_scroll_get_x, core_scroll_get};
+pub import("./core/focus")::{core_set_time, core_wake_ms, core_focus_next, core_activated, core_focused_msg,
+    core_input_focus, core_focused};
+pub import("./core/input")::{core_click, core_drag, core_release, core_selection, core_text_input, core_key_input,
+    core_set_pointer, core_hit};
+pub import("./core/paint")::{core_paint, core_changed, core_cmds};

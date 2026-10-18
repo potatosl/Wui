@@ -1,0 +1,2781 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Unit tests of the Wave core (src/core.wave): layout, hit testing, text inputs
+// and selection, painting, scroll boxes. The context uses a font-less engine, so every character is 8 px wide
+// and a line is 16 px high; the numbers below rely on that.
+//
+// Needs nothing but the Wave sources. Run with:  WUI_TASK=wtest wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui::core")::{Ctx, core_new, core_free, core_clear, core_column, core_row, core_text, core_button, core_checkbox,
+                      core_input, core_input_set, core_input_get, core_input_focus, core_focused, core_click, core_drag,
+                      core_release, core_selection, core_text_input, core_key_input, core_box, core_scroll_box, core_scroll,
+                      core_scroll_key, core_scroll_set, core_scroll_get, core_scroll_box_xy, core_scroll_h, core_scroll_set_x, core_scroll_get_x, core_focus_next, core_activated, core_focused_msg, core_set_time, core_wake_ms, core_radio, core_tab, core_progress, core_slider, core_slider_set, core_slider_get, core_textarea, core_dropdown, core_dropdown_set, core_dropdown_get, core_dropdown_open, core_overlay, core_tooltip, core_left, core_menu, OVERLAY_AT, OVERLAY_BELOW, OVERLAY_ABOVE, OVERLAY_RIGHT,
+                      OVERLAY_MATCH_WIDTH, OVERLAY_FULL,
+                      core_style, core_layout, core_rect, core_set_pointer,
+                      core_hit, core_paint, core_changed, core_cmds,
+                      NONE, INPUT_CHANGED, INPUT_SUBMIT, INPUT_COPY, INPUT_CUT, INPUT_PASTE, INPUT_ACTIVATED, INPUT_FOCUS_MOVED,
+                      P_FONT_SIZE, P_BOLD, P_PADDING, P_WIDTH, P_HEIGHT, P_GROW, P_ALIGN, P_JUSTIFY, P_BACKGROUND, P_BORDER, P_MARGIN, P_RADIUS, P_COLOR, P_GAP,
+                      CENTER, END, STRETCH, BETWEEN,
+                      core_theme, core_set_theme};
+import("wui::theme")::{Theme, theme_light, theme_dark, theme_scale, COLOR_BUTTON, COLOR_BUTTON_HOVER, COLOR_FIELD, COLOR_FIELD_FOCUS,
+                       COLOR_PLACEHOLDER, COLOR_SELECTION, COLOR_SCROLL_THUMB, COLOR_ACCENT, FIELD_PAD_X, RADIUS_BUTTON};
+import("wui::font")::{FontEngine, font_new, font_free};
+import("wui::render")::{TEXT_BOLD, DrawCmd, DRAW_CMD_SIZE, CMD_FILL, CMD_BORDER, CMD_TEXT, CMD_CLIP, CMD_CLIP_END, CMD_LINE,
+                         CMD_ROUND_FILL, CMD_ROUND_BORDER};
+import("wui::unicode")::{unicode_is_alnum, unicode_is_control};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+const KEY_BACKSPACE: i32 = 8;
+const KEY_TAB: i32 = 9;
+const KEY_ESCAPE: i32 = 27;
+const KEY_ENTER: i32 = 13;
+const KEY_DELETE: i32 = 127;
+const KEY_LEFT: i32 = 1001;
+const KEY_RIGHT: i32 = 1002;
+const KEY_UP: i32 = 1003;
+const KEY_DOWN: i32 = 1004;
+const KEY_HOME: i32 = 1005;
+const KEY_END: i32 = 1006;
+const KEY_PAGE_UP: i32 = 1007;
+const KEY_PAGE_DOWN: i32 = 1008;
+const KEY_A: i32 = 97;
+const KEY_C: i32 = 99;
+const KEY_V: i32 = 118;
+const KEY_X: i32 = 120;
+const SHIFT: i32 = 1;
+const CTRL: i32 = 2;
+
+// ---- harness ------------------------------------------------------------------------
+
+struct T {
+    fe: ptr<FontEngine>;              // font-less: 8x16 metrics
+    name: str;                        // the test being run
+    checks: i32;
+    failures: i32;
+}
+
+fun begin(t: ptr<T>, name: str) {
+    t.name = name;
+}
+
+fun eq(t: ptr<T>, what: str, got: i64, want: i64) {
+    t.checks += 1;
+    if (got != want) {
+        t.failures += 1;
+        println("FAIL {}: {}: got {} want {}", t.name, what, got, want);
+    }
+}
+
+fun ok(t: ptr<T>, what: str, cond: bool) {
+    t.checks += 1;
+    if (!cond) {
+        t.failures += 1;
+        println("FAIL {}: {}", t.name, what);
+    }
+}
+
+fun slen(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) { n += 1; }
+    return n;
+}
+
+fun new_ctx(t: ptr<T>) -> ptr<Ctx> {
+    return core_new(t.fe);
+}
+
+fun txt(c: ptr<Ctx>, p: i32, s: str) -> i32 { return core_text(c, p, s as ptr<u8>, slen(s)); }
+fun btn(c: ptr<Ctx>, p: i32, s: str, m: i32) -> i32 { return core_button(c, p, s as ptr<u8>, slen(s), m); }
+fun chk(c: ptr<Ctx>, p: i32, s: str, on: bool, m: i32) -> i32 { return core_checkbox(c, p, s as ptr<u8>, slen(s), on, m); }
+fun feed(c: ptr<Ctx>, s: str) -> i32 { return core_text_input(c, s as ptr<u8>, slen(s)); }
+fun key(c: ptr<Ctx>, k: i32, mods: i32) -> i32 { return core_key_input(c, k, mods); }
+
+fun rc(c: ptr<Ctx>, id: i32, k: i32) -> i32 {
+    var r: array<i32, 4>;
+    r[0] = -9999; r[1] = -9999; r[2] = -9999; r[3] = -9999;
+    core_rect(c, id, &r[0]);
+    return r[k];
+}
+
+fun rect_is(t: ptr<T>, what: str, c: ptr<Ctx>, id: i32, x: i32, y: i32, w: i32, h: i32) {
+    var r: array<i32, 4>;
+    r[0] = -9999; r[1] = -9999; r[2] = -9999; r[3] = -9999;
+    eq(t, what, core_rect(c, id, &r[0]) as i64, 1);
+    eq(t, what, r[0] as i64, x as i64);
+    eq(t, what, r[1] as i64, y as i64);
+    eq(t, what, r[2] as i64, w as i64);
+    eq(t, what, r[3] as i64, h as i64);
+}
+
+// A box with fixed size and grow.
+fun bx(c: ptr<Ctx>, parent: i32, w: i64, h: i64, grow: i64) -> i32 {
+    var id: i32 = core_box(c, parent);
+    core_style(c, id, P_WIDTH, w);
+    core_style(c, id, P_HEIGHT, h);
+    core_style(c, id, P_GROW, grow);
+    return id;
+}
+
+// The draw list as an array of commands.
+struct Cmds {
+    p: ptr<u8>;
+    n: i64;
+}
+
+fun paint(c: ptr<Ctx>, w: i32, h: i32) -> Cmds {
+    core_paint(c, w, h);
+    var n: i64 = 0;
+    var p: ptr<u8> = core_cmds(c, &n);
+    return Cmds { p: p, n: n };
+}
+
+fun cmd(cs: ptr<Cmds>, i: i64) -> ptr<DrawCmd> {
+    return &cs.p[i * DRAW_CMD_SIZE] as ptr<DrawCmd>;
+}
+
+fun count_kind(cs: ptr<Cmds>, kind: i32) -> i32 {
+    var k: i32 = 0;
+    var i: i64 = 0;
+    while (i < cs.n) { if (cmd(cs, i).kind == kind) { k += 1; } i += 1; }
+    return k;
+}
+
+fun count_color(cs: ptr<Cmds>, color: u32) -> i32 {
+    var k: i32 = 0;
+    var i: i64 = 0;
+    while (i < cs.n) { if (cmd(cs, i).color == color) { k += 1; } i += 1; }
+    return k;
+}
+
+// Index of the first command of `kind`, or -1.
+fun find_kind(cs: ptr<Cmds>, kind: i32) -> i64 {
+    var i: i64 = 0;
+    while (i < cs.n) { if (cmd(cs, i).kind == kind) { return i; } i += 1; }
+    return -1;
+}
+
+fun find_color(cs: ptr<Cmds>, color: u32) -> i64 {
+    var i: i64 = 0;
+    while (i < cs.n) { if (cmd(cs, i).color == color) { return i; } i += 1; }
+    return -1;
+}
+
+// Does the text of input `id` equal `want`?
+fun input_is(t: ptr<T>, c: ptr<Ctx>, id: i32, want: str) {
+    var buf: ptr<u8> = mem_alloc(300);
+    var n: i64 = core_input_get(c, id, buf, 300);
+    eq(t, "input length", n, slen(want));
+    var w: ptr<u8> = want as ptr<u8>;
+    var i: i64 = 0;
+    var same: bool = n == slen(want);
+    while (same && i < n) { if (buf[i] != w[i]) { same = false; } i += 1; }
+    ok(t, "input text", same);
+    mem_free(buf, 300);
+}
+
+fun selection_is(t: ptr<T>, c: ptr<Ctx>, want: str) {
+    var buf: ptr<u8> = mem_alloc(300);
+    var n: i64 = core_selection(c, buf, 300);
+    eq(t, "selection length", n, slen(want));
+    var w: ptr<u8> = want as ptr<u8>;
+    var i: i64 = 0;
+    var same: bool = n == slen(want);
+    while (same && i < n) { if (buf[i] != w[i]) { same = false; } i += 1; }
+    ok(t, "selection text", same);
+    mem_free(buf, 300);
+}
+
+// ---- layout & hit testing ---------------------------------------------------------------
+
+fun test_column_and_row_layout(t: ptr<T>) {
+    begin(t, "column_and_row_layout");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 10, 4);
+    var tx: i32 = txt(c, col, "Count: 3");                  // 8 chars -> 64 x 16
+    var row: i32 = core_row(c, col, 0, 8);
+    var minus: i32 = btn(c, row, "-", 0);                   // 1 char -> 8+24 x 16+12 = 32 x 28
+    var plus: i32 = btn(c, row, "+", 1);
+    core_layout(c, 200, 100);
+    rect_is(t, "text", c, tx, 10, 10, 64, 16);
+    rect_is(t, "row", c, row, 10, 30, 72, 28);
+    rect_is(t, "minus", c, minus, 10, 30, 32, 28);
+    rect_is(t, "plus", c, plus, 50, 30, 32, 28);
+    rect_is(t, "root fills the window", c, col, 0, 0, 200, 100);
+    core_free(c);
+}
+
+fun test_hit_testing_returns_message(t: ptr<T>) {
+    begin(t, "hit_testing_returns_message");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 10, 4);
+    txt(c, col, "x");
+    var row: i32 = core_row(c, col, 0, 8);
+    btn(c, row, "-", 7);
+    btn(c, row, "+", 9);
+    core_layout(c, 200, 100);
+    // text row is 16 high, so the row starts at y = 10 + 16 + 4 = 30
+    eq(t, "minus", core_hit(c, 12, 32) as i64, 7);
+    eq(t, "plus", core_hit(c, 52, 32) as i64, 9);
+    eq(t, "gap between buttons", core_hit(c, 44, 32) as i64, NONE as i64);
+    eq(t, "outside", core_hit(c, 0, 0) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_invalid_use_is_rejected(t: ptr<T>) {
+    begin(t, "invalid_use_is_rejected");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var tx: i32 = txt(c, col, "a");
+    eq(t, "second root", core_column(c, NONE, 0, 0) as i64, NONE as i64);
+    eq(t, "text cannot hold children", txt(c, tx, "b") as i64, NONE as i64);
+    eq(t, "unknown parent", txt(c, 99, "b") as i64, NONE as i64);
+    eq(t, "null context", txt(null, col, "b") as i64, NONE as i64);
+    var r: array<i32, 4>;
+    r[0] = 0; r[1] = 0; r[2] = 0; r[3] = 0;
+    eq(t, "unknown node rect", core_rect(c, 42, &r[0]) as i64, 0);
+    core_clear(c);
+    eq(t, "usable again after clear", core_column(c, NONE, 0, 0) as i64, 0);
+    core_free(c);
+}
+
+fun test_paint_emits_background_then_widgets(t: ptr<T>) {
+    begin(t, "paint_emits_background_then_widgets");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 4, 4);
+    txt(c, col, "hi");
+    btn(c, col, "ok", 0);
+    core_layout(c, 200, 100);
+    core_set_pointer(c, 8, 30, false);
+    var cs: Cmds = paint(c, 200, 100);
+    eq(t, "command count (bg, text, button fill, border, label)", cs.n, 5);
+    eq(t, "background", cmd(&cs, 0).kind as i64, CMD_FILL as i64);
+    eq(t, "hovered button colour", cmd(&cs, 2).color as i64, COLOR_BUTTON_HOVER as i64);
+    eq(t, "label", cmd(&cs, 4).kind as i64, CMD_TEXT as i64);
+    core_free(c);
+}
+
+fun test_grow_shares_free_space_exactly(t: ptr<T>) {
+    begin(t, "grow_shares_free_space_exactly");
+    var c: ptr<Ctx> = new_ctx(t);
+    var row: i32 = core_row(c, NONE, 0, 0);
+    var a: i32 = bx(c, row, 50, 10, 0);
+    var b: i32 = bx(c, row, -1, 10, 1);
+    var d: i32 = bx(c, row, -1, 10, 2);
+    core_layout(c, 300, 40);
+    rect_is(t, "fixed box", c, a, 0, 0, 50, 10);
+    // free = 250 -> 1/3 and 2/3, remainders cannot be lost
+    eq(t, "shares add up", (rc(c, b, 2) + rc(c, d, 2)) as i64, 250);
+    eq(t, "b x", rc(c, b, 0) as i64, 50);
+    eq(t, "d x", rc(c, d, 0) as i64, (50 + rc(c, b, 2)) as i64);
+    eq(t, "b width", rc(c, b, 2) as i64, 83);
+    core_free(c);
+}
+
+fun test_justify_and_align(t: ptr<T>) {
+    begin(t, "justify_and_align");
+    var c: ptr<Ctx> = new_ctx(t);
+    var row: i32 = core_row(c, NONE, 10, 0);
+    core_style(c, row, P_JUSTIFY, CENTER);
+    core_style(c, row, P_ALIGN, CENTER);
+    var a: i32 = bx(c, row, 40, 20, 0);
+    core_layout(c, 200, 100);
+    rect_is(t, "centred in both axes", c, a, 10 + 70, 10 + 30, 40, 20);   // inner 180 x 80
+
+    core_clear(c);
+    row = core_row(c, NONE, 0, 0);
+    core_style(c, row, P_JUSTIFY, END);
+    a = bx(c, row, 40, 20, 0);
+    core_layout(c, 200, 100);
+    rect_is(t, "justify end", c, a, 160, 0, 40, 20);
+
+    core_clear(c);
+    row = core_row(c, NONE, 0, 0);
+    core_style(c, row, P_JUSTIFY, BETWEEN);
+    a = bx(c, row, 40, 20, 0);
+    var b: i32 = bx(c, row, 40, 20, 0);
+    var d: i32 = bx(c, row, 40, 20, 0);
+    core_layout(c, 200, 100);
+    eq(t, "between a", rc(c, a, 0) as i64, 0);
+    eq(t, "between b", rc(c, b, 0) as i64, 80);
+    eq(t, "between d", rc(c, d, 0) as i64, 160);
+    core_free(c);
+}
+
+fun test_stretch_skips_fixed_cross_size(t: ptr<T>) {
+    begin(t, "stretch_skips_fixed_cross_size");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var a: i32 = bx(c, col, -1, 10, 0);                     // auto width -> stretched
+    var b: i32 = bx(c, col, 30, 10, 0);                     // fixed width -> kept
+    core_layout(c, 200, 100);
+    rect_is(t, "stretched", c, a, 0, 0, 200, 10);
+    rect_is(t, "fixed", c, b, 0, 10, 30, 10);
+    core_free(c);
+}
+
+fun test_button_label_is_centred_when_stretched(t: ptr<T>) {
+    begin(t, "button_label_is_centred_when_stretched");
+    var c: ptr<Ctx> = new_ctx(t);
+    var row: i32 = core_row(c, NONE, 0, 0);
+    var b: i32 = btn(c, row, "ok", 3);                      // text 16 wide, natural 40 x 28
+    core_style(c, b, P_GROW, 1);
+    core_layout(c, 200, 28);
+    rect_is(t, "button", c, b, 0, 0, 200, 28);
+    var cs: Cmds = paint(c, 200, 28);
+    var label: ptr<DrawCmd> = cmd(&cs, cs.n - 1);
+    eq(t, "label kind", label.kind as i64, CMD_TEXT as i64);
+    eq(t, "label x", label.x as i64, ((200 - 16) / 2) as i64);
+    eq(t, "label y", label.y as i64, ((28 - 16) / 2) as i64);
+    core_free(c);
+}
+
+fun test_box_background_and_border_are_painted(t: ptr<T>) {
+    begin(t, "box_background_and_border_are_painted");
+    var c: ptr<Ctx> = new_ctx(t);
+    var b: i32 = core_box(c, NONE);
+    core_style(c, b, P_BACKGROUND, 0xFF112233);
+    core_style(c, b, P_BORDER, 0xFF445566);
+    eq(t, "unknown property", core_style(c, b, 99, 1) as i64, 0);
+    eq(t, "unknown node", core_style(c, 42, P_GAP, 1) as i64, 0);
+    core_layout(c, 50, 40);
+    var cs: Cmds = paint(c, 50, 40);
+    eq(t, "window bg, box fill, box border", cs.n, 3);
+    eq(t, "fill colour", cmd(&cs, 1).color as i64, 0xFF112233);
+    eq(t, "border colour", cmd(&cs, 2).color as i64, 0xFF445566);
+    core_free(c);
+}
+
+// ---- text inputs -------------------------------------------------------------------------------
+
+fun make_input(c: ptr<Ctx>) -> i32 {
+    var col: i32 = core_column(c, NONE, 10, 0);
+    var id: i32 = core_input(c, col, 7, "name" as ptr<u8>, 4);
+    core_layout(c, 300, 100);
+    return id;
+}
+
+fun test_typing_edits_the_focused_input_only(t: ptr<T>) {
+    begin(t, "typing_edits_the_focused_input_only");
+    var c: ptr<Ctx> = new_ctx(t);
+    make_input(c);
+    eq(t, "no focus yet", feed(c, "abc") as i64, 0);
+    core_input_focus(c, 7);
+    eq(t, "focused", core_focused(c) as i64, 7);
+    eq(t, "typed", feed(c, "abc") as i64, INPUT_CHANGED as i64);
+    eq(t, "left", key(c, KEY_LEFT, 0) as i64, 0);
+    eq(t, "typed X", feed(c, "X") as i64, INPUT_CHANGED as i64);
+    input_is(t, c, 7, "abXc");
+    eq(t, "backspace", key(c, KEY_BACKSPACE, 0) as i64, INPUT_CHANGED as i64);
+    input_is(t, c, 7, "abc");
+    eq(t, "delete the c after the caret", key(c, KEY_DELETE, 0) as i64, INPUT_CHANGED as i64);
+    input_is(t, c, 7, "ab");
+    eq(t, "nothing after the caret", key(c, KEY_DELETE, 0) as i64, 0);
+    key(c, KEY_HOME, 0);
+    eq(t, "nothing before it", key(c, KEY_BACKSPACE, 0) as i64, 0);
+    eq(t, "enter submits", key(c, KEY_ENTER, 0) as i64, INPUT_SUBMIT as i64);
+    eq(t, "control characters are dropped", feed(c, "\n\x07") as i64, 0);
+    core_free(c);
+}
+
+fun test_editing_respects_utf8_boundaries(t: ptr<T>) {
+    begin(t, "editing_respects_utf8_boundaries");
+    var c: ptr<Ctx> = new_ctx(t);
+    make_input(c);
+    core_input_focus(c, 7);
+    feed(c, "가나다");
+    key(c, KEY_BACKSPACE, 0);
+    input_is(t, c, 7, "가나");                               // a whole character, not one byte
+    key(c, KEY_LEFT, 0);
+    feed(c, "x");
+    input_is(t, c, 7, "가x나");
+    key(c, KEY_END, 0);
+    key(c, KEY_RIGHT, 0);                                   // already at the end: stays
+    feed(c, "!");
+    input_is(t, c, 7, "가x나!");
+    core_free(c);
+}
+
+fun test_state_survives_frames_and_set_get_work(t: ptr<T>) {
+    begin(t, "state_survives_frames_and_set_get_work");
+    var c: ptr<Ctx> = new_ctx(t);
+    make_input(c);
+    eq(t, "set", core_input_set(c, 7, "hello" as ptr<u8>, 5) as i64, 1);
+    core_input_focus(c, 7);
+    core_clear(c);                                          // new frame: the tree is gone, the text is not
+    make_input(c);
+    input_is(t, c, 7, "hello");
+    eq(t, "focus kept", core_focused(c) as i64, 7);
+    var tiny: ptr<u8> = mem_alloc(3);
+    eq(t, "buffer too small", core_input_get(c, 7, tiny, 3), -1);
+    eq(t, "unknown id", core_input_get(c, 99, tiny, 3), -1);
+    var bad: ptr<u8> = mem_alloc(2);
+    bad[0] = 0xFF;
+    bad[1] = 0xFE;
+    eq(t, "not UTF-8", core_input_set(c, 7, bad, 2) as i64, 0);
+    mem_free(tiny, 3);
+    mem_free(bad, 2);
+    core_free(c);
+}
+
+fun test_click_focuses_and_places_the_caret(t: ptr<T>) {
+    begin(t, "click_focuses_and_places_the_caret");
+    var c: ptr<Ctx> = new_ctx(t);
+    var id: i32 = make_input(c);
+    core_input_set(c, 7, "abcdef" as ptr<u8>, 6);
+    var rx: i32 = rc(c, id, 0);
+    var ry: i32 = rc(c, id, 1);
+    // text starts at r.x + 6; each char is 8 px wide: x = 16 + 8*3 -> after "abc"
+    eq(t, "click", core_click(c, rx + 6 + 8 * 3 + 1, ry + 5, 0) as i64, NONE as i64);
+    eq(t, "focused", core_focused(c) as i64, 7);
+    feed(c, "_");
+    input_is(t, c, 7, "abc_def");
+    core_click(c, 250, 90, 0);                              // empty area removes focus
+    eq(t, "focus removed", core_focused(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_clicking_a_button_returns_its_message_and_drops_focus(t: ptr<T>) {
+    begin(t, "clicking_a_button_returns_its_message_and_drops_focus");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_input(c, col, 1, null, 0);
+    btn(c, col, "go", 5);
+    core_layout(c, 300, 100);
+    core_input_focus(c, 1);
+    eq(t, "message", core_click(c, 5, 50, 0) as i64, 5);    // the button is below the 26 px input
+    eq(t, "focus dropped", core_focused(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_focused_input_paints_caret_clip_and_placeholder(t: ptr<T>) {
+    begin(t, "focused_input_paints_caret_clip_and_placeholder");
+    var c: ptr<Ctx> = new_ctx(t);
+    make_input(c);
+    core_layout(c, 300, 100);
+    var cs: Cmds = paint(c, 300, 100);
+    // empty + unfocused: placeholder text in gray, no caret
+    var found: bool = false;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_TEXT && cmd(&cs, i).color == COLOR_PLACEHOLDER) { found = true; }
+        i += 1;
+    }
+    ok(t, "placeholder text", found);
+    ok(t, "clip", find_kind(&cs, CMD_CLIP) >= 0);
+    eq(t, "ends with the clip end", cmd(&cs, cs.n - 1).kind as i64, CMD_CLIP_END as i64);
+
+    core_input_focus(c, 7);
+    feed(c, "hi");
+    cs = paint(c, 300, 100);
+    eq(t, "no placeholder when focused", count_color(&cs, COLOR_PLACEHOLDER) as i64, 0);
+    // caret: 1 px wide fill right after "hi" (x = 10 + 6 + 16)
+    var caret: bool = false;
+    i = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_FILL && cmd(&cs, i).w == 1 && cmd(&cs, i).x == 32) { caret = true; }
+        i += 1;
+    }
+    ok(t, "caret", caret);
+    var focus_border: bool = false;
+    i = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_ROUND_BORDER && cmd(&cs, i).color == COLOR_FIELD_FOCUS) { focus_border = true; }
+        i += 1;
+    }
+    ok(t, "focus border", focus_border);
+    core_free(c);
+}
+
+fun test_long_text_scrolls_to_keep_the_caret_visible(t: ptr<T>) {
+    begin(t, "long_text_scrolls_to_keep_the_caret_visible");
+    var c: ptr<Ctx> = new_ctx(t);
+    make_input(c);
+    core_input_focus(c, 7);
+    var i: i32 = 0;
+    while (i < 60) { feed(c, "w"); i += 1; }                // 480 px of text in a 188 px wide field
+    var cs: Cmds = paint(c, 300, 100);
+    var k: i64 = 0;
+    var caret_x: i32 = -1;
+    while (k < cs.n && caret_x < 0) {
+        if (cmd(&cs, k).kind == CMD_FILL && cmd(&cs, k).w == 1) { caret_x = cmd(&cs, k).x; }
+        k += 1;
+    }
+    ok(t, "caret found", caret_x >= 0);
+    ok(t, "caret is inside the field", caret_x <= 10 + 200 - FIELD_PAD_X);
+    core_free(c);
+}
+
+fun build_same(c: ptr<Ctx>) {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 4, 4);
+    txt(c, col, "same");
+    btn(c, col, "go", 1);
+    core_layout(c, 200, 100);
+}
+
+fun test_unchanged_frames_are_detected(t: ptr<T>) {
+    begin(t, "unchanged_frames_are_detected");
+    var c: ptr<Ctx> = new_ctx(t);
+    build_same(c);
+    core_paint(c, 200, 100);
+    ok(t, "first frame", core_changed(c));
+    build_same(c);
+    core_paint(c, 200, 100);
+    ok(t, "rebuilt identically: nothing to redraw", !core_changed(c));
+    core_set_pointer(c, 8, 8 + 16 + 4 + 5, false);          // hover the button
+    core_paint(c, 200, 100);
+    ok(t, "its colour changed", core_changed(c));
+    core_paint(c, 200, 100);
+    ok(t, "again: unchanged", !core_changed(c));
+    core_paint(c, 300, 100);                                // new window size
+    ok(t, "new size", core_changed(c));
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 4, 4);
+    txt(c, col, "diff!");                                   // same length class, different bytes
+    core_layout(c, 300, 100);
+    core_paint(c, 300, 100);
+    ok(t, "different text", core_changed(c));
+    core_free(c);
+}
+
+// ---- checkboxes ---------------------------------------------------------------------------------
+
+fun test_checkbox_layout_hit_and_click(t: ptr<T>) {
+    begin(t, "checkbox_layout_hit_and_click");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 10, 6);
+    var a: i32 = chk(c, col, "Subscribe", false, 4);        // 9 chars: 16 + 8 + 72 = 96 wide
+    var b: i32 = chk(c, col, "x", true, 5);
+    core_layout(c, 300, 100);
+    rect_is(t, "a", c, a, 10, 10, 96, 16);
+    rect_is(t, "b", c, b, 10, 32, 32, 16);
+    eq(t, "hit square", core_hit(c, 12, 12) as i64, 4);
+    eq(t, "hit label", core_hit(c, 100, 12) as i64, 4);     // the label is part of the target
+    eq(t, "hit b", core_hit(c, 12, 34) as i64, 5);
+    eq(t, "miss", core_hit(c, 200, 12) as i64, NONE as i64);
+    core_input(c, col, 1, null, 0);
+    core_input_focus(c, 1);
+    core_layout(c, 300, 100);
+    eq(t, "click", core_click(c, 12, 12, 0) as i64, 4);
+    eq(t, "a checkbox click drops input focus", core_focused(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_checkbox_paint_reflects_state(t: ptr<T>) {
+    begin(t, "checkbox_paint_reflects_state");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    chk(c, col, "on", true, 1);
+    core_layout(c, 100, 100);
+    var cs: Cmds = paint(c, 100, 100);
+    var filled: bool = false;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_ROUND_FILL && cmd(&cs, i).color == COLOR_ACCENT) { filled = true; }
+        i += 1;
+    }
+    ok(t, "filled (rounded) square", filled);
+    eq(t, "the tick is two strokes", count_kind(&cs, CMD_LINE) as i64, 2);
+
+    core_clear(c);
+    col = core_column(c, NONE, 0, 0);
+    chk(c, col, "off", false, 1);
+    core_layout(c, 100, 100);
+    cs = paint(c, 100, 100);
+    eq(t, "no tick", count_kind(&cs, CMD_LINE) as i64, 0);
+    var white: bool = false;
+    i = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_ROUND_FILL && cmd(&cs, i).color == COLOR_FIELD) { white = true; }
+        i += 1;
+    }
+    ok(t, "white square", white);
+    ok(t, "the label", find_kind(&cs, CMD_TEXT) >= 0);
+    core_free(c);
+}
+
+// ---- margin, colour, radius ---------------------------------------------------------------------
+
+fun test_margin_adds_space_around_a_node(t: ptr<T>) {
+    begin(t, "margin_adds_space_around_a_node");
+    var c: ptr<Ctx> = new_ctx(t);
+    var row: i32 = core_row(c, NONE, 0, 0);
+    var a: i32 = bx(c, row, 20, 10, 0);
+    var b: i32 = bx(c, row, 20, 10, 0);
+    core_style(c, a, P_MARGIN, 5);
+    core_style(c, b, P_MARGIN, 5);
+    core_layout(c, 200, 100);
+    // each takes 30 x 20 of room, drawn 20 x 10 in the middle of it
+    rect_is(t, "a", c, a, 5, 5, 20, 10);
+    rect_is(t, "b", c, b, 35, 5, 20, 10);
+    core_free(c);
+}
+
+fun test_margin_counts_in_grow_stretch_and_centering(t: ptr<T>) {
+    begin(t, "margin_counts_in_grow_stretch_and_centering");
+    var c: ptr<Ctx> = new_ctx(t);
+    var row: i32 = core_row(c, NONE, 0, 0);
+    core_style(c, row, P_ALIGN, STRETCH);
+    var a: i32 = bx(c, row, -1, -1, 1);
+    core_style(c, a, P_MARGIN, 10);
+    core_layout(c, 200, 100);
+    rect_is(t, "fills its cell minus the margin", c, a, 10, 10, 180, 80);
+
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, CENTER);
+    a = bx(c, col, 40, 20, 0);
+    core_style(c, a, P_MARGIN, 10);
+    core_layout(c, 200, 100);
+    eq(t, "centred with margin", rc(c, a, 0) as i64, ((200 - 60) / 2 + 10) as i64);
+    core_free(c);
+}
+
+fun test_text_colour_is_inherited_and_can_be_overridden(t: ptr<T>) {
+    begin(t, "text_colour_is_inherited_and_can_be_overridden");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_COLOR, 0xFFCC0000);
+    txt(c, col, "inherits");
+    var own: i32 = txt(c, col, "own");
+    core_style(c, own, P_COLOR, 0xFF0000CC);
+    var inner: i32 = core_column(c, col, 0, 0);             // nested box: still inherits from the outer one
+    txt(c, inner, "deep");
+    btn(c, col, "ok", 1);
+    core_layout(c, 200, 100);
+    var cs: Cmds = paint(c, 200, 100);
+    var want: array<u32, 4>;
+    want[0] = 0xFFCC0000; want[1] = 0xFF0000CC; want[2] = 0xFFCC0000; want[3] = 0xFFCC0000;
+    var seen: i32 = 0;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_TEXT) {
+            if (seen < 4) { eq(t, "text colour", cmd(&cs, i).color as i64, want[seen] as i64); }
+            seen += 1;
+        }
+        i += 1;
+    }
+    eq(t, "four texts", seen as i64, 4);
+    core_free(c);
+}
+
+fun test_radius_selects_rounded_commands(t: ptr<T>) {
+    begin(t, "radius_selects_rounded_commands");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var card: i32 = core_box(c, col);
+    core_style(c, card, P_BACKGROUND, 0xFFFFFFFF);
+    core_style(c, card, P_BORDER, 0xFF808080);
+    core_style(c, card, P_RADIUS, 8);
+    btn(c, col, "ok", 1);
+    var sharp: i32 = bx(c, col, 10, 10, 0);
+    core_style(c, sharp, P_BACKGROUND, 0xFF112233);
+    core_layout(c, 200, 100);
+    var cs: Cmds = paint(c, 200, 100);
+    // the card (fill + border) and the button (fill + border) are rounded
+    eq(t, "rounded commands", (count_kind(&cs, CMD_ROUND_FILL) + count_kind(&cs, CMD_ROUND_BORDER)) as i64, 4);
+    var white8: bool = false;
+    var btn_r: bool = false;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(&cs, i);
+        if ((d.kind == CMD_ROUND_FILL || d.kind == CMD_ROUND_BORDER) && d.color == 0xFFFFFFFF && d.text_len == 8) { white8 = true; }
+        if ((d.kind == CMD_ROUND_FILL || d.kind == CMD_ROUND_BORDER) && d.text_len == (RADIUS_BUTTON as i64)) { btn_r = true; }
+        i += 1;
+    }
+    ok(t, "card radius 8", white8);
+    ok(t, "button default radius", btn_r);
+    var plain: bool = false;
+    i = 0;
+    while (i < cs.n) {
+        if (cmd(&cs, i).kind == CMD_FILL && cmd(&cs, i).color == 0xFF112233) { plain = true; }
+        i += 1;
+    }
+    ok(t, "a plain box stays square", plain);
+    core_free(c);
+}
+
+// ---- selection & clipboard keys ------------------------------------------------------------------
+
+fun focused_with(c: ptr<Ctx>, text: str) {
+    make_input(c);
+    core_input_set(c, 7, text as ptr<u8>, slen(text));
+    core_input_focus(c, 7);
+}
+
+fun test_shift_arrows_home_end_select(t: ptr<T>) {
+    begin(t, "shift_arrows_home_end_select");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "hello world");
+    key(c, KEY_HOME, 0);
+    var i: i32 = 0;
+    while (i < 5) { key(c, KEY_RIGHT, SHIFT); i += 1; }
+    selection_is(t, c, "hello");
+    key(c, KEY_LEFT, SHIFT);
+    selection_is(t, c, "hell");                             // shrinks again
+    key(c, KEY_END, SHIFT);
+    selection_is(t, c, "hello world");
+    key(c, KEY_HOME, SHIFT);                                // anchor is at 0 -> the caret moves to 0
+    selection_is(t, c, "");
+    core_free(c);
+}
+
+fun test_plain_arrow_collapses_the_selection_to_its_edge(t: ptr<T>) {
+    begin(t, "plain_arrow_collapses_the_selection_to_its_edge");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "abcdef");
+    key(c, KEY_HOME, 0);
+    key(c, KEY_RIGHT, 0);
+    key(c, KEY_RIGHT, SHIFT);
+    key(c, KEY_RIGHT, SHIFT);                               // "bc" selected, caret after c
+    selection_is(t, c, "bc");
+    key(c, KEY_LEFT, 0);                                    // collapses to the left edge, no extra step
+    selection_is(t, c, "");
+    feed(c, "X");
+    input_is(t, c, 7, "aXbcdef");
+    core_free(c);
+}
+
+fun test_typing_replaces_and_backspace_deletes_the_selection(t: ptr<T>) {
+    begin(t, "typing_replaces_and_backspace_deletes_the_selection");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "hello world");
+    key(c, KEY_A, CTRL);                                    // select all
+    selection_is(t, c, "hello world");
+    eq(t, "type over", feed(c, "bye") as i64, INPUT_CHANGED as i64);
+    input_is(t, c, 7, "bye");
+    key(c, KEY_A, CTRL);
+    eq(t, "backspace", key(c, KEY_BACKSPACE, 0) as i64, INPUT_CHANGED as i64);
+    input_is(t, c, 7, "");
+    feed(c, "abc");
+    key(c, KEY_LEFT, SHIFT);
+    eq(t, "delete", key(c, KEY_DELETE, 0) as i64, INPUT_CHANGED as i64);
+    input_is(t, c, 7, "ab");
+    core_free(c);
+}
+
+fun test_ctrl_arrows_move_by_word(t: ptr<T>) {
+    begin(t, "ctrl_arrows_move_by_word");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "one two  three");
+    key(c, KEY_HOME, 0);
+    key(c, KEY_RIGHT, CTRL | SHIFT);
+    selection_is(t, c, "one");
+    key(c, KEY_RIGHT, CTRL | SHIFT);
+    selection_is(t, c, "one two");
+    key(c, KEY_END, 0);
+    key(c, KEY_LEFT, CTRL | SHIFT);
+    selection_is(t, c, "three");
+    core_free(c);
+}
+
+fun test_selection_respects_utf8(t: ptr<T>) {
+    begin(t, "selection_respects_utf8");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "가나다라");
+    key(c, KEY_HOME, 0);
+    key(c, KEY_RIGHT, SHIFT);
+    key(c, KEY_RIGHT, SHIFT);
+    selection_is(t, c, "가나");
+    feed(c, "x");
+    input_is(t, c, 7, "x다라");
+    key(c, KEY_END, SHIFT);
+    key(c, KEY_LEFT, CTRL | SHIFT);                         // word move over Hangul
+    selection_is(t, c, "x");                                // anchor after "x", caret back at the word start (0)
+    core_free(c);
+}
+
+fun test_clipboard_requests_are_flagged_for_the_app(t: ptr<T>) {
+    begin(t, "clipboard_requests_are_flagged_for_the_app");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "copy me");
+    eq(t, "nothing selected: nothing to copy", key(c, KEY_C, CTRL) as i64, 0);
+    eq(t, "nothing to cut", key(c, KEY_X, CTRL) as i64, 0);
+    eq(t, "paste", key(c, KEY_V, CTRL) as i64, INPUT_PASTE as i64);
+    key(c, KEY_A, CTRL);
+    eq(t, "copy", key(c, KEY_C, CTRL) as i64, INPUT_COPY as i64);
+    eq(t, "cut", key(c, KEY_X, CTRL) as i64, INPUT_CUT as i64);
+    selection_is(t, c, "copy me");                          // flags do not touch the text; the app does
+    eq(t, "no Ctrl: just a letter", key(c, KEY_C, 0) as i64, 0);
+    core_free(c);
+}
+
+fun test_mouse_press_drag_release_and_shift_click(t: ptr<T>) {
+    begin(t, "mouse_press_drag_release_and_shift_click");
+    var c: ptr<Ctx> = new_ctx(t);
+    var id: i32 = make_input(c);
+    core_input_set(c, 7, "abcdefgh" as ptr<u8>, 8);
+    var rx: i32 = rc(c, id, 0);
+    var y: i32 = rc(c, id, 1) + 5;
+    // x of the boundary after `n` chars: rx + FIELD_PAD_X + 8 * n
+    core_click(c, rx + FIELD_PAD_X + 16, y, 0);
+    selection_is(t, c, "");                                 // a press only places the caret
+    eq(t, "drag", core_drag(c, rx + FIELD_PAD_X + 40, y) as i64, 1);
+    selection_is(t, c, "cde");
+    eq(t, "dragging back over the anchor flips the side", core_drag(c, rx + FIELD_PAD_X + 8, y) as i64, 1);
+    selection_is(t, c, "b");
+    core_release(c);
+    eq(t, "no drag in progress any more", core_drag(c, rx + FIELD_PAD_X + 56, y) as i64, 0);
+    selection_is(t, c, "b");
+    // Shift+click extends from the anchor, i.e. where the press happened
+    // (after "ab", not the far edge of the selection the drag ended with)
+    core_click(c, rx + FIELD_PAD_X + 48, y, SHIFT);
+    selection_is(t, c, "cdef");
+    core_click(c, rx + FIELD_PAD_X + 24, y, 0);             // plain click clears it
+    selection_is(t, c, "");
+    core_free(c);
+}
+
+fun test_selection_is_painted_only_while_focused(t: ptr<T>) {
+    begin(t, "selection_is_painted_only_while_focused");
+    var c: ptr<Ctx> = new_ctx(t);
+    focused_with(c, "hello");
+    key(c, KEY_A, CTRL);
+    core_layout(c, 300, 100);
+    var cs: Cmds = paint(c, 300, 100);
+    var at: i64 = find_color(&cs, COLOR_SELECTION);
+    ok(t, "highlight", at >= 0);
+    if (at >= 0) {
+        eq(t, "highlight x", cmd(&cs, at).x as i64, (10 + FIELD_PAD_X) as i64);
+        eq(t, "highlight w (all five characters)", cmd(&cs, at).w as i64, 40);
+    }
+    core_input_focus(c, NONE);
+    cs = paint(c, 300, 100);
+    eq(t, "no highlight when unfocused", count_color(&cs, COLOR_SELECTION) as i64, 0);
+    core_free(c);
+}
+
+// ---- scroll boxes ----------------------------------------------------------------------------------
+
+// A 100 px tall scroll box holding ten 16 px texts (160 px of content).
+fun rebuild(c: ptr<Ctx>, items: i32) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var sb: i32 = core_scroll_box(c, col, 7);
+    core_style(c, sb, P_HEIGHT, 100);
+    var i: i32 = 0;
+    while (i < items) { txt(c, sb, "n"); i += 1; }
+    core_layout(c, 200, 300);
+    return sb;
+}
+
+fun test_scroll_box_keeps_its_height_and_shifts_content(t: ptr<T>) {
+    begin(t, "scroll_box_keeps_its_height_and_shifts_content");
+    var c: ptr<Ctx> = new_ctx(t);
+    var sb: i32 = rebuild(c, 10);
+    rect_is(t, "box", c, sb, 0, 0, 200, 100);
+    eq(t, "item 3 (id 5)", rc(c, 5, 1) as i64, 48);
+    eq(t, "one notch = 40 px", core_scroll(c, 10, 10, 1) as i64, 1);
+    rebuild(c, 10);
+    eq(t, "offset", core_scroll_get(c, 7) as i64, 40);
+    eq(t, "item 1 (id 3) moved up and out of view", rc(c, 3, 1) as i64, 16 - 40);
+    eq(t, "the box itself stays in place", rc(c, 1, 1) as i64, 0);
+    core_free(c);
+}
+
+fun test_dragging_the_scrollbar_thumb_scrolls_the_box(t: ptr<T>) {
+    begin(t, "dragging_the_scrollbar_thumb_scrolls_the_box");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);                                         // 100 px box, 160 px content: a 62 px thumb with 38 px of travel
+    var x: i32 = 200 - 6 - 1 + 1;                           // inside the 6 px bar at the right edge
+    eq(t, "grab the thumb 10 px below its top", core_click(c, x, 10, 0) as i64, NONE as i64);
+    eq(t, "half the travel", core_drag(c, x, 10 + 19) as i64, 1);
+    eq(t, "offset", core_scroll_get(c, 7) as i64, 30);
+    eq(t, "far past the end: clamped", core_drag(c, x, 10 + 500) as i64, 1);
+    eq(t, "end", core_scroll_get(c, 7) as i64, 60);
+    core_release(c);
+    eq(t, "released: no more dragging", core_drag(c, x, 0) as i64, 0);
+    eq(t, "stays", core_scroll_get(c, 7) as i64, 60);
+    core_free(c);
+}
+
+fun test_clicking_the_scrollbar_track_centres_the_thumb_there(t: ptr<T>) {
+    begin(t, "clicking_the_scrollbar_track_centres_the_thumb_there");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);
+    core_click(c, 194, 90, 0);                              // low on the track: the thumb's middle (31 px) goes to y = 90
+    eq(t, "offset", core_scroll_get(c, 7) as i64, 60);
+    core_release(c);
+    core_free(c);
+}
+
+fun test_scroll_keys_step_page_and_jump(t: ptr<T>) {
+    begin(t, "scroll_keys_step_page_and_jump");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);                                         // 100 px box, 160 px content: 60 px of travel
+    eq(t, "up at the top", core_scroll_key(c, KEY_UP) as i64, 0);
+    eq(t, "down", core_scroll_key(c, KEY_DOWN) as i64, 1);
+    eq(t, "one step", core_scroll_get(c, 7) as i64, 40);
+    eq(t, "page down", core_scroll_key(c, KEY_PAGE_DOWN) as i64, 1);
+    eq(t, "a page (60 px) overshoots: clamped", core_scroll_get(c, 7) as i64, 60);
+    eq(t, "page down at the end", core_scroll_key(c, KEY_PAGE_DOWN) as i64, 0);
+    eq(t, "page up", core_scroll_key(c, KEY_PAGE_UP) as i64, 1);
+    eq(t, "top", core_scroll_get(c, 7) as i64, 0);
+    eq(t, "end", core_scroll_key(c, KEY_END) as i64, 1);
+    eq(t, "bottom", core_scroll_get(c, 7) as i64, 60);
+    eq(t, "home", core_scroll_key(c, KEY_HOME) as i64, 1);
+    eq(t, "top again", core_scroll_get(c, 7) as i64, 0);
+    eq(t, "not a scroll key", core_scroll_key(c, KEY_ENTER) as i64, 0);
+    core_free(c);
+}
+
+fun test_scroll_keys_prefer_the_box_under_the_pointer(t: ptr<T>) {
+    begin(t, "scroll_keys_prefer_the_box_under_the_pointer");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var id: i32 = 1;
+    while (id <= 2) {
+        var sb: i32 = core_scroll_box(c, col, id);
+        core_style(c, sb, P_HEIGHT, 50);
+        var i: i32 = 0;
+        while (i < 10) { txt(c, sb, "n"); i += 1; }
+        id += 1;
+    }
+    core_layout(c, 200, 300);
+    core_set_pointer(c, 5, 75, false);                      // over the second box (y 50..100)
+    eq(t, "scrolled", core_scroll_key(c, KEY_DOWN) as i64, 1);
+    eq(t, "first box", core_scroll_get(c, 1) as i64, 0);
+    eq(t, "second box", core_scroll_get(c, 2) as i64, 40);
+    core_set_pointer(c, 5, 250, false);                     // over nothing: the first box that can move
+    eq(t, "scrolled again", core_scroll_key(c, KEY_DOWN) as i64, 1);
+    eq(t, "first box moved", core_scroll_get(c, 1) as i64, 40);
+    eq(t, "second box stays", core_scroll_get(c, 2) as i64, 40);
+    core_free(c);
+}
+
+fun test_scroll_is_clamped_to_the_content(t: ptr<T>) {
+    begin(t, "scroll_is_clamped_to_the_content");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);
+    var i: i32 = 0;
+    while (i < 10) { core_scroll(c, 10, 10, 1); i += 1; }
+    rebuild(c, 10);
+    eq(t, "160 - 100", core_scroll_get(c, 7) as i64, 60);
+    eq(t, "already at the end", core_scroll(c, 10, 10, 1) as i64, 0);
+    eq(t, "back", core_scroll(c, 10, 10, -100) as i64, 1);
+    rebuild(c, 10);
+    eq(t, "top", core_scroll_get(c, 7) as i64, 0);
+    eq(t, "already at the top", core_scroll(c, 10, 10, -1) as i64, 0);
+    core_free(c);
+}
+
+fun test_wheel_outside_the_box_does_nothing(t: ptr<T>) {
+    begin(t, "wheel_outside_the_box_does_nothing");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);
+    eq(t, "below the box", core_scroll(c, 10, 150, 1) as i64, 0);
+    core_free(c);
+}
+
+fun test_scrolled_out_buttons_cannot_be_hit(t: ptr<T>) {
+    begin(t, "scrolled_out_buttons_cannot_be_hit");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var sb: i32 = core_scroll_box(c, col, 1);
+    core_style(c, sb, P_HEIGHT, 50);
+    var m: i32 = 0;
+    while (m < 5) { btn(c, sb, "b", m); m += 1; }           // 28 px tall each: 140 px of content
+    var below: i32 = btn(c, col, "x", 99);
+    core_layout(c, 200, 300);
+    eq(t, "first button", core_hit(c, 5, 10) as i64, 0);
+    eq(t, "second button", core_hit(c, 5, 40) as i64, 1);
+    // the button at y = 56 is inside the content but outside the 50 px box,
+    // and it overlaps the "x" button below: only the latter may answer
+    eq(t, "the button below answers", core_hit(c, 5, rc(c, below, 1) + 1) as i64, 99);
+    eq(t, "inside the box", core_hit(c, 5, 49) as i64, 1);
+    core_free(c);
+}
+
+fun test_scroll_box_paints_inside_a_clip(t: ptr<T>) {
+    begin(t, "scroll_box_paints_inside_a_clip");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);
+    var cs: Cmds = paint(c, 200, 300);
+    eq(t, "one clip start", count_kind(&cs, CMD_CLIP) as i64, 1);
+    eq(t, "one clip end", count_kind(&cs, CMD_CLIP_END) as i64, 1);
+    var at: i64 = find_kind(&cs, CMD_CLIP);
+    if (at >= 0) {
+        eq(t, "clip x", cmd(&cs, at).x as i64, 0);
+        eq(t, "clip y", cmd(&cs, at).y as i64, 0);
+        eq(t, "clip w", cmd(&cs, at).w as i64, 200);
+        eq(t, "clip h", cmd(&cs, at).h as i64, 100);
+    }
+    ok(t, "a scrollbar appears because the content is taller", count_color(&cs, COLOR_SCROLL_THUMB) > 0);
+    core_free(c);
+}
+
+fun test_scroll_set_clamps_at_layout_and_survives_a_rebuild(t: ptr<T>) {
+    begin(t, "scroll_set_clamps_at_layout_and_survives_a_rebuild");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);
+    eq(t, "unknown id", core_scroll_get(c, 99) as i64, NONE as i64);
+    core_scroll_set(c, 7, 25);
+    rebuild(c, 10);
+    eq(t, "25", core_scroll_get(c, 7) as i64, 25);
+    core_scroll_set(c, 7, 2147483647);                      // "scroll to the end"
+    rebuild(c, 10);
+    eq(t, "end", core_scroll_get(c, 7) as i64, 60);
+    core_scroll_set(c, 7, -5);
+    rebuild(c, 10);
+    eq(t, "negative is the top", core_scroll_get(c, 7) as i64, 0);
+    rebuild(c, 2);                                          // content now fits: nothing to scroll
+    core_scroll_set(c, 7, 30);
+    rebuild(c, 2);
+    eq(t, "nothing to scroll", core_scroll_get(c, 7) as i64, 0);
+    core_free(c);
+}
+
+fun test_wheel_over_a_child_scrolls_its_box(t: ptr<T>) {
+    begin(t, "wheel_over_a_child_scrolls_its_box");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var sb: i32 = core_scroll_box(c, col, 3);
+    core_style(c, sb, P_HEIGHT, 50);
+    var m: i32 = 0;
+    while (m < 5) { btn(c, sb, "b", m); m += 1; }
+    core_layout(c, 200, 300);
+    eq(t, "pointer is over the first button", core_scroll(c, 5, 10, 1) as i64, 1);
+    eq(t, "offset", core_scroll_get(c, 3) as i64, 40);
+    core_free(c);
+}
+
+fun test_nested_scroll_box_scrolls_the_inner_one_first(t: ptr<T>) {
+    begin(t, "nested_scroll_box_scrolls_the_inner_one_first");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var outer: i32 = core_scroll_box(c, col, 1);
+    core_style(c, outer, P_ALIGN, STRETCH);
+    core_style(c, outer, P_HEIGHT, 100);
+    var inner: i32 = core_scroll_box(c, outer, 2);
+    core_style(c, inner, P_HEIGHT, 60);
+    core_style(c, inner, P_ALIGN, STRETCH);
+    var i: i32 = 0;
+    while (i < 8) { txt(c, inner, "n"); i += 1; }            // 128 px inside a 60 px box
+    i = 0;
+    while (i < 8) { txt(c, outer, "n"); i += 1; }           // makes the outer content taller than 100
+    core_layout(c, 200, 300);
+    eq(t, "scrolled", core_scroll(c, 5, 5, 1) as i64, 1);
+    eq(t, "outer", core_scroll_get(c, 1) as i64, 0);
+    eq(t, "inner", core_scroll_get(c, 2) as i64, 40);
+    core_free(c);
+}
+
+// ---- horizontal scrolling ---------------------------------------------------------------
+
+// A 200 px wide, 60 px tall box that scrolls both ways, holding `rows` texts of
+// 40 characters (320 px wide, 16 px tall each).
+fun xy_fixture(c: ptr<Ctx>, rows: i32) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var sb: i32 = core_scroll_box_xy(c, col, 9);
+    core_style(c, sb, P_HEIGHT, 60);
+    var i: i32 = 0;
+    while (i < rows) { txt(c, sb, "0123456789012345678901234567890123456789"); i += 1; }
+    core_layout(c, 200, 300);
+    return sb;
+}
+
+fun test_horizontal_scroll_shifts_and_clamps_the_content(t: ptr<T>) {
+    begin(t, "horizontal_scroll_shifts_and_clamps_the_content");
+    var c: ptr<Ctx> = new_ctx(t);
+    var sb: i32 = xy_fixture(c, 3);                         // 320 x 48 of content in a 200 x 60 box
+    rect_is(t, "box", c, sb, 0, 0, 200, 60);
+    eq(t, "first text starts at the left", rc(c, 2, 0) as i64, 0);
+    core_scroll_set_x(c, 9, 50);
+    xy_fixture(c, 3);
+    eq(t, "offset", core_scroll_get_x(c, 9) as i64, 50);
+    eq(t, "content moved left", rc(c, 2, 0) as i64, -50);
+    eq(t, "the box stays", rc(c, 1, 0) as i64, 0);
+    core_scroll_set_x(c, 9, 1000);
+    xy_fixture(c, 3);
+    eq(t, "clamped: 320 - 200", core_scroll_get_x(c, 9) as i64, 120);
+    core_scroll_set_x(c, 9, -5);
+    xy_fixture(c, 3);
+    eq(t, "negative is the left end", core_scroll_get_x(c, 9) as i64, 0);
+    eq(t, "vertical offset untouched", core_scroll_get(c, 9) as i64, 0);
+    eq(t, "unknown id", core_scroll_get_x(c, 77) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_horizontal_wheel_and_keys(t: ptr<T>) {
+    begin(t, "horizontal_wheel_and_keys");
+    var c: ptr<Ctx> = new_ctx(t);
+    xy_fixture(c, 3);
+    eq(t, "the vertical wheel has nothing to do (the content fits)", core_scroll(c, 10, 10, 1) as i64, 0);
+    eq(t, "horizontal wheel", core_scroll_h(c, 10, 10, 1) as i64, 1);
+    eq(t, "one notch = 40 px", core_scroll_get_x(c, 9) as i64, 40);
+    xy_fixture(c, 3);
+    eq(t, "wheel past the end", core_scroll_h(c, 10, 10, 10) as i64, 1);
+    eq(t, "clamped", core_scroll_get_x(c, 9) as i64, 120);
+    xy_fixture(c, 3);
+    eq(t, "already at the right end", core_scroll_h(c, 10, 10, 1) as i64, 0);
+    eq(t, "outside the box", core_scroll_h(c, 10, 150, -1) as i64, 0);
+    eq(t, "left key", core_scroll_key(c, KEY_LEFT) as i64, 1);
+    eq(t, "a step back", core_scroll_get_x(c, 9) as i64, 80);
+    eq(t, "right key", core_scroll_key(c, KEY_RIGHT) as i64, 1);
+    eq(t, "and forward", core_scroll_get_x(c, 9) as i64, 120);
+    eq(t, "right key at the end", core_scroll_key(c, KEY_RIGHT) as i64, 0);
+    eq(t, "up / down do nothing without vertical overflow", core_scroll_key(c, KEY_DOWN) as i64, 0);
+    core_free(c);
+}
+
+fun test_a_vertical_only_box_ignores_sideways_input(t: ptr<T>) {
+    begin(t, "a_vertical_only_box_ignores_sideways_input");
+    var c: ptr<Ctx> = new_ctx(t);
+    rebuild(c, 10);                                         // the plain vertical fixture
+    eq(t, "horizontal wheel", core_scroll_h(c, 10, 10, 1) as i64, 0);
+    eq(t, "left key", core_scroll_key(c, KEY_LEFT) as i64, 0);
+    eq(t, "right key", core_scroll_key(c, KEY_RIGHT) as i64, 0);
+    eq(t, "vertical still works", core_scroll(c, 10, 10, 1) as i64, 1);
+    core_free(c);
+}
+
+fun test_horizontal_scrollbar_paint_and_drag(t: ptr<T>) {
+    begin(t, "horizontal_scrollbar_paint_and_drag");
+    var c: ptr<Ctx> = new_ctx(t);
+    xy_fixture(c, 3);                                       // track 200 px, thumb 200 * 200 / 320 = 125 px, 75 px of travel
+    var cs: Cmds = paint(c, 200, 300);
+    eq(t, "one thumb (no vertical bar)", count_color(&cs, COLOR_SCROLL_THUMB) as i64, 1);
+    var at: i64 = find_color(&cs, COLOR_SCROLL_THUMB);
+    if (at >= 0) {
+        eq(t, "thumb x", cmd(&cs, at).x as i64, 0);
+        eq(t, "thumb y (along the bottom edge)", cmd(&cs, at).y as i64, 53);
+        eq(t, "thumb width", cmd(&cs, at).w as i64, 125);
+        eq(t, "thumb thickness", cmd(&cs, at).h as i64, 6);
+    }
+    eq(t, "grab the thumb 10 px in", core_click(c, 10, 55, 0) as i64, NONE as i64);
+    eq(t, "drag half the travel", core_drag(c, 10 + 37, 5) as i64, 1);      // only x matters for this bar
+    eq(t, "offset", core_scroll_get_x(c, 9) as i64, 59);
+    eq(t, "drag to the end", core_drag(c, 500, 5) as i64, 1);
+    eq(t, "clamped", core_scroll_get_x(c, 9) as i64, 120);
+    core_release(c);
+    eq(t, "released", core_drag(c, 0, 5) as i64, 0);
+    xy_fixture(c, 3);
+    core_click(c, 190, 55, 0);                              // the track beyond the thumb: it centres there, then follows
+    eq(t, "track click jumps to the end", core_scroll_get_x(c, 9) as i64, 120);
+    core_release(c);
+    core_free(c);
+}
+
+fun test_both_scrollbars_share_the_corner(t: ptr<T>) {
+    begin(t, "both_scrollbars_share_the_corner");
+    var c: ptr<Ctx> = new_ctx(t);
+    xy_fixture(c, 5);                                       // 320 x 80 of content in 200 x 60: both bars
+    var cs: Cmds = paint(c, 200, 300);
+    eq(t, "two thumbs", count_color(&cs, COLOR_SCROLL_THUMB) as i64, 2);
+    var vertical: bool = false;
+    var horizontal: bool = false;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(&cs, i);
+        if (d.kind == CMD_FILL && d.w == 6 && d.h == 53 && d.x == 193) { vertical = true; }     // 60 - 6 - 1
+        if (d.kind == CMD_FILL && d.h == 6 && d.w == 193 && d.y == 53) { horizontal = true; }   // 200 - 6 - 1
+        i += 1;
+    }
+    ok(t, "the vertical track stops above the horizontal bar", vertical);
+    ok(t, "the horizontal track stops before the vertical bar", horizontal);
+    core_click(c, 195, 58, 0);                              // the corner belongs to neither bar
+    eq(t, "nothing grabbed in the corner", core_drag(c, 195, 5) as i64, 0);
+    core_release(c);
+    // the vertical bar still drags: thumb 53 * 53 / (53 + 20) = 38, 15 px of travel
+    core_click(c, 195, 5, 0);
+    eq(t, "vertical thumb drag", core_drag(c, 195, 5 + 15) as i64, 1);
+    eq(t, "vertical offset", core_scroll_get(c, 9) as i64, 20);
+    eq(t, "horizontal offset untouched", core_scroll_get_x(c, 9) as i64, 0);
+    core_release(c);
+    core_free(c);
+}
+
+fun test_content_scrolled_out_sideways_cannot_be_hit(t: ptr<T>) {
+    begin(t, "content_scrolled_out_sideways_cannot_be_hit");
+    var c: ptr<Ctx> = new_ctx(t);
+    // a button on the left of a sideways scrolling box that holds a row of buttons
+    var row: i32 = core_row(c, NONE, 0, 0);
+    btn(c, row, "L", 99);                                   // 32 x 28 at x 0
+    var sb: i32 = core_scroll_box_xy(c, row, 4);
+    core_style(c, sb, P_GROW, 1);
+    core_style(c, sb, P_HEIGHT, 40);
+    var strip: i32 = core_row(c, sb, 0, 0);
+    var m: i32 = 0;
+    while (m < 10) { btn(c, strip, "b", m); m += 1; }       // 10 x 32 = 320 px
+    core_layout(c, 200, 60);                                // the box: x 32..200
+    eq(t, "first strip button", core_hit(c, 40, 10) as i64, 0);
+    core_scroll_set_x(c, 4, 40);
+    core_clear(c);
+    row = core_row(c, NONE, 0, 0);
+    btn(c, row, "L", 99);
+    sb = core_scroll_box_xy(c, row, 4);
+    core_style(c, sb, P_GROW, 1);
+    core_style(c, sb, P_HEIGHT, 40);
+    strip = core_row(c, sb, 0, 0);
+    m = 0;
+    while (m < 10) { btn(c, strip, "b", m); m += 1; }
+    core_layout(c, 200, 60);
+    eq(t, "offset", core_scroll_get_x(c, 4) as i64, 40);
+    // button 0 now spans x -8..24, partly over the "L" button: only L may answer there
+    eq(t, "L answers over scrolled-out content", core_hit(c, 10, 10) as i64, 99);
+    eq(t, "inside the box, button 1 (x 24..56)", core_hit(c, 40, 10) as i64, 1);
+    core_free(c);
+}
+
+// ---- keyboard focus -----------------------------------------------------------------------
+
+// input 1, button A (msg 5), checkbox C (msg 6), input 2, button B (msg 7), and a
+// button without a message: the Tab order is 1, A, C, 2, B.
+fun focus_fixture(c: ptr<Ctx>) {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 4, 4);
+    core_input(c, col, 1, null, 0);
+    btn(c, col, "A", 5);
+    chk(c, col, "C", false, 6);
+    core_input(c, col, 2, null, 0);
+    btn(c, col, "B", 7);
+    btn(c, col, "no message", NONE);
+    core_layout(c, 300, 300);
+}
+
+fun focus_is(t: ptr<T>, what: str, c: ptr<Ctx>, input_id: i32, msg: i32) {
+    eq(t, what, core_focused(c) as i64, input_id as i64);
+    eq(t, what, core_focused_msg(c) as i64, msg as i64);
+}
+
+fun test_tab_walks_the_focusable_widgets_and_wraps(t: ptr<T>) {
+    begin(t, "tab_walks_the_focusable_widgets_and_wraps");
+    var c: ptr<Ctx> = new_ctx(t);
+    focus_fixture(c);
+    focus_is(t, "nothing focused", c, NONE, NONE);
+    eq(t, "tab", key(c, KEY_TAB, 0) as i64, INPUT_FOCUS_MOVED as i64);
+    focus_is(t, "first: input 1", c, 1, NONE);
+    key(c, KEY_TAB, 0);
+    focus_is(t, "button A", c, NONE, 5);
+    key(c, KEY_TAB, 0);
+    focus_is(t, "checkbox C", c, NONE, 6);
+    key(c, KEY_TAB, 0);
+    focus_is(t, "input 2", c, 2, NONE);
+    key(c, KEY_TAB, 0);
+    focus_is(t, "button B (the one without a message is skipped)", c, NONE, 7);
+    key(c, KEY_TAB, 0);
+    focus_is(t, "wraps to input 1", c, 1, NONE);
+    key(c, KEY_TAB, SHIFT);
+    focus_is(t, "Shift+Tab wraps back to B", c, NONE, 7);
+    key(c, KEY_TAB, SHIFT);
+    focus_is(t, "Shift+Tab: input 2", c, 2, NONE);
+    core_input_focus(c, NONE);
+    key(c, KEY_TAB, SHIFT);
+    focus_is(t, "Shift+Tab from nothing: the last one", c, NONE, 7);
+    eq(t, "core_focus_next", core_focus_next(c, false) as i64, 1);
+    focus_is(t, "forward again", c, 1, NONE);
+    core_clear(c);
+    eq(t, "nothing to focus in an empty tree", core_focus_next(c, false) as i64, 0);
+    core_free(c);
+}
+
+fun test_enter_and_space_press_the_focused_widget(t: ptr<T>) {
+    begin(t, "enter_and_space_press_the_focused_widget");
+    var c: ptr<Ctx> = new_ctx(t);
+    focus_fixture(c);
+    eq(t, "no activation yet", core_activated(c) as i64, NONE as i64);
+    eq(t, "Enter with nothing focused", key(c, KEY_ENTER, 0) as i64, 0);
+    key(c, KEY_TAB, 0);
+    key(c, KEY_TAB, 0);                                     // button A
+    eq(t, "Enter presses a button", key(c, KEY_ENTER, 0) as i64, INPUT_ACTIVATED as i64);
+    eq(t, "its message", core_activated(c) as i64, 5);
+    key(c, KEY_TAB, 0);                                     // checkbox C
+    eq(t, "Space presses a checkbox", feed(c, " ") as i64, INPUT_ACTIVATED as i64);
+    eq(t, "its message", core_activated(c) as i64, 6);
+    eq(t, "other text does nothing", feed(c, "x") as i64, 0);
+    eq(t, "(and is not typed anywhere)", core_activated(c) as i64, 6);
+    key(c, KEY_TAB, 0);                                     // input 2
+    eq(t, "Space in an input is a typed space", feed(c, " ") as i64, INPUT_CHANGED as i64);
+    eq(t, "Enter in an input submits", key(c, KEY_ENTER, 0) as i64, INPUT_SUBMIT as i64);
+    input_is(t, c, 2, " ");
+    core_free(c);
+}
+
+fun count_focus_border(cs: ptr<Cmds>) -> i32 {
+    var k: i32 = 0;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        if (cmd(cs, i).kind == CMD_ROUND_BORDER && cmd(cs, i).color == COLOR_FIELD_FOCUS) { k += 1; }
+        i += 1;
+    }
+    return k;
+}
+
+fun test_the_focus_ring_follows_the_keyboard_not_the_mouse(t: ptr<T>) {
+    begin(t, "the_focus_ring_follows_the_keyboard_not_the_mouse");
+    var c: ptr<Ctx> = new_ctx(t);
+    focus_fixture(c);
+    var a_x: i32 = rc(c, 2, 0) + 3;
+    var a_y: i32 = rc(c, 2, 1) + 3;
+    eq(t, "click button A", core_click(c, a_x, a_y, 0) as i64, 5);
+    focus_is(t, "the click focuses it", c, NONE, 5);
+    var cs: Cmds = paint(c, 300, 300);
+    eq(t, "no ring after a click", count_focus_border(&cs) as i64, 0);
+    key(c, KEY_TAB, 0);                                     // checkbox C: keyboard focus
+    cs = paint(c, 300, 300);
+    eq(t, "a two line ring around the checkbox", count_focus_border(&cs) as i64, 2);
+    key(c, KEY_TAB, SHIFT);                                 // back to A
+    cs = paint(c, 300, 300);
+    eq(t, "a ring around button A", count_focus_border(&cs) as i64, 2);
+    core_click(c, a_x, a_y, 0);
+    cs = paint(c, 300, 300);
+    eq(t, "a click hides the ring again", count_focus_border(&cs) as i64, 0);
+    core_click(c, 290, 290, 0);                             // empty space
+    focus_is(t, "clicking nothing clears the focus", c, NONE, NONE);
+    core_free(c);
+}
+
+fun test_focus_survives_a_rebuild_and_follows_input_focus(t: ptr<T>) {
+    begin(t, "focus_survives_a_rebuild_and_follows_input_focus");
+    var c: ptr<Ctx> = new_ctx(t);
+    focus_fixture(c);
+    key(c, KEY_TAB, SHIFT);                                 // the last one: B
+    focus_is(t, "B", c, NONE, 7);
+    focus_fixture(c);                                       // a new frame, same tree
+    focus_is(t, "still B", c, NONE, 7);
+    key(c, KEY_TAB, 0);
+    focus_is(t, "Tab continues from B: wraps to input 1", c, 1, NONE);
+    core_input_focus(c, 2);
+    focus_is(t, "focusing an input drops the widget focus", c, 2, NONE);
+    core_free(c);
+}
+
+// A 100 x 56 box (200 px wide column, stretch) holding eight 28 px buttons (msg 0..7).
+fun reveal_fixture(c: ptr<Ctx>) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_ALIGN, STRETCH);
+    var sb: i32 = core_scroll_box(c, col, 3);
+    core_style(c, sb, P_HEIGHT, 56);
+    var m: i32 = 0;
+    while (m < 8) { btn(c, sb, "b", m); m += 1; }
+    core_layout(c, 200, 300);
+    return sb;
+}
+
+fun test_tab_scrolls_the_focused_widget_into_view(t: ptr<T>) {
+    begin(t, "tab_scrolls_the_focused_widget_into_view");
+    var c: ptr<Ctx> = new_ctx(t);
+    reveal_fixture(c);
+    var step: i32 = 0;
+    while (step < 8) {
+        key(c, KEY_TAB, 0);
+        reveal_fixture(c);                                  // the app rebuilds and lays out after every event
+        step += 1;
+    }
+    eq(t, "the last button has the focus", core_focused_msg(c) as i64, 7);
+    var last: i32 = 2 + 7;                                  // node id of button 7 (column 0, box 1, buttons 2..9)
+    var top: i32 = rc(c, last, 1);
+    ok(t, "it is inside the box", top >= 0 && top + rc(c, last, 3) <= 56);
+    ok(t, "so the box scrolled", core_scroll_get(c, 3) > 0);
+    key(c, KEY_TAB, 0);                                     // wraps to button 0
+    reveal_fixture(c);
+    eq(t, "scrolled back to the top", core_scroll_get(c, 3) as i64, 0);
+    core_free(c);
+}
+
+// ---- theme ----------------------------------------------------------------------------------
+
+fun test_the_default_theme_is_the_light_one(t: ptr<T>) {
+    begin(t, "the_default_theme_is_the_light_one");
+    var c: ptr<Ctx> = new_ctx(t);
+    var light: Theme = Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                               placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                               radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                               field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                               scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0, slider_thumb: 0, slider_track: 0, font_size: 0 };
+    theme_light(&light);
+    var th: ptr<Theme> = core_theme(c);
+    eq(t, "bg", th.bg as i64, light.bg as i64);
+    eq(t, "accent", th.accent as i64, COLOR_ACCENT as i64);
+    eq(t, "button radius", th.radius_button as i64, RADIUS_BUTTON as i64);
+    eq(t, "field padding", th.field_pad_x as i64, FIELD_PAD_X as i64);
+    eq(t, "scroll step", th.scroll_step as i64, 40);
+    core_free(c);
+}
+
+fun test_theme_colours_reach_the_draw_list(t: ptr<T>) {
+    begin(t, "theme_colours_reach_the_draw_list");
+    var c: ptr<Ctx> = new_ctx(t);
+    var th: ptr<Theme> = core_theme(c);
+    th.bg = 0xFF101820;
+    th.button = 0xFF334455;
+    th.text = 0xFFAABBCC;
+    var col: i32 = core_column(c, NONE, 4, 4);
+    txt(c, col, "hi");
+    btn(c, col, "ok", 1);
+    core_layout(c, 200, 100);
+    var cs: Cmds = paint(c, 200, 100);
+    eq(t, "window background", cmd(&cs, 0).color as i64, 0xFF101820);
+    eq(t, "text colour", cmd(&cs, 1).color as i64, 0xFFAABBCC);
+    eq(t, "button fill", cmd(&cs, 2).color as i64, 0xFF334455);
+    eq(t, "the button label inherits the text colour", cmd(&cs, 4).color as i64, 0xFFAABBCC);
+    core_free(c);
+}
+
+fun test_theme_metrics_reach_the_layout(t: ptr<T>) {
+    begin(t, "theme_metrics_reach_the_layout");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var b: i32 = btn(c, col, "ok", 1);
+    var i: i32 = core_input(c, col, 1, null, 0);
+    var k: i32 = chk(c, col, "x", false, 2);
+    core_layout(c, 300, 200);
+    eq(t, "default button width: 16 + 2 * 12", rc(c, b, 2) as i64, 40);
+    eq(t, "default input width", rc(c, i, 2) as i64, 200);
+    eq(t, "default checkbox width: 16 + 8 + 8", rc(c, k, 2) as i64, 32);
+    var th: ptr<Theme> = core_theme(c);
+    th.button_pad_x = 20;
+    th.button_pad_y = 10;
+    th.field_width = 120;
+    th.field_pad_y = 8;
+    th.check_box = 20;
+    th.check_gap = 4;
+    core_layout(c, 300, 200);
+    eq(t, "wider button", rc(c, b, 2) as i64, 56);
+    eq(t, "taller button: 16 + 2 * 10", rc(c, b, 3) as i64, 36);
+    eq(t, "narrower input", rc(c, i, 2) as i64, 120);
+    eq(t, "taller input: 16 + 2 * 8", rc(c, i, 3) as i64, 32);
+    eq(t, "checkbox: 20 + 4 + 8", rc(c, k, 2) as i64, 32);
+    eq(t, "checkbox height is the square", rc(c, k, 3) as i64, 20);
+    core_free(c);
+}
+
+fun test_dark_theme_and_set_theme_copies(t: ptr<T>) {
+    begin(t, "dark_theme_and_set_theme_copies");
+    var c: ptr<Ctx> = new_ctx(t);
+    var dark: Theme = Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                              placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                              radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                              field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                              scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0, slider_thumb: 0, slider_track: 0, font_size: 0 };
+    theme_dark(&dark);
+    var cur: ptr<Theme> = core_theme(c);
+    ok(t, "dark differs from light", dark.bg != cur.bg);
+    core_set_theme(c, &dark);
+    dark.bg = 0xFF000000;                                   // changing the source later must not change the Ui
+    eq(t, "the Ui kept its own copy", cur.bg as i64, 0xFF1E1E1E);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    btn(c, col, "ok", 1);
+    core_layout(c, 100, 100);
+    var cs: Cmds = paint(c, 100, 100);
+    eq(t, "dark background painted", cmd(&cs, 0).color as i64, 0xFF1E1E1E);
+    eq(t, "dark button", cmd(&cs, 1).color as i64, 0xFF3A3A3A);
+    core_free(c);
+}
+
+fun test_node_styles_win_over_the_theme(t: ptr<T>) {
+    begin(t, "node_styles_win_over_the_theme");
+    var c: ptr<Ctx> = new_ctx(t);
+    var th: ptr<Theme> = core_theme(c);
+    th.text = 0xFF111111;
+    th.radius_button = 0;
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var own: i32 = txt(c, col, "own colour");
+    core_style(c, own, P_COLOR, 0xFFCC0000);
+    var plain: i32 = txt(c, col, "theme colour");
+    var square: i32 = btn(c, col, "square", 1);                      // radius 0 from the theme: plain fill
+    var round: i32 = btn(c, col, "round", 2);
+    core_style(c, round, P_RADIUS, 9);
+    core_layout(c, 200, 200);
+    var cs: Cmds = paint(c, 200, 200);
+    eq(t, "an own colour wins", cmd(&cs, 1).color as i64, 0xFFCC0000);
+    eq(t, "the theme colour otherwise", cmd(&cs, 2).color as i64, 0xFF111111);
+    eq(t, "square button from the theme", count_kind(&cs, CMD_FILL) as i64, 2);   // the window and the square button
+    eq(t, "round button from its own radius", count_kind(&cs, CMD_ROUND_FILL) as i64, 1);
+    core_free(c);
+}
+
+fun test_scrollbar_size_and_step_come_from_the_theme(t: ptr<T>) {
+    begin(t, "scrollbar_size_and_step_come_from_the_theme");
+    var c: ptr<Ctx> = new_ctx(t);
+    var th: ptr<Theme> = core_theme(c);
+    th.scrollbar_w = 10;
+    th.scroll_step = 20;
+    th.scroll_thumb = 0xFF445566;
+    rebuild(c, 10);
+    var cs: Cmds = paint(c, 200, 300);
+    var at: i64 = find_color(&cs, 0xFF445566);
+    ok(t, "the thumb has the theme colour", at >= 0);
+    if (at >= 0) {
+        eq(t, "thumb thickness", cmd(&cs, at).w as i64, 10);
+        eq(t, "thumb x: 200 - 10 - 1", cmd(&cs, at).x as i64, 189);
+    }
+    eq(t, "one notch = the theme's step", core_scroll(c, 10, 10, 1) as i64, 1);
+    eq(t, "offset", core_scroll_get(c, 7) as i64, 20);
+    core_free(c);
+}
+
+// ---- time and the caret blink ---------------------------------------------------------------
+
+fun caret_count(cs: ptr<Cmds>) -> i32 {
+    var k: i32 = 0;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        if (cmd(cs, i).kind == CMD_FILL && cmd(cs, i).w == 1 && cmd(cs, i).h == 16) { k += 1; }
+        i += 1;
+    }
+    return k;
+}
+
+fun blink_fixture(c: ptr<Ctx>) {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 10, 0);
+    core_input(c, col, 7, null, 0);
+    core_layout(c, 300, 100);
+}
+
+fun test_the_caret_blinks_and_typing_restarts_it(t: ptr<T>) {
+    begin(t, "the_caret_blinks_and_typing_restarts_it");
+    var c: ptr<Ctx> = new_ctx(t);
+    blink_fixture(c);
+    eq(t, "no focus: nothing to wake up for", core_wake_ms(c) as i64, NONE as i64);
+    core_set_time(c, 1000);
+    core_input_focus(c, 7);                                 // the blink starts now, "on"
+    eq(t, "next flip in a period", core_wake_ms(c) as i64, 530);
+    var cs: Cmds = paint(c, 300, 100);
+    eq(t, "caret on", caret_count(&cs) as i64, 1);
+    core_set_time(c, 1200);
+    eq(t, "330 ms to go", core_wake_ms(c) as i64, 330);
+    cs = paint(c, 300, 100);
+    eq(t, "still on", caret_count(&cs) as i64, 1);
+    ok(t, "an unchanged picture is detected", !core_changed(c));
+    core_set_time(c, 1530);
+    cs = paint(c, 300, 100);
+    eq(t, "caret off", caret_count(&cs) as i64, 0);
+    ok(t, "the flip is a change", core_changed(c));
+    eq(t, "next flip", core_wake_ms(c) as i64, 530);
+    core_set_time(c, 2060);
+    cs = paint(c, 300, 100);
+    eq(t, "caret on again", caret_count(&cs) as i64, 1);
+    core_set_time(c, 1530 + 530);
+    core_set_time(c, 2100);
+    feed(c, "a");                                           // typing restarts the blink in the "on" phase
+    cs = paint(c, 300, 100);
+    eq(t, "caret on after typing", caret_count(&cs) as i64, 1);
+    core_set_time(c, 2100 + 529);
+    cs = paint(c, 300, 100);
+    eq(t, "still on just before the period ends", caret_count(&cs) as i64, 1);
+    core_set_time(c, 2100 + 530);
+    cs = paint(c, 300, 100);
+    eq(t, "off one period after typing", caret_count(&cs) as i64, 0);
+    key(c, KEY_LEFT, 0);                                    // moving the caret restarts it too
+    cs = paint(c, 300, 100);
+    eq(t, "on after a caret move", caret_count(&cs) as i64, 1);
+    core_free(c);
+}
+
+fun test_blink_can_be_switched_off(t: ptr<T>) {
+    begin(t, "blink_can_be_switched_off");
+    var c: ptr<Ctx> = new_ctx(t);
+    var th: ptr<Theme> = core_theme(c);
+    th.caret_blink_ms = 0;
+    blink_fixture(c);
+    core_input_focus(c, 7);
+    core_set_time(c, 5000);
+    var cs: Cmds = paint(c, 300, 100);
+    eq(t, "always on", caret_count(&cs) as i64, 1);
+    eq(t, "nothing to wake up for", core_wake_ms(c) as i64, NONE as i64);
+    th.caret_blink_ms = 200;                                // a faster blink from the theme
+    core_set_time(c, 5000);
+    eq(t, "the period is the theme's", core_wake_ms(c) as i64, 200);
+    core_free(c);
+}
+
+// ---- progress bar, radio button, tab ----------------------------------------------------------
+
+fun test_progress_bar_layout_and_paint(t: ptr<T>) {
+    begin(t, "progress_bar_layout_and_paint");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var p: i32 = core_progress(c, col, 3, 4);
+    core_layout(c, 300, 100);
+    rect_is(t, "natural size: an input's width, the theme's thickness", c, p, 0, 0, 200, 10);
+    var cs: Cmds = paint(c, 300, 100);
+    var track: i64 = find_color(&cs, core_theme(c).scroll_track);
+    var fill: i64 = find_color(&cs, core_theme(c).accent);
+    ok(t, "a track", track >= 0);
+    ok(t, "a fill", fill >= 0);
+    if (fill >= 0) { eq(t, "three quarters of 200", cmd(&cs, fill).w as i64, 150); }
+    // clamping and degenerate values
+    core_clear(c);
+    col = core_column(c, NONE, 0, 0);
+    core_progress(c, col, 99, 4);
+    core_layout(c, 300, 100);
+    cs = paint(c, 300, 100);
+    fill = find_color(&cs, core_theme(c).accent);
+    if (fill >= 0) { eq(t, "over the maximum: full", cmd(&cs, fill).w as i64, 200); }
+    core_clear(c);
+    col = core_column(c, NONE, 0, 0);
+    core_progress(c, col, 0, 4);
+    core_progress(c, col, 5, 0);
+    core_layout(c, 300, 100);
+    cs = paint(c, 300, 100);
+    eq(t, "zero or no maximum: no fill", count_color(&cs, core_theme(c).accent) as i64, 0);
+    core_free(c);
+}
+
+fun test_progress_bar_is_not_interactive(t: ptr<T>) {
+    begin(t, "progress_bar_is_not_interactive");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_progress(c, col, 1, 2);
+    core_layout(c, 300, 100);
+    eq(t, "no message", core_click(c, 10, 5, 0) as i64, NONE as i64);
+    eq(t, "hit", core_hit(c, 10, 5) as i64, NONE as i64);
+    eq(t, "not in the Tab order", core_focus_next(c, false) as i64, 0);
+    core_free(c);
+}
+
+fun test_radio_button(t: ptr<T>) {
+    begin(t, "radio_button");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 10, 6);
+    var a: i32 = core_radio(c, col, "One" as ptr<u8>, 3, true, 1);       // 16 + 8 + 24 = 48 wide
+    var b: i32 = core_radio(c, col, "Two" as ptr<u8>, 3, false, 2);
+    core_layout(c, 300, 100);
+    rect_is(t, "a", c, a, 10, 10, 48, 16);
+    rect_is(t, "b", c, b, 10, 32, 48, 16);
+    var cs: Cmds = paint(c, 300, 100);
+    eq(t, "no tick strokes: a radio has a dot", count_kind(&cs, CMD_LINE) as i64, 0);
+    var circles: i32 = 0;
+    var dots: i32 = 0;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(&cs, i);
+        if ((d.kind == CMD_ROUND_FILL || d.kind == CMD_ROUND_BORDER) && d.w == 16 && d.h == 16 && d.text_len == 8) { circles += 1; }
+        if (d.kind == CMD_ROUND_FILL && d.color == core_theme(c).accent) { dots += 1; }
+        i += 1;
+    }
+    eq(t, "two circles (fill + outline each)", circles as i64, 4);
+    eq(t, "one dot, on the selected choice", dots as i64, 1);
+    eq(t, "click the second", core_click(c, 12, 34, 0) as i64, 2);
+    eq(t, "hit its label", core_hit(c, 50, 34) as i64, 2);
+    core_free(c);
+}
+
+fun test_radio_buttons_take_the_keyboard(t: ptr<T>) {
+    begin(t, "radio_buttons_take_the_keyboard");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_radio(c, col, "A" as ptr<u8>, 1, false, 11);
+    core_radio(c, col, "B" as ptr<u8>, 1, false, 12);
+    core_layout(c, 300, 100);
+    key(c, KEY_TAB, 0);
+    eq(t, "first radio focused", core_focused_msg(c) as i64, 11);
+    key(c, KEY_TAB, 0);
+    eq(t, "Tab to the second", core_focused_msg(c) as i64, 12);
+    eq(t, "Space selects it", feed(c, " ") as i64, INPUT_ACTIVATED as i64);
+    eq(t, "its message", core_activated(c) as i64, 12);
+    core_free(c);
+}
+
+fun test_tabs(t: ptr<T>) {
+    begin(t, "tabs");
+    var c: ptr<Ctx> = new_ctx(t);
+    var row: i32 = core_row(c, NONE, 0, 0);
+    var a: i32 = core_tab(c, row, "One" as ptr<u8>, 3, true, 1);
+    var b: i32 = core_tab(c, row, "Two" as ptr<u8>, 3, false, 2);
+    core_layout(c, 300, 100);
+    rect_is(t, "a tab is as big as a button: 24 + 24 wide", c, a, 0, 0, 48, 28);
+    var cs: Cmds = paint(c, 300, 100);
+    // the window background, the selected tab's fill and underline, and two labels: the idle tab draws nothing else
+    eq(t, "the selected tab has the field colour", count_color(&cs, core_theme(c).field) as i64, 1);
+    var underline: bool = false;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(&cs, i);
+        if (d.kind == CMD_FILL && d.h == 2 && d.w == 48 && d.y == 26 && d.color == core_theme(c).accent) { underline = true; }
+        i += 1;
+    }
+    ok(t, "an accent underline under the selected one", underline);
+    eq(t, "no outline on tabs", count_kind(&cs, CMD_ROUND_BORDER) as i64, 0);
+    eq(t, "click the other tab", core_click(c, 60, 10, 0) as i64, 2);
+    core_set_pointer(c, 60, 10, false);                     // hovering the idle tab fills it
+    cs = paint(c, 300, 100);
+    eq(t, "hover colour", count_color(&cs, core_theme(c).button_hover) as i64, 1);
+    key(c, KEY_TAB, 0);
+    eq(t, "tabs are focusable", core_focused_msg(c) as i64, 1);
+    core_free(c);
+}
+
+// ---- slider -------------------------------------------------------------------------------------
+
+fun slider_fixture(c: ptr<Ctx>, max: i32) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var sl: i32 = core_slider(c, col, 4, 0, max);
+    core_layout(c, 300, 100);
+    return sl;
+}
+
+fun test_slider_value_and_range(t: ptr<T>) {
+    begin(t, "slider_value_and_range");
+    var c: ptr<Ctx> = new_ctx(t);
+    var sl: i32 = slider_fixture(c, 100);
+    rect_is(t, "an input's width, the handle's height", c, sl, 0, 0, 200, 16);
+    eq(t, "starts at the minimum", core_slider_get(c, 4) as i64, 0);
+    core_slider_set(c, 4, 50);
+    slider_fixture(c, 100);
+    eq(t, "set and kept across a rebuild", core_slider_get(c, 4) as i64, 50);
+    core_slider_set(c, 4, 500);
+    slider_fixture(c, 100);
+    eq(t, "clamped to the maximum at layout", core_slider_get(c, 4) as i64, 100);
+    core_slider_set(c, 4, -7);
+    slider_fixture(c, 100);
+    eq(t, "and to the minimum", core_slider_get(c, 4) as i64, 0);
+    core_slider_set(c, 4, 80);
+    slider_fixture(c, 50);
+    eq(t, "a smaller range pulls the value in", core_slider_get(c, 4) as i64, 50);
+    eq(t, "unknown id", core_slider_get(c, 99) as i64, 0);
+    core_free(c);
+}
+
+fun test_slider_mouse(t: ptr<T>) {
+    begin(t, "slider_mouse");
+    var c: ptr<Ctx> = new_ctx(t);
+    slider_fixture(c, 100);                                 // 184 px of travel between the handle centres 8 .. 192
+    eq(t, "a click returns no message", core_click(c, 100, 8, 0) as i64, NONE as i64);
+    eq(t, "the middle", core_slider_get(c, 4) as i64, 50);
+    eq(t, "the slider has the focus", core_focused(c) as i64, 4);
+    core_click(c, 0, 8, 0);
+    eq(t, "the left end", core_slider_get(c, 4) as i64, 0);
+    core_click(c, 199, 8, 0);
+    eq(t, "the right end", core_slider_get(c, 4) as i64, 100);
+    core_click(c, 20, 8, 0);
+    eq(t, "drag to 150", core_drag(c, 150, 40) as i64, 1);   // only x matters, the pointer may leave the groove
+    eq(t, "value", core_slider_get(c, 4) as i64, 77);
+    eq(t, "the same place again: no change", core_drag(c, 150, 40) as i64, 0);
+    eq(t, "beyond the end", core_drag(c, 900, 8) as i64, 1);
+    eq(t, "clamped", core_slider_get(c, 4) as i64, 100);
+    core_release(c);
+    eq(t, "released: the drag is over", core_drag(c, 10, 8) as i64, 0);
+    eq(t, "(the value stays)", core_slider_get(c, 4) as i64, 100);
+    core_free(c);
+}
+
+fun test_slider_keyboard(t: ptr<T>) {
+    begin(t, "slider_keyboard");
+    var c: ptr<Ctx> = new_ctx(t);
+    slider_fixture(c, 100);
+    core_slider_set(c, 4, 50);
+    slider_fixture(c, 100);
+    key(c, KEY_TAB, 0);
+    eq(t, "Tab focuses the slider", core_focused(c) as i64, 4);
+    eq(t, "Left", key(c, KEY_LEFT, 0) as i64, INPUT_CHANGED as i64);
+    eq(t, "one down", core_slider_get(c, 4) as i64, 49);
+    key(c, KEY_RIGHT, 0);
+    key(c, KEY_RIGHT, 0);
+    eq(t, "two up", core_slider_get(c, 4) as i64, 51);
+    key(c, KEY_PAGE_UP, 0);
+    eq(t, "page up: a tenth of the range", core_slider_get(c, 4) as i64, 61);
+    key(c, KEY_PAGE_DOWN, 0);
+    eq(t, "page down", core_slider_get(c, 4) as i64, 51);
+    eq(t, "Home", key(c, KEY_HOME, 0) as i64, INPUT_CHANGED as i64);
+    eq(t, "the minimum", core_slider_get(c, 4) as i64, 0);
+    eq(t, "Home again: nothing changes", key(c, KEY_HOME, 0) as i64, 0);
+    eq(t, "Left at the minimum", key(c, KEY_LEFT, 0) as i64, 0);
+    key(c, KEY_END, 0);
+    eq(t, "End: the maximum", core_slider_get(c, 4) as i64, 100);
+    eq(t, "Right at the maximum", key(c, KEY_RIGHT, 0) as i64, 0);
+    eq(t, "Enter does nothing on a slider", key(c, KEY_ENTER, 0) as i64, 0);
+    eq(t, "typed text does nothing", feed(c, "5") as i64, 0);
+    core_free(c);
+}
+
+fun test_slider_paint(t: ptr<T>) {
+    begin(t, "slider_paint");
+    var c: ptr<Ctx> = new_ctx(t);
+    slider_fixture(c, 100);
+    core_slider_set(c, 4, 50);
+    slider_fixture(c, 100);
+    var cs: Cmds = paint(c, 300, 100);
+    var groove: i64 = find_color(&cs, core_theme(c).scroll_track);
+    ok(t, "a groove", groove >= 0);
+    if (groove >= 0) {
+        eq(t, "groove x: half a handle in", cmd(&cs, groove).x as i64, 8);
+        eq(t, "groove width", cmd(&cs, groove).w as i64, 184);
+        eq(t, "groove thickness", cmd(&cs, groove).h as i64, 4);
+    }
+    var filled: i64 = find_color(&cs, core_theme(c).accent);
+    ok(t, "the part up to the handle is filled", filled >= 0);
+    if (filled >= 0) { eq(t, "half of 184", cmd(&cs, filled).w as i64, 92); }
+    var handle: i64 = find_color(&cs, core_theme(c).field);
+    ok(t, "a handle", handle >= 0);
+    if (handle >= 0) {
+        eq(t, "handle x", cmd(&cs, handle).x as i64, 92);
+        eq(t, "handle size", cmd(&cs, handle).w as i64, 16);
+        eq(t, "a circle", cmd(&cs, handle).text_len as i64, 8);
+    }
+    eq(t, "no ring before the keyboard moved the focus", count_focus_border(&cs) as i64, 0);
+    key(c, KEY_TAB, 0);
+    cs = paint(c, 300, 100);
+    eq(t, "a focused handle: its rim and the two line ring", count_focus_border(&cs) as i64, 3);
+    core_free(c);
+}
+
+fun test_two_sliders_are_independent(t: ptr<T>) {
+    begin(t, "two_sliders_are_independent");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 4);
+    core_slider(c, col, 1, 0, 10);
+    core_slider(c, col, 2, 100, 200);
+    core_layout(c, 300, 100);
+    eq(t, "the second starts at its own minimum", core_slider_get(c, 2) as i64, 100);
+    core_click(c, 199, 8, 0);                               // the first one
+    eq(t, "first", core_slider_get(c, 1) as i64, 10);
+    eq(t, "second untouched", core_slider_get(c, 2) as i64, 100);
+    core_release(c);
+    core_click(c, 100, 28, 0);                              // the second one (y 20..36)
+    eq(t, "second moved", core_slider_get(c, 2) as i64, 150);
+    key(c, KEY_TAB, SHIFT);
+    eq(t, "Shift+Tab goes back to the first", core_focused(c) as i64, 1);
+    core_free(c);
+}
+
+// ---- overlays -------------------------------------------------------------------------------------
+
+// A column with a "main" button (msg 1) at (10, 20), 32 x 28.
+fun overlay_main(c: ptr<Ctx>) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_MARGIN, 0);
+    var spacer: i32 = bx(c, col, 10, 20, 0);
+    var row: i32 = core_row(c, col, 0, 0);
+    bx(c, row, 10, 10, 0);
+    return btn(c, row, "m", 1);
+}
+
+fun test_overlay_is_laid_out_on_its_own_and_hit_first(t: ptr<T>) {
+    begin(t, "overlay_is_laid_out_on_its_own_and_hit_first");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var main: i32 = btn(c, col, "m", 1);                    // 32 x 28 at (0, 0)
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, 20, 10);
+    var inner: i32 = btn(c, ov, "X", 9);                    // 32 x 28
+    core_layout(c, 300, 100);
+    rect_is(t, "the overlay box", c, ov, 20, 10, 32, 28);
+    rect_is(t, "its button", c, inner, 20, 10, 32, 28);
+    rect_is(t, "the main button is unaffected", c, main, 0, 0, 32, 28);
+    eq(t, "over both: the overlay wins", core_hit(c, 25, 15) as i64, 9);
+    eq(t, "the main button where nothing covers it", core_hit(c, 5, 5) as i64, 1);
+    eq(t, "a click goes the same way", core_click(c, 25, 15, 0) as i64, 9);
+    eq(t, "a second root is still refused", core_column(c, NONE, 0, 0) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_an_overlay_blocks_what_is_under_it(t: ptr<T>) {
+    begin(t, "an_overlay_blocks_what_is_under_it");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    btn(c, col, "m", 1);                                    // 32 x 28 at (0, 0)
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, 0, 0);
+    core_style(c, ov, P_PADDING, 12);
+    btn(c, ov, "X", 9);                                     // the overlay is 56 x 52: a 12 px frame around its button
+    core_layout(c, 300, 100);
+    eq(t, "the frame covers the main button", core_hit(c, 5, 5) as i64, NONE as i64);
+    eq(t, "a click on the frame goes nowhere", core_click(c, 5, 5, 0) as i64, NONE as i64);
+    eq(t, "the overlay's own button", core_hit(c, 20, 20) as i64, 9);
+    eq(t, "outside the overlay the main button would answer", core_hit(c, 5, 60) as i64, NONE as i64);   // (nothing there)
+    core_free(c);
+}
+
+fun test_overlay_placements(t: ptr<T>) {
+    begin(t, "overlay_placements");
+    var c: ptr<Ctx> = new_ctx(t);
+    var a: i32 = overlay_main(c);                           // the anchor: 32 x 28 at (10, 20)
+    var below: i32 = core_overlay(c, a, OVERLAY_BELOW, 0, 4);
+    btn(c, below, "B", 2);
+    var above: i32 = core_overlay(c, a, OVERLAY_ABOVE, 0, 0);
+    btn(c, above, "A", 3);
+    var right: i32 = core_overlay(c, a, OVERLAY_RIGHT, 6, 0);
+    btn(c, right, "R", 4);
+    var wide: i32 = core_overlay(c, a, OVERLAY_BELOW + OVERLAY_MATCH_WIDTH, 0, 60);
+    var tiny: i32 = bx(c, wide, 10, 10, 0);
+    core_layout(c, 300, 200);
+    rect_is(t, "anchor", c, a, 10, 20, 32, 28);
+    rect_is(t, "below: left edges aligned, a gap of 4", c, below, 10, 52, 32, 28);
+    rect_is(t, "above: its bottom edge on the anchor's top", c, above, 10, -8 + 8, 32, 28);
+    rect_is(t, "right: to the side, a gap of 6", c, right, 48, 20, 32, 28);
+    eq(t, "match width: at least as wide as the anchor", rc(c, wide, 2) as i64, 32);
+    ok(t, "(and the content stays small)", rc(c, tiny, 2) == 10);
+    core_free(c);
+}
+
+fun test_overlays_stay_inside_the_window(t: ptr<T>) {
+    begin(t, "overlays_stay_inside_the_window");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    btn(c, col, "m", 1);
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, 290, 95);
+    btn(c, ov, "X", 9);                                     // 32 x 28
+    var left: i32 = core_overlay(c, NONE, OVERLAY_AT, -50, -50);
+    btn(c, left, "Y", 8);
+    core_layout(c, 300, 100);
+    rect_is(t, "moved back inside at the bottom right", c, ov, 268, 72, 32, 28);
+    rect_is(t, "and at the top left", c, left, 0, 0, 32, 28);
+    core_free(c);
+}
+
+fun test_a_full_overlay_is_a_modal_backdrop(t: ptr<T>) {
+    begin(t, "a_full_overlay_is_a_modal_backdrop");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    btn(c, col, "m", 1);
+    var back: i32 = core_overlay(c, NONE, OVERLAY_FULL, 0, 0);
+    core_style(c, back, P_BACKGROUND, 0x80000000);
+    core_style(c, back, P_ALIGN, CENTER);
+    core_style(c, back, P_JUSTIFY, CENTER);
+    var dialog: i32 = core_column(c, back, 10, 0);
+    btn(c, dialog, "OK", 7);
+    core_layout(c, 300, 200);
+    rect_is(t, "the backdrop is the window", c, back, 0, 0, 300, 200);
+    eq(t, "nothing below it can be hit", core_hit(c, 5, 5) as i64, NONE as i64);
+    eq(t, "the dialog's button", core_hit(c, 150, 100) as i64, 7);
+    eq(t, "clicking the backdrop does nothing", core_click(c, 5, 5, 0) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_overlays_are_painted_last(t: ptr<T>) {
+    begin(t, "overlays_are_painted_last");
+    var c: ptr<Ctx> = new_ctx(t);
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, 20, 10);        // made FIRST, still painted last
+    core_style(c, ov, P_BACKGROUND, 0xFF112233);
+    btn(c, ov, "X", 9);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    txt(c, col, "main");
+    core_layout(c, 300, 100);
+    var cs: Cmds = paint(c, 300, 100);
+    var main_text: i64 = find_kind(&cs, CMD_TEXT);
+    var over: i64 = find_color(&cs, 0xFF112233);
+    ok(t, "the main tree's text", main_text >= 0);
+    ok(t, "the overlay's background", over >= 0);
+    ok(t, "the overlay is drawn after the main tree", over > main_text);
+    core_free(c);
+}
+
+fun test_tab_stays_inside_the_topmost_overlay(t: ptr<T>) {
+    begin(t, "tab_stays_inside_the_topmost_overlay");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    btn(c, col, "m1", 1);
+    btn(c, col, "m2", 2);
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, 100, 0);
+    btn(c, ov, "a", 20);
+    btn(c, ov, "b", 21);
+    core_layout(c, 300, 200);
+    key(c, KEY_TAB, 0);
+    eq(t, "the first one in the overlay", core_focused_msg(c) as i64, 20);
+    key(c, KEY_TAB, 0);
+    eq(t, "the second", core_focused_msg(c) as i64, 21);
+    key(c, KEY_TAB, 0);
+    eq(t, "wraps inside the overlay, never to the main tree", core_focused_msg(c) as i64, 20);
+    key(c, KEY_TAB, SHIFT);
+    eq(t, "and backwards", core_focused_msg(c) as i64, 21);
+    core_free(c);
+}
+
+fun test_an_overlay_takes_the_wheel(t: ptr<T>) {
+    begin(t, "an_overlay_takes_the_wheel");
+    var c: ptr<Ctx> = new_ctx(t);
+    var sb: i32 = rebuild(c, 10);                           // the 100 px scroll box
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, 0, 0);
+    core_style(c, ov, P_PADDING, 30);
+    txt(c, ov, "a panel over the list");
+    core_layout(c, 200, 300);
+    eq(t, "the wheel over the overlay does not reach the list", core_scroll(c, 10, 10, 1) as i64, 0);
+    eq(t, "nor does a key aimed at it", core_scroll_get(c, 7) as i64, 0);
+    eq(t, "the wheel elsewhere on the list works", core_scroll(c, 190, 90, 1) as i64, 1);
+    core_free(c);
+}
+
+// ---- drop-down ----------------------------------------------------------------------------------
+
+const OPTIONS: str = "Red\nGreen\nBlue";
+
+// A column (padding 10) with a drop-down id 3 at (10, 10), 200 x 26, and a button "below" (msg 5) under where the list opens.
+fun dd_fixture(c: ptr<Ctx>) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 10, 0);
+    var dd: i32 = core_dropdown(c, col, 3, OPTIONS as ptr<u8>, slen(OPTIONS));
+    var gap: i32 = bx(c, col, 10, 20, 0);
+    btn(c, col, "below", 5);                                // at (10, 56)
+    core_layout(c, 300, 200);
+    return dd;
+}
+
+// Number of CMD_TEXT commands whose text is `want`.
+fun text_count(cs: ptr<Cmds>, want: str) -> i32 {
+    var k: i32 = 0;
+    var w: ptr<u8> = want as ptr<u8>;
+    var n: i64 = slen(want);
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(cs, i);
+        if (d.kind == CMD_TEXT && d.text_len == n) {
+            var same: bool = true;
+            var j: i64 = 0;
+            while (j < n) { if (d.text[j] != w[j]) { same = false; } j += 1; }
+            if (same) { k += 1; }
+        }
+        i += 1;
+    }
+    return k;
+}
+
+// ---- tooltips -----------------------------------------------------------------------------------
+
+const TIP: str = "Hint";
+
+// A column (padding 10) with a button "go" (msg 1) at (10, 10) that has a tooltip, and a button "two" (msg 2) right under it.
+fun tip_fixture(c: ptr<Ctx>) {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 10, 0);
+    var b: i32 = btn(c, col, "go", 1);
+    core_tooltip(c, b, TIP as ptr<u8>, slen(TIP));
+    btn(c, col, "two", 2);
+    core_layout(c, 300, 200);
+}
+
+fun test_a_tooltip_shows_after_the_pointer_rests(t: ptr<T>) {
+    begin(t, "a_tooltip_shows_after_the_pointer_rests");
+    var c: ptr<Ctx> = new_ctx(t);
+    core_set_time(c, 1000);
+    core_set_pointer(c, 15, 15, false);
+    tip_fixture(c);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "not shown at once", text_count(&cs, "Hint") as i64, 0);
+    core_set_time(c, 1300);
+    tip_fixture(c);
+    cs = paint(c, 300, 200);
+    eq(t, "nor after 300 ms", text_count(&cs, "Hint") as i64, 0);
+    eq(t, "the loop is told to wake up when it is due", core_wake_ms(c) as i64, 200);
+    core_set_time(c, 1500);
+    tip_fixture(c);
+    cs = paint(c, 300, 200);
+    eq(t, "shown after 500 ms", text_count(&cs, "Hint") as i64, 1);
+    eq(t, "no more wake-up needed", core_wake_ms(c) as i64, NONE as i64);
+    eq(t, "it does not block what is under it", core_hit(c, 29, 45) as i64, 2);
+    core_free(c);
+}
+
+fun test_a_tooltip_goes_when_the_pointer_leaves_or_clicks(t: ptr<T>) {
+    begin(t, "a_tooltip_goes_when_the_pointer_leaves_or_clicks");
+    var c: ptr<Ctx> = new_ctx(t);
+    core_set_time(c, 0);
+    core_set_pointer(c, 15, 15, false);
+    tip_fixture(c);
+    paint(c, 300, 200);
+    core_set_time(c, 600);
+    tip_fixture(c);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "shown", text_count(&cs, "Hint") as i64, 1);
+    core_set_pointer(c, 250, 150, false);
+    tip_fixture(c);
+    cs = paint(c, 300, 200);
+    eq(t, "gone when the pointer leaves", text_count(&cs, "Hint") as i64, 0);
+    core_set_time(c, 700);
+    core_set_pointer(c, 15, 15, false);
+    tip_fixture(c);
+    paint(c, 300, 200);
+    core_set_time(c, 1300);
+    tip_fixture(c);
+    cs = paint(c, 300, 200);
+    eq(t, "back after resting again", text_count(&cs, "Hint") as i64, 1);
+    eq(t, "the click still reaches the button", core_click(c, 15, 15, 0) as i64, 1);
+    tip_fixture(c);
+    cs = paint(c, 300, 200);
+    eq(t, "a click hides it", text_count(&cs, "Hint") as i64, 0);
+    core_free(c);
+}
+
+// ---- menus --------------------------------------------------------------------------------------
+
+const FILE_MENU: str = "File\nOpen\nSave\n-\nQuit";
+const EDIT_MENU: str = "Edit\nCopy\nPaste";
+
+// A row (the bar) at (0, 0) with two menus: File (id 20, messages 100..) = node 1 and Edit (id 21, messages 200..) = node 2.
+fun menu_fixture(c: ptr<Ctx>) {
+    core_clear(c);
+    var bar: i32 = core_row(c, NONE, 0, 0);
+    core_menu(c, bar, 20, FILE_MENU as ptr<u8>, slen(FILE_MENU), 100);
+    core_menu(c, bar, 21, EDIT_MENU as ptr<u8>, slen(EDIT_MENU), 200);
+    btn(c, bar, "after", 7);
+    core_layout(c, 300, 200);
+}
+
+fun test_a_menu_shows_only_its_label(t: ptr<T>) {
+    begin(t, "a_menu_shows_only_its_label");
+    var c: ptr<Ctx> = new_ctx(t);
+    menu_fixture(c);
+    ok(t, "the menus sit side by side", rc(c, 2, 0) == rc(c, 1, 0) + rc(c, 1, 2));
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "the label is drawn", text_count(&cs, "File") as i64, 1);
+    eq(t, "the items are not", text_count(&cs, "Open") as i64, 0);
+    eq(t, "the options text is not drawn as one string", text_count(&cs, FILE_MENU) as i64, 0);
+    eq(t, "no list is open", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_a_menu_opens_and_yields_a_message(t: ptr<T>) {
+    begin(t, "a_menu_opens_and_yields_a_message");
+    var c: ptr<Ctx> = new_ctx(t);
+    menu_fixture(c);
+    var fx: i32 = rc(c, 1, 0) + 4;
+    var bottom: i32 = rc(c, 1, 1) + rc(c, 1, 3);
+    eq(t, "a click on the label opens it", core_click(c, fx, 5, 0) as i64, NONE as i64);
+    eq(t, "open", core_dropdown_open(c) as i64, 20);
+    menu_fixture(c);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "items are listed", (text_count(&cs, "Open") + text_count(&cs, "Save") + text_count(&cs, "Quit")) as i64, 3);
+    eq(t, "the label is not repeated in the list", text_count(&cs, "File") as i64, 1);
+    // list: frame 3 px, rows of 22 px (Open, Save), then a 9 px separator, then Quit
+    eq(t, "the second item", core_click(c, fx, bottom + 3 + 22 + 5, 0) as i64, 101);
+    eq(t, "picking closes the menu", core_dropdown_open(c) as i64, NONE as i64);
+    menu_fixture(c);
+    core_click(c, fx, 5, 0);
+    menu_fixture(c);
+    eq(t, "the last item (the separator counts)", core_click(c, fx, bottom + 3 + 22 + 22 + 9 + 5, 0) as i64, 103);
+    menu_fixture(c);
+    core_click(c, fx, 5, 0);
+    menu_fixture(c);
+    eq(t, "a click on the separator picks nothing", core_click(c, fx, bottom + 3 + 22 + 22 + 4, 0) as i64, NONE as i64);
+    eq(t, "and closes", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_menus_switch_on_hover_while_one_is_open(t: ptr<T>) {
+    begin(t, "menus_switch_on_hover_while_one_is_open");
+    var c: ptr<Ctx> = new_ctx(t);
+    menu_fixture(c);
+    core_set_pointer(c, rc(c, 2, 0) + 4, 5, false);
+    eq(t, "nothing opens by hovering alone", core_dropdown_open(c) as i64, NONE as i64);
+    core_click(c, rc(c, 1, 0) + 4, 5, 0);
+    menu_fixture(c);
+    core_set_pointer(c, rc(c, 2, 0) + 4, 5, false);
+    eq(t, "hovering Edit opens it instead", core_dropdown_open(c) as i64, 21);
+    eq(t, "and gives it the focus", core_focused(c) as i64, 21);
+    core_set_pointer(c, rc(c, 3, 0) + 4, 5, false);
+    eq(t, "a button in the bar does not switch it", core_dropdown_open(c) as i64, 21);
+    core_free(c);
+}
+
+fun test_menu_keyboard(t: ptr<T>) {
+    begin(t, "menu_keyboard");
+    var c: ptr<Ctx> = new_ctx(t);
+    menu_fixture(c);
+    key(c, KEY_TAB, 0);
+    eq(t, "Tab focuses the first menu", core_focused(c) as i64, 20);
+    eq(t, "Enter opens it", key(c, KEY_ENTER, 0) as i64, 0);
+    eq(t, "open", core_dropdown_open(c) as i64, 20);
+    menu_fixture(c);
+    eq(t, "Enter picks the first item", key(c, KEY_ENTER, 0) as i64, INPUT_ACTIVATED as i64);
+    eq(t, "its message", core_activated(c) as i64, 100);
+    eq(t, "closed", core_dropdown_open(c) as i64, NONE as i64);
+    key(c, KEY_DOWN, 0);                                    // opens it again, on the first item
+    menu_fixture(c);
+    key(c, KEY_DOWN, 0);                                    // Save
+    key(c, KEY_DOWN, 0);                                    // skips the separator: Quit
+    key(c, KEY_DOWN, 0);                                    // stays on the last
+    eq(t, "Enter picks Quit", key(c, KEY_ENTER, 0) as i64, INPUT_ACTIVATED as i64);
+    eq(t, "message", core_activated(c) as i64, 103);
+    key(c, KEY_ENTER, 0);
+    menu_fixture(c);
+    key(c, KEY_RIGHT, 0);
+    eq(t, "Right goes to the next menu", core_dropdown_open(c) as i64, 21);
+    eq(t, "Right wraps around", (key(c, KEY_RIGHT, 0) + core_dropdown_open(c)) as i64, 20);
+    key(c, KEY_LEFT, 0);
+    eq(t, "Left goes back", core_dropdown_open(c) as i64, 21);
+    key(c, KEY_ESCAPE, 0);
+    eq(t, "Escape closes", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+// ---- left-aligned buttons -----------------------------------------------------------------------
+
+fun test_a_left_button_starts_at_the_edge_and_is_cut(t: ptr<T>) {
+    begin(t, "a_left_button_starts_at_the_edge_and_is_cut");
+    var c: ptr<Ctx> = new_ctx(t);
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 10, 0);
+    var a: i32 = btn(c, col, "ab", 1);
+    core_style(c, a, P_WIDTH, 100);
+    var b: i32 = btn(c, col, "ab", 2);
+    core_style(c, b, P_WIDTH, 100);
+    core_left(c, b);
+    var long: i32 = btn(c, col, "a very long label indeed", 3);
+    core_style(c, long, P_WIDTH, 60);
+    core_layout(c, 300, 200);
+    var cs: Cmds = paint(c, 300, 200);
+    var centred: i64 = -1;
+    var left: i64 = -1;
+    var cut: i64 = -1;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(&cs, i);
+        if (d.kind == CMD_TEXT && d.text_len == 2 && centred < 0) { centred = d.x as i64; }
+        else if (d.kind == CMD_TEXT && d.text_len == 2) { left = d.x as i64; }
+        if (d.kind == CMD_TEXT && d.text_len == 24) { cut = d.x as i64; }
+        i += 1;
+    }
+    eq(t, "a plain button centres its label", centred, (10 + (100 - 16) / 2) as i64);
+    eq(t, "a left button starts 4 px in", left, 14);
+    eq(t, "a label too long for its button starts at the left too", cut, 14);
+    ok(t, "and is clipped", count_kind(&cs, CMD_CLIP) >= 2);
+    core_free(c);
+}
+
+fun test_dropdown_layout_value_and_paint(t: ptr<T>) {
+    begin(t, "dropdown_layout_value_and_paint");
+    var c: ptr<Ctx> = new_ctx(t);
+    var dd: i32 = dd_fixture(c);
+    rect_is(t, "an input's size", c, dd, 10, 10, 200, 26);
+    eq(t, "starts at the first option", core_dropdown_get(c, 3) as i64, 0);
+    core_dropdown_set(c, 3, 2);
+    dd_fixture(c);
+    eq(t, "set and kept", core_dropdown_get(c, 3) as i64, 2);
+    core_dropdown_set(c, 3, 99);
+    dd_fixture(c);
+    eq(t, "clamped to the last option", core_dropdown_get(c, 3) as i64, 2);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "the chosen option is shown", text_count(&cs, "Blue") as i64, 1);
+    eq(t, "the others are not", text_count(&cs, "Red") as i64, 0);
+    eq(t, "a chevron: two strokes", count_kind(&cs, CMD_LINE) as i64, 2);
+    eq(t, "the list is closed", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_dropdown_opens_and_picks_with_the_mouse(t: ptr<T>) {
+    begin(t, "dropdown_opens_and_picks_with_the_mouse");
+    var c: ptr<Ctx> = new_ctx(t);
+    dd_fixture(c);
+    eq(t, "a click returns no message", core_click(c, 100, 20, 0) as i64, NONE as i64);
+    eq(t, "the list is open", core_dropdown_open(c) as i64, 3);
+    eq(t, "the drop-down has the focus", core_focused(c) as i64, 3);
+    dd_fixture(c);                                          // the next frame: the list exists
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "all three options are listed", (text_count(&cs, "Red") + text_count(&cs, "Green") + text_count(&cs, "Blue")) as i64, 4);   // Red twice: the box and the list
+    // the list: x 10, y 38 (under the box, a 2 px gap), 3 px frame, rows of 22 px
+    eq(t, "the button underneath is covered", core_hit(c, 20, 80) as i64, NONE as i64);
+    eq(t, "clicking the third row", core_click(c, 50, 41 + 44 + 5, 0) as i64, NONE as i64);
+    eq(t, "picks Blue", core_dropdown_get(c, 3) as i64, 2);
+    eq(t, "and closes the list", core_dropdown_open(c) as i64, NONE as i64);
+    dd_fixture(c);
+    cs = paint(c, 300, 200);
+    eq(t, "the box now shows Blue", text_count(&cs, "Blue") as i64, 1);
+    eq(t, "the button below is reachable again", core_hit(c, 20, 70) as i64, 5);
+    core_free(c);
+}
+
+fun test_clicking_elsewhere_closes_the_list(t: ptr<T>) {
+    begin(t, "clicking_elsewhere_closes_the_list");
+    var c: ptr<Ctx> = new_ctx(t);
+    dd_fixture(c);
+    core_click(c, 100, 20, 0);
+    dd_fixture(c);
+    eq(t, "open", core_dropdown_open(c) as i64, 3);
+    eq(t, "a click outside the list", core_click(c, 280, 180, 0) as i64, NONE as i64);
+    eq(t, "closes it", core_dropdown_open(c) as i64, NONE as i64);
+    eq(t, "the choice is unchanged", core_dropdown_get(c, 3) as i64, 0);
+    core_click(c, 100, 20, 0);                              // open again
+    dd_fixture(c);
+    core_click(c, 100, 20, 0);                              // a click on its own box
+    eq(t, "closes it, and does not reopen", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_dropdown_keyboard(t: ptr<T>) {
+    begin(t, "dropdown_keyboard");
+    var c: ptr<Ctx> = new_ctx(t);
+    dd_fixture(c);
+    key(c, KEY_TAB, 0);
+    eq(t, "Tab focuses it", core_focused(c) as i64, 3);
+    eq(t, "Down changes the choice while closed", key(c, KEY_DOWN, 0) as i64, INPUT_CHANGED as i64);
+    eq(t, "Green", core_dropdown_get(c, 3) as i64, 1);
+    key(c, KEY_END, 0);
+    eq(t, "End: the last", core_dropdown_get(c, 3) as i64, 2);
+    eq(t, "Down at the end", key(c, KEY_DOWN, 0) as i64, 0);
+    key(c, KEY_HOME, 0);
+    eq(t, "Home: the first", core_dropdown_get(c, 3) as i64, 0);
+    eq(t, "Up at the start", key(c, KEY_UP, 0) as i64, 0);
+    eq(t, "Enter opens the list", key(c, KEY_ENTER, 0) as i64, 0);
+    eq(t, "it is open", core_dropdown_open(c) as i64, 3);
+    dd_fixture(c);
+    key(c, KEY_DOWN, 0);
+    key(c, KEY_DOWN, 0);
+    eq(t, "moving the highlight does not change the choice", core_dropdown_get(c, 3) as i64, 0);
+    eq(t, "Enter picks the highlighted one", key(c, KEY_ENTER, 0) as i64, INPUT_CHANGED as i64);
+    eq(t, "Blue", core_dropdown_get(c, 3) as i64, 2);
+    eq(t, "and closes", core_dropdown_open(c) as i64, NONE as i64);
+    key(c, KEY_ENTER, 0);
+    dd_fixture(c);
+    key(c, KEY_UP, 0);
+    eq(t, "Escape closes without picking", key(c, KEY_ESCAPE, 0) as i64, 0);
+    eq(t, "closed", core_dropdown_open(c) as i64, NONE as i64);
+    eq(t, "still Blue", core_dropdown_get(c, 3) as i64, 2);
+    eq(t, "Space opens", feed(c, " ") as i64, 0);
+    eq(t, "open", core_dropdown_open(c) as i64, 3);
+    dd_fixture(c);
+    eq(t, "Space again picks the highlighted row", feed(c, " ") as i64, 0);
+    eq(t, "closed", core_dropdown_open(c) as i64, NONE as i64);
+    key(c, KEY_ENTER, 0);
+    key(c, KEY_TAB, 0);
+    eq(t, "Tab closes an open list", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_the_list_is_built_once_and_follows_the_tree(t: ptr<T>) {
+    begin(t, "the_list_is_built_once_and_follows_the_tree");
+    var c: ptr<Ctx> = new_ctx(t);
+    dd_fixture(c);
+    core_click(c, 100, 20, 0);
+    dd_fixture(c);
+    core_layout(c, 300, 200);                               // laying out again must not build a second list
+    core_layout(c, 300, 200);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "Green is listed once", text_count(&cs, "Green") as i64, 1);
+    // the drop-down leaves the tree: the list closes with it
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 10, 0);
+    btn(c, col, "only a button", 1);
+    core_layout(c, 300, 200);
+    eq(t, "closed", core_dropdown_open(c) as i64, NONE as i64);
+    core_free(c);
+}
+
+fun test_dropdown_highlight_and_choice_are_marked(t: ptr<T>) {
+    begin(t, "dropdown_highlight_and_choice_are_marked");
+    var c: ptr<Ctx> = new_ctx(t);
+    core_dropdown_set(c, 3, 1);                             // Green is chosen
+    dd_fixture(c);
+    core_click(c, 100, 20, 0);
+    dd_fixture(c);
+    key(c, KEY_DOWN, 0);                                    // the highlight moves to Blue
+    dd_fixture(c);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "one highlighted row", count_color(&cs, core_theme(c).selection) as i64, 1);
+    var hl: i64 = find_color(&cs, core_theme(c).selection);
+    if (hl >= 0) { eq(t, "it is the third row (y 3 + 38 + 44)", cmd(&cs, hl).y as i64, 41 + 44); }
+    var accent_text: bool = false;
+    var i: i64 = 0;
+    while (i < cs.n) {
+        var d: ptr<DrawCmd> = cmd(&cs, i);
+        if (d.kind == CMD_TEXT && d.color == core_theme(c).accent && d.text_len == 5) { accent_text = true; }   // "Green"
+        i += 1;
+    }
+    ok(t, "the chosen option is in the accent colour", accent_text);
+    core_free(c);
+}
+
+// ---- multi-line text area ---------------------------------------------------------------------
+
+// A column (padding 10) with a text area, id 4, `rows` lines tall: (10, 10), 200 x (16 * rows + 10).
+fun ta_fixture(c: ptr<Ctx>, rows: i32) -> i32 {
+    core_clear(c);
+    var col: i32 = core_column(c, NONE, 10, 0);
+    var ta: i32 = core_textarea(c, col, 4, "notes" as ptr<u8>, 5, rows);
+    core_layout(c, 300, 200);
+    return ta;
+}
+
+fun set_text(c: ptr<Ctx>, text: str) {
+    core_input_set(c, 4, text as ptr<u8>, slen(text));
+}
+
+fun test_textarea_layout_and_newlines(t: ptr<T>) {
+    begin(t, "textarea_layout_and_newlines");
+    var c: ptr<Ctx> = new_ctx(t);
+    var ta: i32 = ta_fixture(c, 3);
+    rect_is(t, "3 rows + padding", c, ta, 10, 10, 200, 58);
+    core_input_focus(c, 4);
+    eq(t, "typed", feed(c, "ab") as i64, INPUT_CHANGED as i64);
+    eq(t, "Enter types a newline", key(c, KEY_ENTER, 0) as i64, INPUT_CHANGED as i64);
+    feed(c, "cd");
+    input_is(t, c, 4, "ab\ncd");
+    eq(t, "Ctrl+Enter submits instead", key(c, KEY_ENTER, CTRL) as i64, INPUT_SUBMIT as i64);
+    input_is(t, c, 4, "ab\ncd");
+    feed(c, "x\ny");                                       // a paste with a newline keeps it
+    input_is(t, c, 4, "ab\ncdx\ny");
+    feed(c, "\x07");                                       // other control characters are still dropped
+    input_is(t, c, 4, "ab\ncdx\ny");
+    core_free(c);
+}
+
+fun test_textarea_up_and_down_keep_the_column(t: ptr<T>) {
+    begin(t, "textarea_up_and_down_keep_the_column");
+    var c: ptr<Ctx> = new_ctx(t);
+    ta_fixture(c, 3);
+    set_text(c, "hello\nhi\nworld");
+    core_input_focus(c, 4);                                 // the caret is at the end: line 3, column 5
+    key(c, KEY_UP, 0);                                      // "hi" is shorter: the end of it
+    key(c, KEY_UP, 0);                                      // the column 5 is remembered: back to column 5 of "hello"
+    key(c, KEY_DOWN, 0);
+    key(c, KEY_DOWN, 0);
+    feed(c, "?");
+    input_is(t, c, 4, "hello\nhi\nworld?");
+    set_text(c, "hello\nhi\nworld");
+    key(c, KEY_UP, 0);
+    feed(c, "!");
+    input_is(t, c, 4, "hello\nhi!\nworld");
+    key(c, KEY_UP, 0);                                      // typing forgets the remembered column
+    key(c, KEY_UP, 0);
+    feed(c, "^");
+    input_is(t, c, 4, "^hello\nhi!\nworld");
+    core_free(c);
+}
+
+fun test_textarea_home_end_and_selection(t: ptr<T>) {
+    begin(t, "textarea_home_end_and_selection");
+    var c: ptr<Ctx> = new_ctx(t);
+    ta_fixture(c, 3);
+    set_text(c, "ab\ncd");
+    core_input_focus(c, 4);
+    key(c, KEY_HOME, 0);                                    // the start of the line
+    feed(c, "|");
+    input_is(t, c, 4, "ab\n|cd");
+    key(c, KEY_HOME, CTRL);                                 // the start of the text
+    feed(c, "^");
+    input_is(t, c, 4, "^ab\n|cd");
+    key(c, KEY_END, 0);                                     // the end of the first line
+    feed(c, "$");
+    input_is(t, c, 4, "^ab$\n|cd");
+    key(c, KEY_END, CTRL);
+    feed(c, "!");
+    input_is(t, c, 4, "^ab$\n|cd!");
+    set_text(c, "ab\ncd");
+    key(c, KEY_HOME, CTRL);
+    key(c, KEY_RIGHT, 0);
+    key(c, KEY_DOWN, SHIFT);                                // a selection across the line break
+    selection_is(t, c, "b\nc");
+    core_free(c);
+}
+
+fun test_textarea_mouse(t: ptr<T>) {
+    begin(t, "textarea_mouse");
+    var c: ptr<Ctx> = new_ctx(t);
+    ta_fixture(c, 3);
+    set_text(c, "abc\ndef\nghi");
+    // text starts at x 10 + 6, the first line at y 10 + 5, each line 16 px
+    eq(t, "a click in the second line, after two characters", core_click(c, 16 + 16 + 1, 15 + 16 + 3, 0) as i64, NONE as i64);
+    eq(t, "focused", core_focused(c) as i64, 4);
+    feed(c, "_");
+    input_is(t, c, 4, "abc\nde_f\nghi");
+    core_click(c, 200, 15 + 32 + 3, 0);                     // far right of the third line: its end
+    feed(c, "!");
+    input_is(t, c, 4, "abc\nde_f\nghi!");
+    core_click(c, 16, 12, 0);                               // above the first line's text, inside the box: the start of the first line
+    feed(c, "<");
+    input_is(t, c, 4, "<abc\nde_f\nghi!");
+    core_click(c, 16, 15 + 3, 0);                           // press at the start of line 1 and drag down to line 3
+    eq(t, "drag", core_drag(c, 16 + 16, 15 + 32 + 3) as i64, 1);
+    selection_is(t, c, "<abc\nde_f\ngh");
+    core_free(c);
+}
+
+fun test_textarea_scrolls_with_the_caret_and_the_wheel(t: ptr<T>) {
+    begin(t, "textarea_scrolls_with_the_caret_and_the_wheel");
+    var c: ptr<Ctx> = new_ctx(t);
+    ta_fixture(c, 3);
+    set_text(c, "1\n2\n3\n4\n5\n6");
+    core_input_focus(c, 4);                                 // the caret is on line 6, below the three visible rows
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "line 6 is shown", text_count(&cs, "6") as i64, 1);
+    eq(t, "line 1 is scrolled out", text_count(&cs, "1") as i64, 0);
+    var caret: i64 = -1;
+    var i: i64 = 0;
+    while (i < cs.n) { if (cmd(&cs, i).kind == CMD_FILL && cmd(&cs, i).w == 1 && cmd(&cs, i).h == 16) { caret = i; } i += 1; }
+    ok(t, "the caret is inside the box", caret >= 0 && cmd(&cs, caret).y >= 10 && cmd(&cs, caret).y + 16 <= 68);
+    eq(t, "the wheel scrolls it back up", core_scroll(c, 20, 20, -1) as i64, 1);
+    cs = paint(c, 300, 200);
+    eq(t, "line 1 is back", text_count(&cs, "1") as i64, 1);
+    eq(t, "(and the view does not snap back to the caret)", text_count(&cs, "1") as i64, 1);
+    eq(t, "already at the top", core_scroll(c, 20, 20, -1) as i64, 0);
+    core_free(c);
+}
+
+fun test_textarea_page_keys_tab_and_placeholder(t: ptr<T>) {
+    begin(t, "textarea_page_keys_tab_and_placeholder");
+    var c: ptr<Ctx> = new_ctx(t);
+    ta_fixture(c, 3);
+    var cs: Cmds = paint(c, 300, 200);
+    eq(t, "an empty, unfocused area shows its hint", text_count(&cs, "notes") as i64, 1);
+    set_text(c, "1\n2\n3\n4\n5\n6");
+    core_input_focus(c, 4);
+    key(c, KEY_HOME, CTRL);
+    key(c, KEY_PAGE_DOWN, 0);                               // rows - 1 = two lines
+    feed(c, "x");
+    input_is(t, c, 4, "1\n2\nx3\n4\n5\n6");
+    key(c, KEY_PAGE_UP, 0);
+    feed(c, "y");
+    input_is(t, c, 4, "1y\n2\nx3\n4\n5\n6");                 // the column (after one character) is kept
+    eq(t, "Tab moves the focus out instead of typing a tab", key(c, KEY_TAB, 0) as i64, INPUT_FOCUS_MOVED as i64);
+    input_is(t, c, 4, "1y\n2\nx3\n4\n5\n6");
+    core_free(c);
+}
+
+// ---- font size, weight and scale ----------------------------------------------------------------
+
+fun test_font_size_scales_measurement_and_is_inherited(t: ptr<T>) {
+    begin(t, "font_size_scales_measurement_and_is_inherited");
+    var c: ptr<Ctx> = new_ctx(t);                            // font-less: 16 px text = 8 px per character, 16 px high
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var plain: i32 = txt(c, col, "abcd");
+    var big: i32 = core_box(c, col);
+    core_style(c, big, P_FONT_SIZE, 32);
+    var inherits: i32 = txt(c, big, "abcd");
+    var own: i32 = txt(c, big, "abcd");
+    core_style(c, own, P_FONT_SIZE, 10);
+    var deeper: i32 = core_box(c, big);
+    var grandchild: i32 = txt(c, deeper, "abcd");
+    core_layout(c, 300, 300);
+    rect_is(t, "the default: 4 x 8 by 16", c, plain, 0, 0, 32, 16);
+    eq(t, "inherited from the parent: 4 x 16 wide", rc(c, inherits, 2) as i64, 64);
+    eq(t, "and 32 high", rc(c, inherits, 3) as i64, 32);
+    eq(t, "an own size wins: 4 x 5", rc(c, own, 2) as i64, 20);
+    eq(t, "and 10 high", rc(c, own, 3) as i64, 10);
+    eq(t, "a grandchild inherits through a plain box", rc(c, grandchild, 2) as i64, 64);
+    core_free(c);
+}
+
+fun test_widgets_follow_the_font_size(t: ptr<T>) {
+    begin(t, "widgets_follow_the_font_size");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_FONT_SIZE, 32);
+    var b: i32 = btn(c, col, "ok", 1);                      // 2 chars x 16 + 24 wide, 32 + 12 high
+    var i: i32 = core_input(c, col, 1, null, 0);            // 32 + 10 high
+    var k: i32 = chk(c, col, "x", false, 2);                // the square is 16: the 32 px line is taller
+    core_layout(c, 400, 300);
+    rect_is(t, "button", c, b, 0, 0, 56, 44);
+    eq(t, "input height", rc(c, i, 3) as i64, 42);
+    eq(t, "checkbox: 16 + 8 + one 16 px character", rc(c, k, 2) as i64, 40);
+    eq(t, "checkbox height follows the line", rc(c, k, 3) as i64, 32);
+    // a click in the input lands by the bigger characters (16 px each)
+    core_input_set(c, 1, "abcdef" as ptr<u8>, 6);
+    core_click(c, 6 + 16 * 3 + 2, rc(c, i, 1) + 5, 0);
+    feed(c, "_");
+    input_is(t, c, 1, "abc_def");
+    core_free(c);
+}
+
+fun test_text_commands_carry_size_and_weight(t: ptr<T>) {
+    begin(t, "text_commands_carry_size_and_weight");
+    var c: ptr<Ctx> = new_ctx(t);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    core_style(c, col, P_BOLD, 1);
+    core_style(c, col, P_FONT_SIZE, 24);
+    txt(c, col, "bold and big");
+    var reg: i32 = txt(c, col, "regular again");
+    core_style(c, reg, P_BOLD, 0);
+    var back: i32 = txt(c, col, "inherits");
+    core_style(c, back, P_BOLD, -1);
+    core_layout(c, 400, 300);
+    var cs: Cmds = paint(c, 400, 300);
+    eq(t, "size of the first", cmd(&cs, 1).w as i64, 24);
+    eq(t, "bold flag", cmd(&cs, 1).h as i64, TEXT_BOLD as i64);
+    eq(t, "regular overrides a bold parent", cmd(&cs, 2).h as i64, 0);
+    eq(t, "the size is still inherited", cmd(&cs, 2).w as i64, 24);
+    eq(t, "-1 inherits the weight again", cmd(&cs, 3).h as i64, TEXT_BOLD as i64);
+    core_free(c);
+}
+
+fun test_the_theme_sets_the_default_size(t: ptr<T>) {
+    begin(t, "the_theme_sets_the_default_size");
+    var c: ptr<Ctx> = new_ctx(t);
+    var th: ptr<Theme> = core_theme(c);
+    eq(t, "a new Ui starts with 16 px text", th.font_size as i64, 16);
+    var light: Theme = Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                               placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                               radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                               field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                               scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0,
+                               slider_thumb: 0, slider_track: 0, font_size: 0 };
+    theme_light(&light);
+    eq(t, "theme_light's size", light.font_size as i64, 16);
+    th.font_size = 20;
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var tx: i32 = txt(c, col, "abcd");
+    core_layout(c, 300, 100);
+    rect_is(t, "20 px text: 10 per character, 20 high", c, tx, 0, 0, 40, 20);
+    core_free(c);
+}
+
+fun test_theme_scale_for_high_resolution_screens(t: ptr<T>) {
+    begin(t, "theme_scale_for_high_resolution_screens");
+    var th: Theme = Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                            placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                            radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                            field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                            scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0,
+                            slider_thumb: 0, slider_track: 0, font_size: 0 };
+    theme_light(&th);
+    theme_scale(&th, 200);
+    eq(t, "text size", th.font_size as i64, 32);
+    eq(t, "button padding", th.button_pad_x as i64, 24);
+    eq(t, "checkbox", th.check_box as i64, 32);
+    eq(t, "scrollbar", th.scrollbar_w as i64, 12);
+    eq(t, "input width", th.field_width as i64, 400);
+    eq(t, "the caret blink time is not a size", th.caret_blink_ms as i64, 530);
+    theme_light(&th);
+    theme_scale(&th, 150);
+    eq(t, "one and a half: 16 -> 24", th.font_size as i64, 24);
+    eq(t, "6 -> 9", th.scrollbar_w as i64, 9);
+    eq(t, "rounds: 3 * 1.5 = 4.5 -> 5", th.radius_check as i64, 5);
+    theme_light(&th);
+    theme_scale(&th, 100);
+    eq(t, "100 changes nothing", th.font_size as i64, 16);
+    var c: ptr<Ctx> = new_ctx(t);
+    theme_light(&th);
+    theme_scale(&th, 200);
+    core_set_theme(c, &th);
+    var col: i32 = core_column(c, NONE, 0, 0);
+    var b: i32 = btn(c, col, "ok", 1);                      // 32 px text: 2 x 16 + 2 x 24 wide, 32 + 24 high
+    core_layout(c, 400, 300);
+    rect_is(t, "a scaled button", c, b, 0, 0, 80, 56);
+    core_free(c);
+}
+
+// ---- Unicode helpers ------------------------------------------------------------------------------
+
+fun test_unicode_classes(t: ptr<T>) {
+    begin(t, "unicode_classes");
+    ok(t, "ascii letter", unicode_is_alnum(97));
+    ok(t, "ascii digit", unicode_is_alnum(48));
+    ok(t, "space", !unicode_is_alnum(32));
+    ok(t, "punctuation", !unicode_is_alnum(46));
+    ok(t, "underscore", !unicode_is_alnum(95));
+    ok(t, "Hangul syllable", unicode_is_alnum(0xAC00));
+    ok(t, "CJK ideograph", unicode_is_alnum(0x65E5));
+    ok(t, "Cyrillic", unicode_is_alnum(0x0436));
+    ok(t, "circled digit one", unicode_is_alnum(0x2460));
+    ok(t, "superscript two", unicode_is_alnum(0xB2));
+    ok(t, "em dash", !unicode_is_alnum(0x2014));
+    ok(t, "check mark", !unicode_is_alnum(0x2713));
+    ok(t, "emoji", !unicode_is_alnum(0x1F600));
+    ok(t, "NUL is control", unicode_is_control(0));
+    ok(t, "DEL is control", unicode_is_control(0x7F));
+    ok(t, "C1 control", unicode_is_control(0x9F));
+    ok(t, "space is not control", !unicode_is_control(32));
+    ok(t, "NBSP is not control", !unicode_is_control(0xA0));
+}
+
+fun main() {
+    var t: T = T { fe: font_new(), name: "", checks: 0, failures: 0 };
+    test_column_and_row_layout(&t);
+    test_hit_testing_returns_message(&t);
+    test_invalid_use_is_rejected(&t);
+    test_paint_emits_background_then_widgets(&t);
+    test_grow_shares_free_space_exactly(&t);
+    test_justify_and_align(&t);
+    test_stretch_skips_fixed_cross_size(&t);
+    test_button_label_is_centred_when_stretched(&t);
+    test_box_background_and_border_are_painted(&t);
+    test_typing_edits_the_focused_input_only(&t);
+    test_editing_respects_utf8_boundaries(&t);
+    test_state_survives_frames_and_set_get_work(&t);
+    test_click_focuses_and_places_the_caret(&t);
+    test_clicking_a_button_returns_its_message_and_drops_focus(&t);
+    test_focused_input_paints_caret_clip_and_placeholder(&t);
+    test_long_text_scrolls_to_keep_the_caret_visible(&t);
+    test_unchanged_frames_are_detected(&t);
+    test_checkbox_layout_hit_and_click(&t);
+    test_checkbox_paint_reflects_state(&t);
+    test_margin_adds_space_around_a_node(&t);
+    test_margin_counts_in_grow_stretch_and_centering(&t);
+    test_text_colour_is_inherited_and_can_be_overridden(&t);
+    test_radius_selects_rounded_commands(&t);
+    test_shift_arrows_home_end_select(&t);
+    test_plain_arrow_collapses_the_selection_to_its_edge(&t);
+    test_typing_replaces_and_backspace_deletes_the_selection(&t);
+    test_ctrl_arrows_move_by_word(&t);
+    test_selection_respects_utf8(&t);
+    test_clipboard_requests_are_flagged_for_the_app(&t);
+    test_mouse_press_drag_release_and_shift_click(&t);
+    test_selection_is_painted_only_while_focused(&t);
+    test_scroll_box_keeps_its_height_and_shifts_content(&t);
+    test_dragging_the_scrollbar_thumb_scrolls_the_box(&t);
+    test_clicking_the_scrollbar_track_centres_the_thumb_there(&t);
+    test_scroll_keys_step_page_and_jump(&t);
+    test_scroll_keys_prefer_the_box_under_the_pointer(&t);
+    test_scroll_is_clamped_to_the_content(&t);
+    test_wheel_outside_the_box_does_nothing(&t);
+    test_scrolled_out_buttons_cannot_be_hit(&t);
+    test_scroll_box_paints_inside_a_clip(&t);
+    test_scroll_set_clamps_at_layout_and_survives_a_rebuild(&t);
+    test_wheel_over_a_child_scrolls_its_box(&t);
+    test_nested_scroll_box_scrolls_the_inner_one_first(&t);
+    test_horizontal_scroll_shifts_and_clamps_the_content(&t);
+    test_horizontal_wheel_and_keys(&t);
+    test_a_vertical_only_box_ignores_sideways_input(&t);
+    test_horizontal_scrollbar_paint_and_drag(&t);
+    test_both_scrollbars_share_the_corner(&t);
+    test_content_scrolled_out_sideways_cannot_be_hit(&t);
+    test_tab_walks_the_focusable_widgets_and_wraps(&t);
+    test_enter_and_space_press_the_focused_widget(&t);
+    test_the_focus_ring_follows_the_keyboard_not_the_mouse(&t);
+    test_focus_survives_a_rebuild_and_follows_input_focus(&t);
+    test_tab_scrolls_the_focused_widget_into_view(&t);
+    test_the_default_theme_is_the_light_one(&t);
+    test_theme_colours_reach_the_draw_list(&t);
+    test_theme_metrics_reach_the_layout(&t);
+    test_dark_theme_and_set_theme_copies(&t);
+    test_node_styles_win_over_the_theme(&t);
+    test_scrollbar_size_and_step_come_from_the_theme(&t);
+    test_the_caret_blinks_and_typing_restarts_it(&t);
+    test_blink_can_be_switched_off(&t);
+    test_progress_bar_layout_and_paint(&t);
+    test_progress_bar_is_not_interactive(&t);
+    test_radio_button(&t);
+    test_radio_buttons_take_the_keyboard(&t);
+    test_tabs(&t);
+    test_slider_value_and_range(&t);
+    test_slider_mouse(&t);
+    test_slider_keyboard(&t);
+    test_slider_paint(&t);
+    test_two_sliders_are_independent(&t);
+    test_overlay_is_laid_out_on_its_own_and_hit_first(&t);
+    test_an_overlay_blocks_what_is_under_it(&t);
+    test_overlay_placements(&t);
+    test_overlays_stay_inside_the_window(&t);
+    test_a_full_overlay_is_a_modal_backdrop(&t);
+    test_overlays_are_painted_last(&t);
+    test_tab_stays_inside_the_topmost_overlay(&t);
+    test_an_overlay_takes_the_wheel(&t);
+    test_a_tooltip_shows_after_the_pointer_rests(&t);
+    test_a_tooltip_goes_when_the_pointer_leaves_or_clicks(&t);
+    test_a_menu_shows_only_its_label(&t);
+    test_a_menu_opens_and_yields_a_message(&t);
+    test_menus_switch_on_hover_while_one_is_open(&t);
+    test_menu_keyboard(&t);
+    test_a_left_button_starts_at_the_edge_and_is_cut(&t);
+    test_dropdown_layout_value_and_paint(&t);
+    test_dropdown_opens_and_picks_with_the_mouse(&t);
+    test_clicking_elsewhere_closes_the_list(&t);
+    test_dropdown_keyboard(&t);
+    test_the_list_is_built_once_and_follows_the_tree(&t);
+    test_dropdown_highlight_and_choice_are_marked(&t);
+    test_textarea_layout_and_newlines(&t);
+    test_textarea_up_and_down_keep_the_column(&t);
+    test_textarea_home_end_and_selection(&t);
+    test_textarea_mouse(&t);
+    test_textarea_scrolls_with_the_caret_and_the_wheel(&t);
+    test_textarea_page_keys_tab_and_placeholder(&t);
+    test_font_size_scales_measurement_and_is_inherited(&t);
+    test_widgets_follow_the_font_size(&t);
+    test_text_commands_carry_size_and_weight(&t);
+    test_the_theme_sets_the_default_size(&t);
+    test_theme_scale_for_high_resolution_screens(&t);
+    test_unicode_classes(&t);
+    println("core_test: {}/{} checks passed", t.checks - t.failures, t.checks);
+    font_free(t.fe);
+    if (t.failures != 0) { println("core_test: {} FAILED", t.failures); }
+}

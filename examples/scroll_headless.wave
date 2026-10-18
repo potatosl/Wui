@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Renders a scroll box without a window to build/scroll.ppm: a list scrolled
+// down three wheel notches, with its scrollbar.
+// Run with:  WUI_RUN=scroll_headless wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, ui_new, ui_free, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_scroll_box, ui_scroll,
+                ui_input, ui_layout, ui_render, ui_align, ui_grow, ui_gap, ui_padding, ui_background, ui_border,
+                UI_ROOT, UI_STRETCH};
+import("std::fs::file")::{write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+const W: i32 = 360;
+const H: i32 = 300;
+
+fun row_label(buf: ptr<u8>, n: i32) {
+    var w: str = "Row ";
+    var p: ptr<u8> = w as ptr<u8>;
+    var i: i32 = 0;
+    while (p[i] != 0) { buf[i] = p[i]; i += 1; }
+    buf[i] = (48 + n / 10) as u8;
+    buf[i + 1] = (48 + n % 10) as u8;
+    buf[i + 2] = 0;
+}
+
+fun build(ui: ptr<Ui>) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 12, 8);
+    ui_align(ui, page, UI_STRETCH);
+    ui_text(ui, page, "scroll box / 스크롤 상자");
+    var list: i32 = ui_scroll_box(ui, page, 1);
+    ui_grow(ui, list, 1);
+    ui_align(ui, list, UI_STRETCH);
+    ui_gap(ui, list, 6);
+    ui_padding(ui, list, 8);
+    ui_background(ui, list, 0xFFFFFFFF);
+    ui_border(ui, list, 0xFFC8C8C8);
+    var buf: ptr<u8> = mem_alloc(16);
+    var i: i32 = 0;
+    while (i < 40) {
+        row_label(buf, i);
+        var r: i32 = ui_row(ui, list, 0, 8);
+        ui_button(ui, r, "pick", 100 + i);
+        ui_text(ui, r, buf as str);
+        if (i == 5) { ui_input(ui, list, 1, "an input inside"); }
+        i += 1;
+    }
+    mem_free(buf, 16);
+    ui_layout(ui, W, H);
+}
+
+fun main() {
+    var ui: Ui = ui_new();
+    var pixels: ptr<u8> = mem_alloc((W * H * 4) as i64);
+    var rgb: ptr<u8> = mem_alloc((W * H * 3) as i64);
+    build(&ui);
+    ui_scroll(&ui, 100, 100, 3);
+    build(&ui);
+    ui_render(&ui, pixels, W, H);
+
+    var n: i32 = W * H;
+    var i: i32 = 0;
+    while (i < n) {
+        rgb[i * 3] = pixels[i * 4 + 2];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4];
+        i += 1;
+    }
+    var header: str = "P6\n360 300\n255\n";
+    var hp: ptr<u8> = header as ptr<u8>;
+    var hlen: i64 = 0;
+    while (hp[hlen] != 0) { hlen += 1; }
+    var total: i64 = hlen + (n as i64) * 3;
+    var img: ptr<u8> = mem_alloc(total);
+    var k: i64 = 0;
+    while (k < hlen) { img[k] = hp[k]; k += 1; }
+    var j: i64 = 0;
+    while (j < (n as i64) * 3) { img[hlen + j] = rgb[j]; j += 1; }
+    write("build/scroll.ppm", img, total);
+    mem_free(img, total);
+    mem_free(pixels, (W * H * 4) as i64);
+    mem_free(rgb, (W * H * 3) as i64);
+    ui_free(&ui);
+    println("wrote build/scroll.ppm");
+}

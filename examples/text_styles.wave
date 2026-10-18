@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Text styles and scale: sizes (ui_font_size), bold (ui_bold) and a theme scaled for the screen
+// (theme_scale; win_dpi_percent tells how much this screen wants). The buttons (or + and -) change
+// the scale. Esc quits.
+// Run with:  WUI_RUN=text_styles wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Window, WinEvent, Theme, ui_new, ui_free, ui_click, ui_set_pointer, ui_feed_text, ui_activated, ui_wake_ms,
+                ui_set_theme, theme_light, theme_scale,
+                win_open, win_ok, win_close, win_next_timeout, win_text, win_draw, win_pending, win_width, win_height, win_feed_key,
+                win_dpi_percent, UI_NO_MSG, UI_ACTIVATED,
+                EV_CLOSE, EV_EXPOSE, EV_MOVE, EV_DOWN, EV_UP, EV_TEXT, EV_KEY, KEY_ESCAPE};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./text_view")::{text_view, MSG_BIGGER, MSG_SMALLER};
+
+fun put_num(buf: ptr<u8>, at: i32, v: i32) -> i32 {
+    if (v >= 10) {
+        var m: i32 = put_num(buf, at, v / 10);
+        buf[m] = (48 + v % 10) as u8;
+        return m + 1;
+    }
+    buf[at] = (48 + v) as u8;
+    return at + 1;
+}
+
+fun put_str(buf: ptr<u8>, at: i32, s: str) -> i32 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var i: i32 = 0;
+    while (p[i] != 0) { buf[at + i] = p[i]; i += 1; }
+    return at + i;
+}
+
+// Applies a scale to the Ui's theme (a fresh light theme, scaled).
+fun apply_scale(ui: ptr<Ui>, percent: i32) {
+    var t: Theme = Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                           placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                           radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                           field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                           scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0,
+                           slider_thumb: 0, slider_track: 0, font_size: 0 };
+    theme_light(&t);
+    theme_scale(&t, percent);
+    ui_set_theme(ui, &t);
+}
+
+fun main() {
+    var win: Window = win_open("wui text styles", 460, 560);
+    if (!win_ok(&win)) {
+        println("cannot open a window (no X display or libX11)");
+        return;
+    }
+    var ui: Ui = ui_new();
+    var screen: i32 = win_dpi_percent(&win);
+    var percent: i32 = 100;
+    var label: ptr<u8> = mem_alloc(96);
+    var piece: ptr<u8> = mem_alloc(64);
+    var ev: WinEvent = WinEvent { kind: 0, x: 0, y: 0, a: 0, width: 0, height: 0, mods: 0 };
+    var running: bool = true;
+    var first: bool = true;
+    while (running) {
+        // the heading says what the screen wants and what is applied
+        var n: i32 = put_str(label, 0, "Scale ");
+        n = put_num(label, n, percent);
+        n = put_str(label, n, "%   (this screen: ");
+        n = put_num(label, n, screen);
+        n = put_str(label, n, "%)");
+        label[n] = 0;
+        apply_scale(&ui, percent);
+        text_view(&ui, label as str, win_width(&win), win_height(&win));
+        win_draw(&win, &ui);
+        if (first) { first = false; }
+        var kind: i32 = win_next_timeout(&win, &ev, ui_wake_ms(&ui));
+        var msg: i32 = UI_NO_MSG;
+        if (kind == EV_CLOSE) { running = false; }
+        if (kind == EV_MOVE) { ui_set_pointer(&ui, ev.x, ev.y, false); }
+        if (kind == EV_DOWN && ev.a == 1) {
+            ui_set_pointer(&ui, ev.x, ev.y, true);
+            msg = ui_click(&ui, ev.x, ev.y, ev.mods);
+        }
+        if (kind == EV_UP && ev.a == 1) { ui_set_pointer(&ui, ev.x, ev.y, false); }
+        if (kind == EV_TEXT) {
+            var len: i64 = win_text(&win, piece, 64);
+            var r: i32 = ui_feed_text(&ui, piece, len);
+            if ((r & UI_ACTIVATED) != 0) { msg = ui_activated(&ui); }
+            if (len == 1 && piece[0] == 43) { msg = MSG_BIGGER; }       // '+'
+            if (len == 1 && piece[0] == 45) { msg = MSG_SMALLER; }      // '-'
+        }
+        if (kind == EV_KEY) {
+            if (ev.a == KEY_ESCAPE) { running = false; }
+            var r: i32 = win_feed_key(&win, &ui, ev.a, ev.mods);
+            if ((r & UI_ACTIVATED) != 0) { msg = ui_activated(&ui); }
+        }
+        if (msg == MSG_BIGGER && percent < 300) { percent += 25; }
+        if (msg == MSG_SMALLER && percent > 50) { percent -= 25; }
+    }
+    mem_free(piece, 64);
+    mem_free(label, 96);
+    ui_free(&ui);
+    win_close(&win);
+}

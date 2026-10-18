@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Pointer and keyboard input: clicks, drags, typed text and keys, routed to inputs, buttons, sliders,
+// drop-downs, menus and scroll boxes.
+
+import("./ctx")::{slider_find, slider_slot};
+import("./field")::{field_backspace, field_delete, field_has_selection, field_hi, field_index, field_insert,
+    field_lo, field_move_to, field_next, field_next_word, field_prev, field_prev_word, utf8_valid};
+import("./focus")::{activate, focus_move, touch_blink};
+import("./pick")::{button_at, clickable_at, input_node, scrollbar_at, slider_node};
+import("./scroll")::{drag_thumb};
+import("./textarea")::{field_pos_at, textarea_key};
+import("./types")::{Ctx, Field, INPUT_ACTIVATED, INPUT_CHANGED, INPUT_COPY, INPUT_CUT, INPUT_FOCUS_MOVED,
+    INPUT_PASTE, INPUT_SUBMIT, KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_LEFT,
+    KEY_RIGHT, KEY_TAB, KEY_UP, K_DROPDOWN, K_INPUT, K_OPTION, K_SLIDER, K_TEXTAREA, MOD_CTRL, MOD_SHIFT, NONE, Node,
+    copy_bytes};
+import("./widgets")::{dropdown_key, dropdown_node, dropdown_pick, slider_key, slider_store, slider_value_at};
+
+// A press on a scrollbar: on the thumb it holds the thumb where it was grabbed; on the track it puts the
+// thumb's middle under the pointer and keeps dragging from there. False when (x, y) is not on a scrollbar.
+pub fun press_scrollbar(c: ptr<Ctx>, x: i32, y: i32) -> bool {
+    var bar: array<i32, 4>;
+    bar[0] = 0; bar[1] = 0; bar[2] = 0; bar[3] = 0;
+    if (!scrollbar_at(c, x, y, &bar[0])) { return false; }
+    var horiz: bool = bar[3] == 1;
+    var pos: i32 = y;
+    if (horiz) { pos = x; }
+    var grab: i32 = bar[2] / 2;
+    if (pos >= bar[1] && pos < bar[1] + bar[2]) { grab = pos - bar[1]; }
+    var sid: i32 = c.nodes[bar[0]].scroll_id;
+    c.bar_active = true;
+    c.bar_horiz = horiz;
+    c.bar_id = sid;
+    c.bar_grab = grab;
+    drag_thumb(c, sid, grab, pos, horiz);
+    return true;
+}
+
+// A click while a drop-down / menu list is open, on node `id` (or NONE). A row of the list picks it
+// (res[0] = the message of a menu item, else NONE); any other click closes the list, and a click on the
+// list's own box only closes it. False when the click goes on as an ordinary one.
+pub fun click_in_open_list(c: ptr<Ctx>, id: i32, res: ptr<i32>) -> bool {
+    if (id != NONE && c.nodes[id].kind == K_OPTION) {
+        var dn: i32 = dropdown_node(c, c.nodes[id].input_id);
+        c.dd_open = NONE;
+        if (dn != NONE && c.nodes[dn].menu) { res[0] = c.nodes[dn].msg + c.nodes[id].val - 1; return true; }   // a menu item is a message
+        if (dn != NONE) { dropdown_pick(c, dn, c.nodes[id].val); }
+        return true;
+    }
+    var own: bool = id != NONE && c.nodes[id].kind == K_DROPDOWN && c.nodes[id].input_id == c.dd_open;
+    c.dd_open = NONE;
+    return own;
+}
+
+// Handles a mouse press at (x, y): clicking an input focuses it and puts the
+// caret under the pointer (with Shift held, the selection grows to there);
+// anything else removes focus. While the button stays down, core_drag extends
+// the selection. A press on a scrollbar grabs it. Returns the message of the
+// button that was hit, or -1 (same as core_hit).
+pub fun core_click(c: ptr<Ctx>, x: i32, y: i32, mods: i32) -> i32 {
+    if (c != null) { c.tip_blocked = true; }           // a click hides the tooltip
+    if (c == null) { return NONE; }
+    c.drag = NONE;
+    c.bar_active = false;
+    c.focus_visible = false;                           // the mouse is in use: no focus ring
+    if (press_scrollbar(c, x, y)) { return NONE; }
+    var id: i32 = clickable_at(c, x, y);
+    if (c.dd_open != NONE) {
+        var picked: array<i32, 1>;
+        picked[0] = NONE;
+        if (click_in_open_list(c, id, &picked[0])) { return picked[0]; }
+    }
+    if (id == NONE) {
+        c.focus = NONE;
+        c.wfocus = NONE;
+        return NONE;
+    }
+    var n: ptr<Node> = &c.nodes[id];
+    if (n.kind == K_DROPDOWN) {                                    // opens the list
+        c.wfocus = NONE;
+        c.focus = n.input_id;
+        c.dd_open = n.input_id;
+        if (n.menu) { c.dd_cur = -1; } else { c.dd_cur = c.slider_vals[slider_slot(c, n.input_id, 0)]; }
+        return NONE;
+    }
+    if (n.kind == K_SLIDER) {                          // a slider: the press sets the value, the drag follows it
+        c.wfocus = NONE;
+        c.focus = n.input_id;
+        c.drag = n.input_id;
+        slider_store(c, id, slider_value_at(c, n, x));
+        return NONE;
+    }
+    if (n.kind != K_INPUT && n.kind != K_TEXTAREA) {
+        c.focus = NONE;                                // a button or checkbox takes the focus away from inputs
+        c.wfocus = n.msg;                              // ... and keeps it (Space / Enter press it again)
+        return n.msg;
+    }
+    c.wfocus = NONE;
+    c.focus = n.input_id;
+    c.drag = n.input_id;
+    touch_blink(c);
+    var fi: i32 = field_index(c, n.input_id);
+    if (fi >= 0) {
+        var f: ptr<Field> = &c.fields[fi];
+        var pos: i64 = field_pos_at(c, n, f, x, y);
+        field_move_to(f, pos, (mods & MOD_SHIFT) != 0);
+        f.want_x = -1;
+    }
+    return NONE;
+}
+
+// The pointer moved with the button held after core_click on an input: extends
+// the selection to (x, y); after a press on a scrollbar it moves the thumb (its
+// own axis: y for the vertical bar, x for the horizontal one).
+// Returns 1 when the selection or the scroll offset changed.
+pub fun core_drag(c: ptr<Ctx>, x: i32, y: i32) -> i32 {
+    if (c == null) { return 0; }
+    if (c.bar_active) {
+        var pos: i32 = y;
+        if (c.bar_horiz) { pos = x; }
+        if (drag_thumb(c, c.bar_id, c.bar_grab, pos, c.bar_horiz)) { return 1; }
+        return 0;
+    }
+    var sn: i32 = NONE;
+    if (c.drag != NONE) { sn = slider_node(c, c.drag); }
+    if (sn != NONE) {                                  // dragging a slider's handle
+        if (slider_store(c, sn, slider_value_at(c, &c.nodes[sn], x))) { return 1; }
+        return 0;
+    }
+    var ni: i32 = input_node(c, c.drag);
+    if (ni == NONE) { return 0; }
+    var n: ptr<Node> = &c.nodes[ni];
+    var fi: i32 = field_index(c, n.input_id);
+    if (fi < 0) { return 0; }
+    var f: ptr<Field> = &c.fields[fi];
+    var pos: i64 = field_pos_at(c, n, f, x, y);
+    var changed: bool = pos != f.cursor;
+    f.cursor = pos;                                    // the anchor stays where the press was
+    if (changed) { return 1; }
+    return 0;
+}
+
+// The mouse button was released: ends a drag.
+pub fun core_release(c: ptr<Ctx>) {
+    if (c == null) { return; }
+    c.drag = NONE;
+    c.bar_active = false;
+}
+
+// Copies the focused input's selected text (UTF-8, NUL-terminated) into `buf`.
+// Returns its length in bytes (0 = nothing selected), or -1 when `cap` is too
+// small or nothing is focused.
+pub fun core_selection(c: ptr<Ctx>, buf: ptr<u8>, cap: i64) -> i64 {
+    if (c == null) { return -1; }
+    var fi: i32 = field_index(c, c.focus);
+    if (fi < 0) { return -1; }
+    var f: ptr<Field> = &c.fields[fi];
+    var lo: i64 = field_lo(f);
+    var n: i64 = field_hi(f) - lo;
+    if (buf == null || cap < n + 1) { return -1; }
+    copy_bytes(buf, &f.text[lo], n);
+    buf[n] = 0;
+    return n;
+}
+
+// Typed text (UTF-8) for the focused input; a single space presses a focused
+// button or checkbox (INPUT_ACTIVATED). Returns INPUT_* bits (0 when nothing is
+// focused or nothing changed).
+pub fun core_text_input(c: ptr<Ctx>, text: ptr<u8>, len: i64) -> i32 {
+    if (c == null) { return 0; }
+    var n: i64 = len;
+    if (text == null || n < 0) { n = 0; }
+    if (!utf8_valid(text, n)) { return 0; }
+    var fi: i32 = field_index(c, c.focus);
+    if (fi < 0) {
+        // Space opens a focused drop-down (or picks the highlighted row of its open list)
+        if (c.focus != NONE && n == 1 && text[0] == 32 && dropdown_node(c, c.focus) != NONE) { return dropdown_key(c, KEY_ENTER); }
+        // Space presses the focused button or checkbox
+        if (c.wfocus != NONE && n == 1 && text[0] == 32 && activate(c)) { return INPUT_ACTIVATED; }
+        return 0;
+    }
+    c.fields[fi].want_x = -1;
+    if (field_insert(&c.fields[fi], text, n, c.fields[fi].multi)) { touch_blink(c); return INPUT_CHANGED; }
+    return 0;
+}
+
+// A control key (KEY_* code, or a lower-case letter with Ctrl) for the focused
+// input, with its MOD_* bits. Editing and caret movement happen here:
+// Backspace/Delete, Left/Right (Ctrl: by word), Home/End, each extending the
+// selection while Shift is held; Ctrl+A selects all. Enter submits (or presses a
+// focused button / checkbox). Tab and Shift+Tab move the focus. Returns
+// INPUT_* bits; INPUT_COPY / INPUT_CUT / INPUT_PASTE ask the app to talk to the
+// clipboard (see core_selection, core_text_input).
+pub fun core_key_input(c: ptr<Ctx>, key: i32, mods: i32) -> i32 {
+    if (c == null) { return 0; }
+    if (key == KEY_TAB) {                              // Tab / Shift+Tab: the next / previous focusable widget
+        if (focus_move(c, (mods & MOD_SHIFT) != 0)) { return INPUT_FOCUS_MOVED; }
+        return 0;
+    }
+    var fi: i32 = field_index(c, c.focus);
+    if (fi < 0) {
+        if (c.focus != NONE && slider_find(c, c.focus) >= 0) {
+            if (dropdown_node(c, c.focus) != NONE) { return dropdown_key(c, key); }              // a focused drop-down
+            return slider_key(c, key);                                                          // a focused slider
+        }
+        if (c.wfocus != NONE && key == KEY_ENTER && activate(c)) { return INPUT_ACTIVATED; }   // Enter presses a focused button
+        return 0;
+    }
+    var f: ptr<Field> = &c.fields[fi];
+    touch_blink(c);                                    // any key for the input restarts the blink
+    if (f.multi) {
+        var tn: i32 = input_node(c, c.focus);
+        if (tn != NONE) { c.cur_size = c.nodes[tn].eff_size; }
+        var handled: i32 = textarea_key(c, f, key, mods);
+        if (handled >= 0) { return handled; }
+        if (key != KEY_UP && key != KEY_DOWN) { f.want_x = -1; }
+    }
+    var shift: bool = (mods & MOD_SHIFT) != 0;
+    var ctrl: bool = (mods & MOD_CTRL) != 0;
+    if (key == KEY_BACKSPACE) { if (field_backspace(f)) { return INPUT_CHANGED; } return 0; }
+    if (key == KEY_DELETE) { if (field_delete(f)) { return INPUT_CHANGED; } return 0; }
+    if (key == KEY_LEFT || key == KEY_RIGHT) {
+        var left: bool = key == KEY_LEFT;
+        var pos: i64 = 0;
+        if (field_has_selection(f) && !shift) {
+            // a plain arrow collapses the selection to its edge
+            if (left) { pos = field_lo(f); } else { pos = field_hi(f); }
+        } else if (ctrl) {
+            if (left) { pos = field_prev_word(f); } else { pos = field_next_word(f); }
+        } else if (left) {
+            pos = field_prev(f);
+        } else {
+            pos = field_next(f);
+        }
+        field_move_to(f, pos, shift);
+        return 0;
+    }
+    if (key == KEY_HOME) { field_move_to(f, 0, shift); return 0; }
+    if (key == KEY_END) { field_move_to(f, f.len, shift); return 0; }
+    if (key == KEY_ENTER) { return INPUT_SUBMIT; }
+    if (ctrl && key == 97) { f.anchor = 0; f.cursor = f.len; return 0; }                                  // a
+    if (ctrl && key == 99) { if (field_has_selection(f)) { return INPUT_COPY; } return 0; }              // c
+    if (ctrl && key == 120) { if (field_has_selection(f)) { return INPUT_CUT; } return 0; }              // x
+    if (ctrl && key == 118) { return INPUT_PASTE; }                                                      // v
+    return 0;
+}
+
+pub fun core_set_pointer(c: ptr<Ctx>, x: i32, y: i32, down: bool) {
+    if (c == null) { return; }
+    c.pointer_x = x;
+    c.pointer_y = y;
+    c.pointer_down = down;
+    if (c.dd_open != NONE) {                           // with a menu open, the menus next to it open on hover
+        var open: i32 = dropdown_node(c, c.dd_open);
+        if (open != NONE && c.nodes[open].menu) {
+            var over: i32 = clickable_at(c, x, y);
+            if (over != NONE && c.nodes[over].kind == K_DROPDOWN && c.nodes[over].menu && c.nodes[over].input_id != c.dd_open) {
+                c.dd_open = c.nodes[over].input_id;
+                c.focus = c.dd_open;
+                c.wfocus = NONE;
+                c.dd_cur = -1;
+            }
+        }
+    }
+}
+
+// Message of the button under (x, y), or -1.
+pub fun core_hit(c: ptr<Ctx>, x: i32, y: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var id: i32 = button_at(c, x, y);
+    if (id == NONE) { return NONE; }
+    return c.nodes[id].msg;
+}

@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Scrolling: the wheel, scroll keys, scrollbar dragging and programmatic offsets.
+
+import("./ctx")::{scroll_find, scroll_put, scroll_put_x};
+import("./field")::{field_get};
+import("./pick")::{clipped, contains, hscrollbar, scrollbar};
+import("./textarea")::{line_count};
+import("./types")::{Ctx, Field, KEY_DOWN, KEY_END, KEY_HOME, KEY_LEFT, KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_RIGHT,
+    KEY_UP, K_TEXTAREA, NONE, Node, clamp_i64, max_i32, text_height};
+
+// Scrolls the box `id` so its thumb's start follows the pointer (`pos` is y for
+// the vertical bar, x for the horizontal one).
+pub fun drag_thumb(c: ptr<Ctx>, id: i32, grab: i32, pos: i32, horiz: bool) -> bool {
+    var i: i32 = 0;
+    var found: i32 = -1;
+    while (found < 0 && i < c.nnodes) {
+        if (c.nodes[i].scroll_id == id) { found = i; }
+        i += 1;
+    }
+    if (found < 0) { return false; }
+    var n: ptr<Node> = &c.nodes[found];
+    var bar: array<i32, 4>;
+    bar[0] = 0; bar[1] = 0; bar[2] = 0; bar[3] = 0;
+    if (horiz) {
+        if (!hscrollbar(c, n, &bar[0])) { return false; }
+        var hroom: i64 = max_i32(bar[3] - bar[2], 1) as i64;
+        var hnw: i32 = clamp_i64(((pos - grab - n.x) as i64) * (n.scroll_xmax as i64) / hroom, 0, n.scroll_xmax as i64) as i32;
+        var hchanged: bool = hnw != n.scroll_xoff;
+        scroll_put_x(c, id, hnw);
+        n.scroll_xoff = hnw;
+        return hchanged;
+    }
+    if (!scrollbar(c, n, &bar[0])) { return false; }
+    var room: i64 = max_i32(bar[3] - bar[2], 1) as i64;
+    var nw: i32 = clamp_i64(((pos - grab - n.y) as i64) * (n.scroll_max as i64) / room, 0, n.scroll_max as i64) as i32;
+    var changed: bool = nw != n.scroll_off;
+    scroll_put(c, id, nw);
+    n.scroll_off = nw;
+    return changed;
+}
+
+// The mouse wheel turned `notches` (positive = down) with the pointer at (x, y):
+// scrolls the innermost scroll box there that can still move that way. Returns
+// 1 when something scrolled (rebuild the view and redraw).
+pub fun core_scroll(c: ptr<Ctx>, x: i32, y: i32, notches: i32) -> i32 {
+    if (c == null) { return 0; }
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {
+        var n: ptr<Node> = &c.nodes[i];
+        if (n.kind == K_TEXTAREA && contains(n, x, y) && !clipped(c, i, x, y)) {      // a text area scrolls its own text first
+            c.cur_size = n.eff_size;
+            var tf: ptr<Field> = field_get(c, n.input_id);
+            var more: i32 = line_count(tf) * text_height(c) - (n.h - 2 * c.theme.field_pad_y);
+            if (more > 0) {
+                var now: i32 = clamp_i64((tf.scroll_y as i64) + (notches as i64) * (text_height(c) as i64) * 3, 0, more as i64) as i32;
+                if (now != tf.scroll_y) {
+                    tf.scroll_y = now;
+                    return 1;
+                }
+            }
+        }
+        if (n.scroll_id != NONE && contains(n, x, y) && !clipped(c, i, x, y)) {
+            var cur: i32 = n.scroll_off;
+            var nw: i32 = clamp_i64((cur as i64) + (notches as i64) * (c.theme.scroll_step as i64), 0, n.scroll_max as i64) as i32;
+            if (nw != cur) {
+                scroll_put(c, n.scroll_id, nw);
+                n.scroll_off = nw;
+                return 1;
+            }
+        }
+        i -= 1;
+    }
+    return 0;
+}
+
+// The horizontal wheel (or Shift + wheel) turned `notches` (positive = right)
+// with the pointer at (x, y): scrolls the innermost horizontally scrolling box
+// there that can still move that way. Returns 1 when something scrolled.
+pub fun core_scroll_h(c: ptr<Ctx>, x: i32, y: i32, notches: i32) -> i32 {
+    if (c == null) { return 0; }
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {
+        var n: ptr<Node> = &c.nodes[i];
+        if (n.scroll_id != NONE && n.scroll_x && contains(n, x, y) && !clipped(c, i, x, y)) {
+            var cur: i32 = n.scroll_xoff;
+            var nw: i32 = clamp_i64((cur as i64) + (notches as i64) * (c.theme.scroll_step as i64), 0, n.scroll_xmax as i64) as i32;
+            if (nw != cur) {
+                scroll_put_x(c, n.scroll_id, nw);
+                n.scroll_xoff = nw;
+                return 1;
+            }
+        }
+        i -= 1;
+    }
+    return 0;
+}
+
+// Tries to scroll box `i` for a scroll key; true when it moved.
+pub fun scroll_key_box(c: ptr<Ctx>, i: i32, key: i32) -> bool {
+    var n: ptr<Node> = &c.nodes[i];
+    if (key == KEY_LEFT || key == KEY_RIGHT) {         // horizontal: only boxes that scroll that way
+        if (!n.scroll_x) { return false; }
+        var delta: i64 = c.theme.scroll_step as i64;
+        if (key == KEY_LEFT) { delta = 0 - delta; }
+        var xnw: i32 = clamp_i64((n.scroll_xoff as i64) + delta, 0, n.scroll_xmax as i64) as i32;
+        if (xnw != n.scroll_xoff) {
+            scroll_put_x(c, n.scroll_id, xnw);
+            n.scroll_xoff = xnw;
+            return true;
+        }
+        return false;
+    }
+    var page: i64 = max_i32(n.h - c.theme.scroll_step, c.theme.scroll_step) as i64;
+    var target: i64 = n.scroll_max as i64;
+    if (key == KEY_UP) { target = (n.scroll_off as i64) - (c.theme.scroll_step as i64); }
+    else if (key == KEY_DOWN) { target = (n.scroll_off as i64) + (c.theme.scroll_step as i64); }
+    else if (key == KEY_PAGE_UP) { target = (n.scroll_off as i64) - page; }
+    else if (key == KEY_PAGE_DOWN) { target = (n.scroll_off as i64) + page; }
+    else if (key == KEY_HOME) { target = 0; }
+    var nw: i32 = clamp_i64(target, 0, n.scroll_max as i64) as i32;
+    if (nw != n.scroll_off) {
+        scroll_put(c, n.scroll_id, nw);
+        n.scroll_off = nw;
+        return true;
+    }
+    return false;
+}
+
+// A scroll key (Up / Down = one step, PageUp / PageDown = a page, Home / End =
+// the ends; Left / Right = one step sideways, for boxes made with
+// core_scroll_box_xy). It goes to the innermost scroll box under the pointer that can
+// still move that way, else to the first scroll box that can. Returns 1 when
+// something scrolled (rebuild the view and redraw), 0 for any other key.
+pub fun core_scroll_key(c: ptr<Ctx>, key: i32) -> i32 {
+    if (c == null) { return 0; }
+    if (key != KEY_UP && key != KEY_DOWN && key != KEY_PAGE_UP && key != KEY_PAGE_DOWN && key != KEY_HOME && key != KEY_END &&
+        key != KEY_LEFT && key != KEY_RIGHT) {
+        return 0;
+    }
+    var px: i32 = c.pointer_x;
+    var py: i32 = c.pointer_y;
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {                                   // under the pointer, innermost first
+        var n: ptr<Node> = &c.nodes[i];
+        if (n.scroll_id != NONE && contains(n, px, py) && !clipped(c, i, px, py)) {
+            if (scroll_key_box(c, i, key)) { return 1; }
+        }
+        i -= 1;
+    }
+    i = 0;
+    while (i < c.nnodes) {                             // then the first one that can move
+        if (c.nodes[i].scroll_id != NONE) {
+            if (scroll_key_box(c, i, key)) { return 1; }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// Sets the offset of a scroll box in pixels (clamped at the next layout; a huge
+// value scrolls to the end).
+pub fun core_scroll_set(c: ptr<Ctx>, scroll_id: i32, offset: i32) {
+    if (c == null || scroll_id < 0) { return; }
+    scroll_put(c, scroll_id, max_i32(offset, 0));
+}
+
+// Sets the horizontal offset of a scroll box (clamped at the next layout).
+pub fun core_scroll_set_x(c: ptr<Ctx>, scroll_id: i32, offset: i32) {
+    if (c == null || scroll_id < 0) { return; }
+    scroll_put_x(c, scroll_id, max_i32(offset, 0));
+}
+
+// The horizontal offset of a scroll box in pixels (as of the last layout), or -1 when unknown.
+pub fun core_scroll_get_x(c: ptr<Ctx>, scroll_id: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var i: i32 = scroll_find(c, scroll_id);
+    if (i < 0) { return NONE; }
+    return c.scroll_xvals[i];
+}
+
+// The offset of a scroll box in pixels (as of the last layout), or -1 when unknown.
+pub fun core_scroll_get(c: ptr<Ctx>, scroll_id: i32) -> i32 {
+    if (c == null) { return NONE; }
+    var i: i32 = scroll_find(c, scroll_id);
+    if (i < 0) { return NONE; }
+    return c.scroll_vals[i];
+}

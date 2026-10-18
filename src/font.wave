@@ -1,0 +1,1338 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// TrueType / OpenType font reader and glyph rasterizer, in pure Wave.
+//
+// Supports: .ttf/.otf/.ttc, cmap formats 4 and 12, TrueType glyphs (simple and
+// composite, quadratic) and CFF glyphs (Type 2 charstrings, cubic, local and
+// global subroutines, CID-keyed fonts), anti-aliased coverage (exact-area
+// scanline accumulation). Not supported: hinting, kerning / shaping, CFF2 /
+// variable fonts, seac accents.
+//
+// All state lives in a FontEngine (font_new / font_free); nothing is global.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("./gfx")::{gfx_blend, gfx_put};
+
+const MAX_FONTS: i32 = 4;
+const MAX_POINTS: i32 = 8192;
+const MAX_CONTOURS: i32 = 512;
+const MAX_GLYPH_PX: i32 = 160;       // bitmap side limit
+const MAX_FD: i32 = 64;              // CFF font dicts (CID-keyed fonts)
+const PICK_SLOTS: i32 = 4096;
+const CACHE_SLOTS: i32 = 4096;
+const POOL_BYTES: u32 = 3145728;     // 3 MiB of glyph coverage
+const CURVE_STEPS: i32 = 6;
+
+pub const FONT_GLYPH_W: i32 = 8;     // bitmap fallback: 1 byte = 1 box glyph
+pub const FONT_GLYPH_H: i32 = 16;
+
+struct Font {
+    d: ptr<u8>;
+    n: i64;
+    glyf: u32;
+    loca: u32;
+    hmtx: u32;
+    cmap_sub: u32;
+    cmap_fmt: i32;
+    // CFF (OpenType) outlines; all offsets absolute within the file
+    cff: bool;
+    cid: bool;
+    cs_index: i64;
+    gsubr: i64;
+    fdselect: i64;
+    fdselect_fmt: i32;
+    nfd: i32;
+    lsubr: ptr<i64>;                 // MAX_FD local subr INDEX offsets
+    upem: i32;
+    loca_fmt: i32;
+    num_glyphs: i32;
+    num_hm: i32;
+    ascent: i32;
+    descent: i32;
+    gap: i32;
+}
+
+pub struct FontEngine {
+    fonts: ptr<ptr<Font>>;           // MAX_FONTS
+    nfonts: i32;
+    size: i32;                       // pixel size
+    // outline under construction
+    px: ptr<f32>;
+    py: ptr<f32>;
+    on: ptr<u8>;
+    flags: ptr<u8>;
+    cend: ptr<i32>;
+    npts: i32;
+    ncont: i32;
+    // CFF charstring interpreter
+    cs: ptr<f32>;                    // 96
+    csp: i32;
+    cnstems: i32;
+    cstart: i32;
+    cx: f32;
+    cy: f32;
+    cwidth: bool;
+    cdone: bool;
+    copen: bool;
+    cover: bool;
+    cs_lsubr: i64;
+    // coverage accumulation
+    acc: ptr<f32>;
+    acc_w: i32;
+    acc_h: i32;
+    // code point -> (font, glyph) cache
+    pick_cp: ptr<u32>;
+    pick_font: ptr<i32>;             // 0 = empty (stored as index + 1)
+    pick_gid: ptr<i32>;
+    // glyph bitmap cache
+    key: ptr<u32>;                   // 0 = empty slot
+    gx: ptr<i32>;
+    gy: ptr<i32>;
+    gw: ptr<i32>;
+    gh: ptr<i32>;
+    goff: ptr<u32>;
+    pool: ptr<u8>;
+    pool_used: u32;
+}
+
+// Dict values read while parsing CFF DICTs.
+struct Dict {
+    charstrings: i64;
+    priv_size: i64;
+    priv_off: i64;
+    fdarray: i64;
+    fdselect: i64;
+    subrs: i64;
+    cid: bool;
+}
+
+fun dict_new() -> Dict {
+    return Dict { charstrings: 0, priv_size: 0, priv_off: 0, fdarray: 0, fdselect: 0, subrs: 0, cid: false };
+}
+
+pub fun font_new() -> ptr<FontEngine> {
+    var e: ptr<FontEngine> = mem_alloc((size_of<FontEngine>() as i64)) as ptr<FontEngine>;
+    e.fonts = mem_alloc((MAX_FONTS * 8) as i64) as ptr<ptr<Font>>;
+    e.nfonts = 0;
+    e.size = 16;
+    e.px = mem_alloc((MAX_POINTS * 4) as i64) as ptr<f32>;
+    e.py = mem_alloc((MAX_POINTS * 4) as i64) as ptr<f32>;
+    e.on = mem_alloc(MAX_POINTS as i64);
+    e.flags = mem_alloc(MAX_POINTS as i64);
+    e.cend = mem_alloc((MAX_CONTOURS * 4) as i64) as ptr<i32>;
+    e.npts = 0;
+    e.ncont = 0;
+    e.cs = mem_alloc(96 * 4) as ptr<f32>;
+    e.csp = 0;
+    e.cnstems = 0;
+    e.cstart = 0;
+    e.cx = 0.0;
+    e.cy = 0.0;
+    e.cwidth = false;
+    e.cdone = false;
+    e.copen = false;
+    e.cover = false;
+    e.cs_lsubr = 0;
+    e.acc = mem_alloc(((MAX_GLYPH_PX + 2) * MAX_GLYPH_PX * 4) as i64) as ptr<f32>;
+    e.acc_w = 0;
+    e.acc_h = 0;
+    e.pick_cp = mem_alloc((PICK_SLOTS * 4) as i64) as ptr<u32>;
+    e.pick_font = mem_alloc((PICK_SLOTS * 4) as i64) as ptr<i32>;
+    e.pick_gid = mem_alloc((PICK_SLOTS * 4) as i64) as ptr<i32>;
+    e.key = mem_alloc((CACHE_SLOTS * 4) as i64) as ptr<u32>;
+    e.gx = mem_alloc((CACHE_SLOTS * 4) as i64) as ptr<i32>;
+    e.gy = mem_alloc((CACHE_SLOTS * 4) as i64) as ptr<i32>;
+    e.gw = mem_alloc((CACHE_SLOTS * 4) as i64) as ptr<i32>;
+    e.gh = mem_alloc((CACHE_SLOTS * 4) as i64) as ptr<i32>;
+    e.goff = mem_alloc((CACHE_SLOTS * 4) as i64) as ptr<u32>;
+    e.pool = mem_alloc(POOL_BYTES as i64);
+    e.pool_used = 0;
+    var i: i32 = 0;
+    while (i < PICK_SLOTS) { e.pick_font[i] = 0; i += 1; }
+    cache_clear(e);
+    return e;
+}
+
+// Frees the engine. The font data it points into belongs to the caller.
+pub fun font_free(e: ptr<FontEngine>) {
+    var i: i32 = 0;
+    while (i < e.nfonts) {
+        var f: ptr<Font> = e.fonts[i];
+        mem_free(f.lsubr as ptr<u8>, (MAX_FD * 8) as i64);
+        mem_free(f as ptr<u8>, (size_of<Font>() as i64));
+        i += 1;
+    }
+    mem_free(e.fonts as ptr<u8>, (MAX_FONTS * 8) as i64);
+    mem_free(e.px as ptr<u8>, (MAX_POINTS * 4) as i64);
+    mem_free(e.py as ptr<u8>, (MAX_POINTS * 4) as i64);
+    mem_free(e.on, MAX_POINTS as i64);
+    mem_free(e.flags, MAX_POINTS as i64);
+    mem_free(e.cend as ptr<u8>, (MAX_CONTOURS * 4) as i64);
+    mem_free(e.cs as ptr<u8>, 96 * 4);
+    mem_free(e.acc as ptr<u8>, ((MAX_GLYPH_PX + 2) * MAX_GLYPH_PX * 4) as i64);
+    mem_free(e.pick_cp as ptr<u8>, (PICK_SLOTS * 4) as i64);
+    mem_free(e.pick_font as ptr<u8>, (PICK_SLOTS * 4) as i64);
+    mem_free(e.pick_gid as ptr<u8>, (PICK_SLOTS * 4) as i64);
+    mem_free(e.key as ptr<u8>, (CACHE_SLOTS * 4) as i64);
+    mem_free(e.gx as ptr<u8>, (CACHE_SLOTS * 4) as i64);
+    mem_free(e.gy as ptr<u8>, (CACHE_SLOTS * 4) as i64);
+    mem_free(e.gw as ptr<u8>, (CACHE_SLOTS * 4) as i64);
+    mem_free(e.gh as ptr<u8>, (CACHE_SLOTS * 4) as i64);
+    mem_free(e.goff as ptr<u8>, (CACHE_SLOTS * 4) as i64);
+    mem_free(e.pool, POOL_BYTES as i64);
+    mem_free(e as ptr<u8>, (size_of<FontEngine>() as i64));
+}
+
+// ---- bounds-checked big-endian reads (out of range reads give 0) ------------
+
+fun rd8(f: ptr<Font>, o: i64) -> u32 {
+    if (o >= 0 && o < f.n) { return f.d[o] as u32; }
+    return 0;
+}
+
+fun rd16(f: ptr<Font>, o: i64) -> u32 {
+    return (rd8(f, o) << 8) | rd8(f, o + 1);
+}
+
+fun rds16(f: ptr<Font>, o: i64) -> i32 {
+    return ((rd16(f, o) as u16) as i16) as i32;
+}
+
+fun rd32(f: ptr<Font>, o: i64) -> u32 {
+    return (rd16(f, o) << 16) | rd16(f, o + 2);
+}
+
+fun find_table(f: ptr<Font>, sfnt: i64, tag: str) -> u32 {
+    var t: ptr<u8> = tag as ptr<u8>;
+    var num: u32 = rd16(f, sfnt + 4);
+    var i: u32 = 0;
+    while (i < num) {
+        var r: i64 = sfnt + 12 + 16 * (i as i64);
+        if (rd8(f, r) == (t[0] as u32) && rd8(f, r + 1) == (t[1] as u32) &&
+            rd8(f, r + 2) == (t[2] as u32) && rd8(f, r + 3) == (t[3] as u32)) {
+            var off: u32 = rd32(f, r + 8);
+            if ((off as i64) < f.n) { return off; }
+            return 0;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// ---- cmap -------------------------------------------------------------------
+
+// Both cmap formats keep their ranges sorted, so a lookup is a binary search.
+fun glyph_index(f: ptr<Font>, cp: u32) -> i32 {
+    var t: i64 = f.cmap_sub as i64;
+    if (f.cmap_fmt == 4) {
+        if (cp > 0xFFFF) { return 0; }
+        var segs: u32 = rd16(f, t + 6) / 2;
+        var sg: i64 = segs as i64;
+        var ends: i64 = t + 14;
+        var starts: i64 = ends + 2 * sg + 2;
+        var deltas: i64 = starts + 2 * sg;
+        var ranges: i64 = deltas + 2 * sg;
+        var lo: u32 = 0;
+        var hi: u32 = segs;                          // first segment with end >= cp
+        while (lo < hi) {
+            var mid: u32 = (lo + hi) / 2;
+            if (rd16(f, ends + 2 * (mid as i64)) < cp) { lo = mid + 1; } else { hi = mid; }
+        }
+        if (lo >= segs) { return 0; }
+        var l: i64 = lo as i64;
+        var start: u32 = rd16(f, starts + 2 * l);
+        if (cp < start) { return 0; }
+        var delta: u32 = rd16(f, deltas + 2 * l);
+        var ro: u32 = rd16(f, ranges + 2 * l);
+        if (ro == 0) { return ((cp + delta) & 0xFFFF) as i32; }
+        var g: u32 = rd16(f, ranges + 2 * l + (ro as i64) + 2 * ((cp - start) as i64));
+        if (g != 0) { return ((g + delta) & 0xFFFF) as i32; }
+        return 0;
+    }
+    if (f.cmap_fmt == 12) {
+        var groups: u32 = rd32(f, t + 12);
+        var lo: u32 = 0;
+        var hi: u32 = groups;                        // first group with end >= cp
+        while (lo < hi) {
+            var mid: u32 = (lo + hi) / 2;
+            if (rd32(f, t + 16 + 12 * (mid as i64) + 4) < cp) { lo = mid + 1; } else { hi = mid; }
+        }
+        if (lo >= groups) { return 0; }
+        var g: i64 = t + 16 + 12 * (lo as i64);
+        var s0: u32 = rd32(f, g);
+        if (cp < s0) { return 0; }
+        return (rd32(f, g + 8) + (cp - s0)) as i32;
+    }
+    return 0;
+}
+
+fun pick_cmap(f: ptr<Font>, sfnt: i64) -> bool {
+    var cmap: u32 = find_table(f, sfnt, "cmap");
+    if (cmap == 0) { return false; }
+    var cm: i64 = cmap as i64;
+    var n: u32 = rd16(f, cm + 2);
+    var best: i64 = 0;
+    var best_fmt: i32 = 0;
+    var best_rank: i32 = 0;
+    var i: u32 = 0;
+    while (i < n) {
+        var plat: u32 = rd16(f, cm + 4 + 8 * (i as i64));
+        var enc: u32 = rd16(f, cm + 6 + 8 * (i as i64));
+        var sub: i64 = cm + (rd32(f, cm + 8 + 8 * (i as i64)) as i64);
+        var fmt: u32 = rd16(f, sub);
+        var rank: i32 = 0;
+        if (fmt == 12 && ((plat == 3 && enc == 10) || plat == 0)) { rank = 4; }
+        else if (fmt == 4 && ((plat == 3 && enc == 1) || plat == 0)) { rank = 3; }
+        else if (fmt == 12) { rank = 2; }
+        else if (fmt == 4) { rank = 1; }
+        if (rank > best_rank) { best_rank = rank; best = sub; best_fmt = fmt as i32; }
+        i += 1;
+    }
+    if (best_rank == 0) { return false; }
+    f.cmap_sub = best as u32;
+    f.cmap_fmt = best_fmt;
+    return true;
+}
+
+fun advance_units(f: ptr<Font>, gid: i32) -> i32 {
+    if (f.num_hm <= 0) { return 0; }
+    var i: i32 = f.num_hm - 1;
+    if (gid < f.num_hm) { i = gid; }
+    return rd16(f, (f.hmtx as i64) + 4 * (i as i64)) as i32;
+}
+
+// ---- outline loading --------------------------------------------------------
+
+// Byte range of glyph `gid` in the glyf table: off / len through the pointers.
+fun glyph_range(f: ptr<Font>, gid: i32, off: ptr<i64>, len: ptr<i64>) -> bool {
+    if (gid < 0 || gid >= f.num_glyphs) { return false; }
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var g: i64 = gid as i64;
+    if (f.loca_fmt == 0) {
+        a = 2 * (rd16(f, (f.loca as i64) + 2 * g) as i64);
+        b = 2 * (rd16(f, (f.loca as i64) + 2 * g + 2) as i64);
+    } else {
+        a = rd32(f, (f.loca as i64) + 4 * g) as i64;
+        b = rd32(f, (f.loca as i64) + 4 * g + 4) as i64;
+    }
+    if (b <= a) { len[0] = 0; off[0] = 0; return true; }   // empty glyph (space)
+    off[0] = (f.glyf as i64) + a;
+    len[0] = b - a;
+    return off[0] + len[0] <= f.n;
+}
+
+// Appends the glyph (transformed by m, offset by dx/dy, in font units).
+fun load_glyph(e: ptr<FontEngine>, f: ptr<Font>, gid: i32, depth: i32,
+               m00: f32, m01: f32, m10: f32, m11: f32, dx: f32, dy: f32) -> bool {
+    if (depth > 4) { return false; }
+    var off: i64 = 0;
+    var len: i64 = 0;
+    if (!glyph_range(f, gid, &off, &len)) { return false; }
+    if (len == 0) { return true; }
+    var nc: i32 = rds16(f, off);
+    if (nc >= 0) {
+        if (e.ncont + nc > MAX_CONTOURS) { return false; }
+        var p: i64 = off + 10;
+        var base: i32 = e.npts;
+        var npts: i32 = 0;
+        if (nc != 0) { npts = (rd16(f, p + 2 * ((nc - 1) as i64)) as i32) + 1; }
+        if (base + npts > MAX_POINTS) { return false; }
+        var i: i32 = 0;
+        while (i < nc) {
+            e.cend[e.ncont + i] = base + (rd16(f, p + 2 * (i as i64)) as i32);
+            i += 1;
+        }
+        p += 2 * (nc as i64);
+        p += 2 + (rd16(f, p) as i64);                  // skip instructions
+        i = 0;
+        while (i < npts) {
+            var fl: u8 = rd8(f, p) as u8;
+            p += 1;
+            e.flags[i] = fl;
+            i += 1;
+            if ((fl & 8) != 0) {
+                var r: u32 = rd8(f, p);
+                p += 1;
+                while (r > 0 && i < npts) { r -= 1; e.flags[i] = fl; i += 1; }
+            }
+        }
+        var v: i32 = 0;
+        i = 0;
+        while (i < npts) {                             // x
+            var fl: u8 = e.flags[i];
+            if ((fl & 2) != 0) {
+                var d: i32 = rd8(f, p) as i32;
+                p += 1;
+                if ((fl & 16) != 0) { v += d; } else { v -= d; }
+            } else if ((fl & 16) == 0) {
+                v += rds16(f, p);
+                p += 2;
+            }
+            e.px[base + i] = v as f32;
+            i += 1;
+        }
+        v = 0;
+        i = 0;
+        while (i < npts) {                             // y
+            var fl: u8 = e.flags[i];
+            if ((fl & 4) != 0) {
+                var d: i32 = rd8(f, p) as i32;
+                p += 1;
+                if ((fl & 32) != 0) { v += d; } else { v -= d; }
+            } else if ((fl & 32) == 0) {
+                v += rds16(f, p);
+                p += 2;
+            }
+            e.py[base + i] = v as f32;
+            e.on[base + i] = fl & 1;
+            i += 1;
+        }
+        i = 0;
+        while (i < npts) {
+            var x: f32 = e.px[base + i];
+            var y: f32 = e.py[base + i];
+            e.px[base + i] = m00 * x + m10 * y + dx;
+            e.py[base + i] = m01 * x + m11 * y + dy;
+            i += 1;
+        }
+        e.npts += npts;
+        e.ncont += nc;
+        return true;
+    }
+    // composite
+    var p: i64 = off + 10;
+    var more: bool = true;
+    while (more) {
+        var fl: u32 = rd16(f, p);
+        var sub: u32 = rd16(f, p + 2);
+        p += 4;
+        var a1: i32 = 0;
+        var a2: i32 = 0;
+        if ((fl & 1) != 0) { a1 = rds16(f, p); a2 = rds16(f, p + 2); p += 4; }
+        else {
+            a1 = ((rd8(f, p) as u8) as i8) as i32;
+            a2 = ((rd8(f, p + 1) as u8) as i8) as i32;
+            p += 2;
+        }
+        var a: f32 = 1.0;
+        var b: f32 = 0.0;
+        var c: f32 = 0.0;
+        var d: f32 = 1.0;
+        if ((fl & 8) != 0) {
+            a = (rds16(f, p) as f32) / 16384.0;
+            d = a;
+            p += 2;
+        } else if ((fl & 0x40) != 0) {
+            a = (rds16(f, p) as f32) / 16384.0;
+            d = (rds16(f, p + 2) as f32) / 16384.0;
+            p += 4;
+        } else if ((fl & 0x80) != 0) {
+            a = (rds16(f, p) as f32) / 16384.0;
+            b = (rds16(f, p + 2) as f32) / 16384.0;
+            c = (rds16(f, p + 4) as f32) / 16384.0;
+            d = (rds16(f, p + 6) as f32) / 16384.0;
+            p += 8;
+        }
+        if ((fl & 2) == 0) { return false; }           // point matching: unsupported
+        // child transform, then parent transform
+        var n00: f32 = m00 * a + m10 * b;
+        var n01: f32 = m01 * a + m11 * b;
+        var n10: f32 = m00 * c + m10 * d;
+        var n11: f32 = m01 * c + m11 * d;
+        var ox: f32 = m00 * (a1 as f32) + m10 * (a2 as f32) + dx;
+        var oy: f32 = m01 * (a1 as f32) + m11 * (a2 as f32) + dy;
+        if (!load_glyph(e, f, sub as i32, depth + 1, n00, n01, n10, n11, ox, oy)) { return false; }
+        if ((fl & 0x20) == 0) { more = false; }
+    }
+    return true;
+}
+
+// ---- CFF: INDEX / DICT parsing ----------------------------------------------
+
+fun index_offset(f: ptr<Font>, idx: i64, osz: i32, k: u32) -> u32 {
+    var v: u32 = 0;
+    var b: i32 = 0;
+    while (b < osz) {
+        v = (v << 8) | rd8(f, idx + 3 + (k as i64) * (osz as i64) + (b as i64));
+        b += 1;
+    }
+    return v;
+}
+
+// Entry `i` of the INDEX at `idx`: its file offset and length.
+fun index_entry(f: ptr<Font>, idx: i64, i: i32, off: ptr<i64>, len: ptr<i64>) -> bool {
+    var count: u32 = rd16(f, idx);
+    if (count == 0 || i < 0 || (i as u32) >= count) { return false; }
+    var osz: i32 = rd8(f, idx + 2) as i32;
+    if (osz < 1 || osz > 4) { return false; }
+    var base: i64 = idx + 3 + ((count + 1) as i64) * (osz as i64) - 1;
+    var a: u32 = index_offset(f, idx, osz, i as u32);
+    var b: u32 = index_offset(f, idx, osz, (i as u32) + 1);
+    if (b < a) { return false; }
+    off[0] = base + (a as i64);
+    len[0] = (b as i64) - (a as i64);
+    return off[0] >= 0 && off[0] + len[0] <= f.n;
+}
+
+fun index_end(f: ptr<Font>, idx: i64) -> i64 {
+    var count: u32 = rd16(f, idx);
+    if (count == 0) { return idx + 2; }
+    var osz: i32 = rd8(f, idx + 2) as i32;
+    var last: u32 = 0;
+    var b: i32 = 0;
+    while (b < osz) {
+        last = (last << 8) | rd8(f, idx + 3 + (count as i64) * (osz as i64) + (b as i64));
+        b += 1;
+    }
+    return idx + 3 + ((count + 1) as i64) * (osz as i64) - 1 + (last as i64);
+}
+
+fun parse_dict(f: ptr<Font>, start: i64, end: i64, d: ptr<Dict>) {
+    var st: array<f32, 48>;
+    var sp: i32 = 0;
+    var p: i64 = start;
+    while (p < end) {
+        var b: u32 = rd8(f, p);
+        p += 1;
+        if (b >= 32 || b == 28 || b == 29 || b == 30) {
+            var v: f32 = 0.0;
+            if (b == 28) { v = rds16(f, p) as f32; p += 2; }
+            else if (b == 29) { v = (rd32(f, p) as i32) as f32; p += 4; }
+            else if (b == 30) {                        // real number: skip the nibbles
+                var more: bool = true;
+                while (p < end && more) {
+                    var x: u32 = rd8(f, p);
+                    p += 1;
+                    if ((x & 15) == 15 || (x >> 4) == 15) { more = false; }
+                }
+            }
+            else if (b <= 246) { v = ((b as i32) - 139) as f32; }
+            else if (b <= 250) { v = ((((b as i32) - 247) * 256 + (rd8(f, p) as i32) + 108)) as f32; p += 1; }
+            else if (b <= 254) { v = ((0 - ((b as i32) - 251)) * 256 - (rd8(f, p) as i32) - 108) as f32; p += 1; }
+            if (sp < 48) { st[sp] = v; sp += 1; }
+        } else {
+            var op: i32 = b as i32;
+            if (b == 12) { op = 1200 + (rd8(f, p) as i32); p += 1; }
+            if (op == 17) { if (sp >= 1) { d.charstrings = st[sp - 1] as i64; } }
+            else if (op == 18) { if (sp >= 2) { d.priv_size = st[sp - 2] as i64; d.priv_off = st[sp - 1] as i64; } }
+            else if (op == 19) { if (sp >= 1) { d.subrs = st[sp - 1] as i64; } }
+            else if (op == 1230) { d.cid = true; }
+            else if (op == 1236) { if (sp >= 1) { d.fdarray = st[sp - 1] as i64; } }
+            else if (op == 1237) { if (sp >= 1) { d.fdselect = st[sp - 1] as i64; } }
+            sp = 0;
+        }
+    }
+}
+
+// Local subroutine INDEX of the Private DICT described by `d` (0 if none).
+fun local_subrs(f: ptr<Font>, table: i64, d: ptr<Dict>) -> i64 {
+    if (d.priv_size <= 0 || d.priv_off <= 0) { return 0; }
+    var pd: Dict = dict_new();
+    parse_dict(f, table + d.priv_off, table + d.priv_off + d.priv_size, &pd);
+    if (pd.subrs != 0) { return table + d.priv_off + pd.subrs; }
+    return 0;
+}
+
+fun cff_init(f: ptr<Font>, table: i64) -> bool {
+    var name: i64 = table + (rd8(f, table + 2) as i64);
+    var top: i64 = index_end(f, name);
+    var strs: i64 = index_end(f, top);
+    f.gsubr = index_end(f, strs);
+    var off: i64 = 0;
+    var len: i64 = 0;
+    if (!index_entry(f, top, 0, &off, &len)) { return false; }
+    var d: Dict = dict_new();
+    parse_dict(f, off, off + len, &d);
+    if (d.charstrings <= 0) { return false; }
+    f.cs_index = table + d.charstrings;
+    f.cid = d.cid;
+    if (d.cid) {
+        if (d.fdarray <= 0 || d.fdselect <= 0) { return false; }
+        var fda: i64 = table + d.fdarray;
+        var n: u32 = rd16(f, fda);
+        f.nfd = MAX_FD;
+        if (n < (MAX_FD as u32)) { f.nfd = n as i32; }
+        var i: i32 = 0;
+        while (i < f.nfd) {
+            var fd: Dict = dict_new();
+            if (index_entry(f, fda, i, &off, &len)) { parse_dict(f, off, off + len, &fd); }
+            f.lsubr[i] = local_subrs(f, table, &fd);
+            i += 1;
+        }
+        f.fdselect = table + d.fdselect;
+        f.fdselect_fmt = rd8(f, f.fdselect) as i32;
+    } else {
+        f.nfd = 1;
+        f.lsubr[0] = local_subrs(f, table, &d);
+    }
+    return true;
+}
+
+fun fd_for(f: ptr<Font>, gid: i32) -> i32 {
+    if (!f.cid) { return 0; }
+    if (f.fdselect_fmt == 0) { return rd8(f, f.fdselect + 1 + (gid as i64)) as i32; }
+    if (f.fdselect_fmt == 3) {
+        var nr: u32 = rd16(f, f.fdselect + 1);
+        var i: u32 = 0;
+        while (i < nr) {
+            var r: i64 = f.fdselect + 3 + 3 * (i as i64);
+            if ((gid as u32) >= rd16(f, r) && (gid as u32) < rd16(f, r + 3)) { return rd8(f, r + 2) as i32; }
+            i += 1;
+        }
+    }
+    return 0;
+}
+
+// ---- CFF: Type 2 charstring interpreter ---------------------------------------
+//
+// Produces the same point list as the TrueType loader (all points on-curve:
+// cubic curves are flattened into line segments), so the rasterizer is shared.
+
+fun cs_close(e: ptr<FontEngine>) {
+    if (e.copen && e.npts > e.cstart && e.ncont < MAX_CONTOURS) {
+        e.cend[e.ncont] = e.npts - 1;
+        e.ncont += 1;
+    }
+    e.copen = false;
+}
+
+fun cs_add(e: ptr<FontEngine>, x: f32, y: f32) {
+    if (e.npts >= MAX_POINTS) { e.cover = true; return; }
+    e.px[e.npts] = x;
+    e.py[e.npts] = y;
+    e.on[e.npts] = 1;
+    e.npts += 1;
+}
+
+fun cs_move(e: ptr<FontEngine>, dx: f32, dy: f32) {
+    cs_close(e);
+    e.cx += dx;
+    e.cy += dy;
+    e.cstart = e.npts;
+    cs_add(e, e.cx, e.cy);
+    e.copen = true;
+}
+
+fun cs_line(e: ptr<FontEngine>, dx: f32, dy: f32) {
+    if (!e.copen) { cs_move(e, 0.0, 0.0); }
+    e.cx += dx;
+    e.cy += dy;
+    cs_add(e, e.cx, e.cy);
+}
+
+fun cs_curve(e: ptr<FontEngine>, a: f32, b: f32, c: f32, d: f32, ee: f32, g: f32) {
+    if (!e.copen) { cs_move(e, 0.0, 0.0); }
+    var x0: f32 = e.cx;
+    var y0: f32 = e.cy;
+    var x1: f32 = x0 + a;
+    var y1: f32 = y0 + b;
+    var x2: f32 = x1 + c;
+    var y2: f32 = y1 + d;
+    var x3: f32 = x2 + ee;
+    var y3: f32 = y2 + g;
+    var i: i32 = 1;
+    while (i <= CURVE_STEPS) {
+        var t: f32 = (i as f32) / (CURVE_STEPS as f32);
+        var u: f32 = 1.0 - t;
+        var w0: f32 = u * u * u;
+        var w1: f32 = 3.0 * u * u * t;
+        var w2: f32 = 3.0 * u * t * t;
+        var w3: f32 = t * t * t;
+        cs_add(e, w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3, w0 * y0 + w1 * y1 + w2 * y2 + w3 * y3);
+        i += 1;
+    }
+    e.cx = x3;
+    e.cy = y3;
+}
+
+fun arg(e: ptr<FontEngine>, i: i32) -> f32 {
+    if (i >= 0 && i < e.csp) { return e.cs[i]; }
+    return 0.0;
+}
+
+fun fabs(v: f32) -> f32 {
+    if (v < 0.0) { return 0.0 - v; }
+    return v;
+}
+
+// The first stack-clearing operator may carry the glyph width as an extra
+// leading argument; drop it (widths come from hmtx).
+fun take_width(e: ptr<FontEngine>, extra: bool) {
+    if (!e.cwidth && extra && e.csp > 0) {
+        var i: i32 = 1;
+        while (i < e.csp) { e.cs[i - 1] = e.cs[i]; i += 1; }
+        e.csp -= 1;
+    }
+    e.cwidth = true;
+}
+
+fun subr_bias(f: ptr<Font>, idx: i64) -> i32 {
+    var n: u32 = 0;
+    if (idx != 0) { n = rd16(f, idx); }
+    if (n < 1240) { return 107; }
+    if (n < 33900) { return 1131; }
+    return 32768;
+}
+
+fun cs_run(e: ptr<FontEngine>, f: ptr<Font>, start: i64, end: i64, depth: i32) -> bool {
+    if (depth > 10) { return false; }
+    var p: i64 = start;
+    while (p < end && !e.cdone) {
+        var b: u32 = rd8(f, p);
+        p += 1;
+        if (b >= 32 || b == 28) {                       // number
+            var v: f32 = 0.0;
+            if (b == 28) { v = rds16(f, p) as f32; p += 2; }
+            else if (b <= 246) { v = ((b as i32) - 139) as f32; }
+            else if (b <= 250) { v = (((b as i32) - 247) * 256 + (rd8(f, p) as i32) + 108) as f32; p += 1; }
+            else if (b <= 254) { v = ((0 - ((b as i32) - 251)) * 256 - (rd8(f, p) as i32) - 108) as f32; p += 1; }
+            else { v = ((rd32(f, p) as i32) as f32) / 65536.0; p += 4; }
+            if (e.csp >= 96) { return false; }
+            e.cs[e.csp] = v;
+            e.csp += 1;
+            continue;
+        }
+        if (b == 1 || b == 3 || b == 18 || b == 23) {           // stems
+            take_width(e, (e.csp & 1) != 0);
+            e.cnstems += e.csp / 2;
+            e.csp = 0;
+        } else if (b == 19 || b == 20) {                        // hintmask / cntrmask
+            take_width(e, (e.csp & 1) != 0);
+            e.cnstems += e.csp / 2;
+            e.csp = 0;
+            p += ((e.cnstems + 7) / 8) as i64;
+        } else if (b == 21) { take_width(e, e.csp > 2); cs_move(e, arg(e, 0), arg(e, 1)); e.csp = 0; }
+        else if (b == 22) { take_width(e, e.csp > 1); cs_move(e, arg(e, 0), 0.0); e.csp = 0; }
+        else if (b == 4) { take_width(e, e.csp > 1); cs_move(e, 0.0, arg(e, 0)); e.csp = 0; }
+        else if (b == 5) {
+            var i: i32 = 0;
+            while (i + 1 < e.csp) { cs_line(e, arg(e, i), arg(e, i + 1)); i += 2; }
+            e.csp = 0;
+        } else if (b == 6 || b == 7) {                          // hlineto / vlineto
+            var horiz: bool = (b == 6);
+            var i: i32 = 0;
+            while (i < e.csp) {
+                if (horiz) { cs_line(e, arg(e, i), 0.0); } else { cs_line(e, 0.0, arg(e, i)); }
+                i += 1;
+                horiz = !horiz;
+            }
+            e.csp = 0;
+        } else if (b == 8) {
+            var i: i32 = 0;
+            while (i + 5 < e.csp) {
+                cs_curve(e, arg(e, i), arg(e, i + 1), arg(e, i + 2), arg(e, i + 3), arg(e, i + 4), arg(e, i + 5));
+                i += 6;
+            }
+            e.csp = 0;
+        } else if (b == 24) {                                   // rcurveline
+            var i: i32 = 0;
+            while (i + 7 < e.csp) {
+                cs_curve(e, arg(e, i), arg(e, i + 1), arg(e, i + 2), arg(e, i + 3), arg(e, i + 4), arg(e, i + 5));
+                i += 6;
+            }
+            if (i + 1 < e.csp) { cs_line(e, arg(e, i), arg(e, i + 1)); }
+            e.csp = 0;
+        } else if (b == 25) {                                   // rlinecurve
+            var i: i32 = 0;
+            while (i + 7 < e.csp) { cs_line(e, arg(e, i), arg(e, i + 1)); i += 2; }
+            if (i + 5 < e.csp) {
+                cs_curve(e, arg(e, i), arg(e, i + 1), arg(e, i + 2), arg(e, i + 3), arg(e, i + 4), arg(e, i + 5));
+            }
+            e.csp = 0;
+        } else if (b == 26) {                                   // vvcurveto
+            var i: i32 = 0;
+            var dx1: f32 = 0.0;
+            if ((e.csp & 1) != 0) { dx1 = arg(e, i); i += 1; }
+            while (i + 3 < e.csp) {
+                cs_curve(e, dx1, arg(e, i), arg(e, i + 1), arg(e, i + 2), 0.0, arg(e, i + 3));
+                dx1 = 0.0;
+                i += 4;
+            }
+            e.csp = 0;
+        } else if (b == 27) {                                   // hhcurveto
+            var i: i32 = 0;
+            var dy1: f32 = 0.0;
+            if ((e.csp & 1) != 0) { dy1 = arg(e, i); i += 1; }
+            while (i + 3 < e.csp) {
+                cs_curve(e, arg(e, i), dy1, arg(e, i + 1), arg(e, i + 2), arg(e, i + 3), 0.0);
+                dy1 = 0.0;
+                i += 4;
+            }
+            e.csp = 0;
+        } else if (b == 30 || b == 31) {                        // vhcurveto / hvcurveto
+            var horiz: bool = (b == 31);
+            var i: i32 = 0;
+            while (i + 3 < e.csp) {
+                var last: f32 = 0.0;
+                if (e.csp - i == 5) { last = arg(e, i + 4); }
+                if (horiz) { cs_curve(e, arg(e, i), 0.0, arg(e, i + 1), arg(e, i + 2), last, arg(e, i + 3)); }
+                else { cs_curve(e, 0.0, arg(e, i), arg(e, i + 1), arg(e, i + 2), arg(e, i + 3), last); }
+                i += 4;
+                horiz = !horiz;
+            }
+            e.csp = 0;
+        } else if (b == 10 || b == 29) {                        // callsubr / callgsubr
+            if (e.csp < 1) { return false; }
+            var idx: i64 = f.gsubr;
+            if (b == 10) { idx = e.cs_lsubr; }
+            e.csp -= 1;
+            var n: i32 = (e.cs[e.csp] as i32) + subr_bias(f, idx);
+            var off: i64 = 0;
+            var len: i64 = 0;
+            if (idx == 0 || !index_entry(f, idx, n, &off, &len)) { return false; }
+            if (!cs_run(e, f, off, off + len, depth + 1)) { return false; }
+        } else if (b == 11) { return true; }                    // return
+        else if (b == 14) {                                     // endchar
+            take_width(e, e.csp == 1 || e.csp == 5);
+            cs_close(e);
+            e.cdone = true;
+            e.csp = 0;
+        } else if (b == 12) {
+            var x: u32 = rd8(f, p);
+            p += 1;
+            if (x == 35) {                                      // flex
+                cs_curve(e, arg(e, 0), arg(e, 1), arg(e, 2), arg(e, 3), arg(e, 4), arg(e, 5));
+                cs_curve(e, arg(e, 6), arg(e, 7), arg(e, 8), arg(e, 9), arg(e, 10), arg(e, 11));
+            } else if (x == 34) {                               // hflex
+                cs_curve(e, arg(e, 0), 0.0, arg(e, 1), arg(e, 2), arg(e, 3), 0.0);
+                cs_curve(e, arg(e, 4), 0.0, arg(e, 5), 0.0 - arg(e, 2), arg(e, 6), 0.0);
+            } else if (x == 36) {                               // hflex1
+                cs_curve(e, arg(e, 0), arg(e, 1), arg(e, 2), arg(e, 3), arg(e, 4), 0.0);
+                cs_curve(e, arg(e, 5), 0.0, arg(e, 6), arg(e, 7), arg(e, 8), 0.0 - (arg(e, 1) + arg(e, 3) + arg(e, 7)));
+            } else if (x == 37) {                               // flex1
+                var dx: f32 = arg(e, 0) + arg(e, 2) + arg(e, 4) + arg(e, 6) + arg(e, 8);
+                var dy: f32 = arg(e, 1) + arg(e, 3) + arg(e, 5) + arg(e, 7) + arg(e, 9);
+                var ax: f32 = fabs(dx);
+                var ay: f32 = fabs(dy);
+                var dx6: f32 = 0.0 - dx;
+                var dy6: f32 = arg(e, 10);
+                if (ax > ay) { dx6 = arg(e, 10); dy6 = 0.0 - dy; }
+                cs_curve(e, arg(e, 0), arg(e, 1), arg(e, 2), arg(e, 3), arg(e, 4), arg(e, 5));
+                cs_curve(e, arg(e, 6), arg(e, 7), arg(e, 8), arg(e, 9), dx6, dy6);
+            }
+            e.csp = 0;                                          // other escapes (arithmetic): ignored
+        } else { e.csp = 0; }                                   // reserved operators
+    }
+    return true;
+}
+
+fun load_cff_glyph(e: ptr<FontEngine>, f: ptr<Font>, gid: i32) -> bool {
+    var off: i64 = 0;
+    var len: i64 = 0;
+    if (gid < 0 || gid >= f.num_glyphs || !index_entry(f, f.cs_index, gid, &off, &len)) { return false; }
+    var fd: i32 = fd_for(f, gid);
+    e.cs_lsubr = 0;
+    if (fd >= 0 && fd < f.nfd) { e.cs_lsubr = f.lsubr[fd]; }
+    e.csp = 0;
+    e.cnstems = 0;
+    e.cstart = e.npts;
+    e.cx = 0.0;
+    e.cy = 0.0;
+    e.cwidth = false;
+    e.cdone = false;
+    e.copen = false;
+    e.cover = false;
+    var ok: bool = cs_run(e, f, off, off + len, 0);
+    cs_close(e);
+    return ok && !e.cover;
+}
+
+// ---- rasterizer (exact-area coverage accumulation) --------------------------
+
+fun ifloor(v: f32) -> i32 {
+    var i: i32 = v as i32;
+    if ((i as f32) > v) { return i - 1; }
+    return i;
+}
+
+fun iceil(v: f32) -> i32 {
+    var i: i32 = v as i32;
+    if ((i as f32) < v) { return i + 1; }
+    return i;
+}
+
+fun raster_line(e: ptr<FontEngine>, ax0: f32, ay0: f32, ax1: f32, ay1: f32) {
+    var x0: f32 = ax0;
+    var y0: f32 = ay0;
+    var x1: f32 = ax1;
+    var y1: f32 = ay1;
+    if (y0 == y1) { return; }
+    var dir: f32 = 1.0;
+    if (y0 > y1) {
+        dir = -1.0;
+        var t: f32 = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+    }
+    var dxdy: f32 = (x1 - x0) / (y1 - y0);
+    var x: f32 = x0;
+    if (y0 < 0.0) { x -= y0 * dxdy; y0 = 0.0; }
+    var ys: i32 = y0 as i32;
+    var ye: i32 = iceil(y1);
+    if (e.acc_h < ye) { ye = e.acc_h; }
+    var y: i32 = ys;
+    while (y < ye) {
+        var rowi: i32 = y * e.acc_w;
+        var top: f32 = y0;
+        if ((y as f32) > y0) { top = y as f32; }
+        var bot: f32 = y1;
+        if (((y + 1) as f32) < y1) { bot = (y + 1) as f32; }
+        var dy: f32 = bot - top;
+        var xn: f32 = x + dxdy * dy;
+        var d: f32 = dy * dir;
+        var xa: f32 = xn;
+        var xb: f32 = x;
+        if (x < xn) { xa = x; xb = xn; }
+        if (xa < 0.0) { xa = 0.0; }
+        var right: f32 = (e.acc_w - 2) as f32;     // last column that may get coverage
+        if (xb > right) { xb = right; }
+        if (xb < xa) { xb = xa; }
+        var xi0: i32 = ifloor(xa);
+        var xi1: i32 = iceil(xb);
+        if (xi1 <= xi0 + 1) {
+            var xmf: f32 = 0.5 * (xa + xb) - (xi0 as f32);
+            e.acc[rowi + xi0] += d - d * xmf;
+            e.acc[rowi + xi0 + 1] += d * xmf;
+        } else {
+            var s: f32 = 1.0 / (xb - xa);
+            var x0f: f32 = xa - (xi0 as f32);
+            var a0: f32 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+            var x1f: f32 = xb - (xi1 as f32) + 1.0;
+            var am: f32 = 0.5 * s * x1f * x1f;
+            e.acc[rowi + xi0] += d * a0;
+            if (xi1 == xi0 + 2) {
+                e.acc[rowi + xi0 + 1] += d * (1.0 - a0 - am);
+            } else {
+                var a1: f32 = s * (1.5 - x0f);
+                e.acc[rowi + xi0 + 1] += d * (a1 - a0);
+                var xi: i32 = xi0 + 2;
+                while (xi < xi1 - 1) { e.acc[rowi + xi] += d * s; xi += 1; }
+                var a2: f32 = a1 + ((xi1 - xi0 - 3) as f32) * s;
+                e.acc[rowi + xi1 - 1] += d * (1.0 - a2 - am);
+            }
+            e.acc[rowi + xi1] += d * am;
+        }
+        x = xn;
+        y += 1;
+    }
+}
+
+fun raster_quad(e: ptr<FontEngine>, x0: f32, y0: f32, cx: f32, cy: f32, x1: f32, y1: f32) {
+    var px: f32 = x0;
+    var py: f32 = y0;
+    var i: i32 = 1;
+    while (i <= 8) {
+        var t: f32 = (i as f32) / 8.0;
+        var u: f32 = 1.0 - t;
+        var x: f32 = u * u * x0 + 2.0 * u * t * cx + t * t * x1;
+        var y: f32 = u * u * y0 + 2.0 * u * t * cy + t * t * y1;
+        raster_line(e, px, py, x, y);
+        px = x;
+        py = y;
+        i += 1;
+    }
+}
+
+// Points are already in bitmap space (pixels, y down).
+fun contour(e: ptr<FontEngine>, s: i32, en: i32) {
+    var n: i32 = en - s + 1;
+    if (n < 2) { return; }
+    var first: i32 = -1;
+    var i: i32 = 0;
+    while (i < n && first < 0) {
+        if (e.on[s + i] != 0) { first = i; }
+        i += 1;
+    }
+    var sx: f32 = 0.0;
+    var sy: f32 = 0.0;
+    var k0: i32 = 0;
+    var k1: i32 = n;
+    if (first >= 0) { sx = e.px[s + first]; sy = e.py[s + first]; k0 = 1; }
+    else { sx = 0.5 * (e.px[s] + e.px[en]); sy = 0.5 * (e.py[s] + e.py[en]); first = 0; k0 = 0; }
+    var cx: f32 = sx;                                 // current on-curve point
+    var cy: f32 = sy;
+    var pend: bool = false;
+    var qx: f32 = 0.0;                                // pending control point
+    var qy: f32 = 0.0;
+    var k: i32 = k0;
+    while (k < k1) {
+        var idx: i32 = s + (first + k) % n;
+        var x: f32 = e.px[idx];
+        var y: f32 = e.py[idx];
+        if (e.on[idx] != 0) {
+            if (pend) { raster_quad(e, cx, cy, qx, qy, x, y); } else { raster_line(e, cx, cy, x, y); }
+            cx = x;
+            cy = y;
+            pend = false;
+        } else if (pend) {
+            var mx: f32 = 0.5 * (qx + x);
+            var my: f32 = 0.5 * (qy + y);
+            raster_quad(e, cx, cy, qx, qy, mx, my);
+            cx = mx;
+            cy = my;
+            qx = x;
+            qy = y;
+        } else { qx = x; qy = y; pend = true; }
+        k += 1;
+    }
+    if (pend) { raster_quad(e, cx, cy, qx, qy, sx, sy); } else { raster_line(e, cx, cy, sx, sy); }
+}
+
+// Rasterizes `gid` into e.acc (coverage after accumulate). bm gets
+// [x, y, w, h], the bitmap's offset from the pen / baseline origin.
+// Returns false if the glyph is empty or too big.
+fun raster(e: ptr<FontEngine>, f: ptr<Font>, gid: i32, bm: ptr<i32>) -> bool {
+    e.npts = 0;
+    e.ncont = 0;
+    var ok: bool = false;
+    if (f.cff) { ok = load_cff_glyph(e, f, gid); }
+    else { ok = load_glyph(e, f, gid, 0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0); }
+    if (!ok || e.npts == 0) { return false; }
+    var s: f32 = (e.size as f32) / (f.upem as f32);
+    var minx: f32 = 1000000000.0;
+    var miny: f32 = 1000000000.0;
+    var maxx: f32 = -1000000000.0;
+    var maxy: f32 = -1000000000.0;
+    var i: i32 = 0;
+    while (i < e.npts) {
+        var x: f32 = e.px[i] * s;
+        var y: f32 = (0.0 - e.py[i]) * s;             // y down, relative to baseline
+        e.px[i] = x;
+        e.py[i] = y;
+        if (x < minx) { minx = x; }
+        if (x > maxx) { maxx = x; }
+        if (y < miny) { miny = y; }
+        if (y > maxy) { maxy = y; }
+        i += 1;
+    }
+    var ox: i32 = ifloor(minx);
+    var oy: i32 = ifloor(miny);
+    var w: i32 = iceil(maxx) - ox;
+    var h: i32 = iceil(maxy) - oy;
+    if (w <= 0 || h <= 0 || w > MAX_GLYPH_PX || h > MAX_GLYPH_PX) { return false; }
+    e.acc_w = w + 2;
+    e.acc_h = h;
+    i = 0;
+    while (i < e.acc_w * e.acc_h) { e.acc[i] = 0.0; i += 1; }
+    i = 0;
+    while (i < e.npts) { e.px[i] -= ox as f32; e.py[i] -= oy as f32; i += 1; }
+    var start: i32 = 0;
+    var c: i32 = 0;
+    while (c < e.ncont) {
+        contour(e, start, e.cend[c]);
+        start = e.cend[c] + 1;
+        c += 1;
+    }
+    var y: i32 = 0;
+    while (y < h) {                                   // prefix sum -> coverage
+        var acc: f32 = 0.0;
+        var x: i32 = 0;
+        while (x < e.acc_w) {
+            acc += e.acc[y * e.acc_w + x];
+            var v: f32 = fabs(acc);
+            if (v > 1.0) { v = 1.0; }
+            e.acc[y * e.acc_w + x] = v;
+            x += 1;
+        }
+        y += 1;
+    }
+    bm[0] = ox;
+    bm[1] = oy;
+    bm[2] = w;
+    bm[3] = h;
+    return true;
+}
+
+// ---- text -------------------------------------------------------------------
+
+// Decodes one UTF-8 code point at s[*i] and advances *i; invalid bytes become U+FFFD.
+fun next_cp(s: ptr<u8>, len: i64, i: ptr<i64>) -> u32 {
+    var c: u32 = s[i[0]] as u32;
+    i[0] += 1;
+    if (c < 0x80) { return c; }
+    var extra: i32 = -1;
+    if (c >= 0xF0 && c < 0xF8) { extra = 3; }
+    else if (c >= 0xE0) { extra = 2; }
+    else if (c >= 0xC0) { extra = 1; }
+    if (extra < 0 || c >= 0xF8 || i[0] + (extra as i64) > len) { return 0xFFFD; }
+    var shift: u32 = extra as u32;
+    var cp: u32 = c & (0x3F >> shift);
+    var k: i32 = 0;
+    while (k < extra) {
+        var b: u32 = s[i[0]] as u32;
+        if ((b & 0xC0) != 0x80) { return 0xFFFD; }
+        cp = (cp << 6) | (b & 0x3F);
+        i[0] += 1;
+        k += 1;
+    }
+    return cp;
+}
+
+// Which font and glyph draw a code point. Remembered in a direct-mapped cache:
+// measuring and drawing ask for the same characters every frame. Returns the
+// font index; the glyph id goes through `gid`.
+fun pick(e: ptr<FontEngine>, cp: u32, gid: ptr<i32>) -> i32 {
+    var slot: i32 = (((cp * 2654435761) >> 20) & ((PICK_SLOTS - 1) as u32)) as i32;
+    if (e.pick_font[slot] != 0 && e.pick_cp[slot] == cp) {
+        gid[0] = e.pick_gid[slot];
+        return e.pick_font[slot] - 1;
+    }
+    var fi: i32 = 0;
+    var g: i32 = 0;
+    var i: i32 = 0;
+    while (i < e.nfonts) {
+        var cand: i32 = glyph_index(e.fonts[i], cp);
+        if (cand != 0) { fi = i; g = cand; i = e.nfonts; } else { i += 1; }
+    }
+    e.pick_cp[slot] = cp;
+    e.pick_font[slot] = fi + 1;
+    e.pick_gid[slot] = g;
+    gid[0] = g;
+    return fi;
+}
+
+// ---- glyph bitmap cache -------------------------------------------------------
+//
+// Rasterizing an outline is the expensive part of drawing text, and the same
+// glyphs are drawn every frame. Coverage bitmaps (8 bit) are kept in a fixed
+// pool, found through a hash table keyed by (font, size, glyph). When the pool
+// or a slot is needed and full, everything is dropped and refilled: simple,
+// and a UI re-warms it within a frame.
+
+fun make_key(e: ptr<FontEngine>, font: i32, gid: i32) -> u32 {
+    return 0x80000000 | ((font as u32) << 24) | ((e.size as u32) << 16) | ((gid & 0xFFFF) as u32);
+}
+
+fun cache_clear(e: ptr<FontEngine>) {
+    var i: i32 = 0;
+    while (i < CACHE_SLOTS) { e.key[i] = 0; i += 1; }
+    e.pool_used = 0;
+}
+
+// Returns the cache slot holding the glyph's coverage bitmap, rasterizing it
+// on a miss.
+fun glyph_bitmap(e: ptr<FontEngine>, font_index: i32, gid: i32) -> i32 {
+    var key: u32 = make_key(e, font_index, gid);
+    var slot: i32 = (((key * 2654435761) >> 20) & ((CACHE_SLOTS - 1) as u32)) as i32;
+    if (e.key[slot] == key) { return slot; }
+    var bm: array<i32, 4>;
+    bm[0] = 0; bm[1] = 0; bm[2] = 0; bm[3] = 0;
+    var ok: bool = raster(e, e.fonts[font_index], gid, &bm[0]);
+    var need: u32 = 0;
+    if (ok) { need = (bm[2] * bm[3]) as u32; }
+    if (e.pool_used + need > POOL_BYTES) {
+        cache_clear(e);                               // pool full: start over
+    }
+    e.key[slot] = key;
+    e.gx[slot] = 0; e.gy[slot] = 0; e.gw[slot] = 0; e.gh[slot] = 0;
+    if (ok) { e.gx[slot] = bm[0]; e.gy[slot] = bm[1]; e.gw[slot] = bm[2]; e.gh[slot] = bm[3]; }
+    e.goff[slot] = e.pool_used;
+    if (ok) {
+        var r: i32 = 0;
+        while (r < bm[3]) {
+            var c: i32 = 0;
+            while (c < bm[2]) {
+                var v: f32 = e.acc[r * e.acc_w + c];
+                e.pool[(e.pool_used as i64) + ((r * bm[2] + c) as i64)] = (v * 255.0 + 0.5) as u8;
+                c += 1;
+            }
+            r += 1;
+        }
+        e.pool_used += need;
+    }
+    return slot;
+}
+
+fun px_advance(e: ptr<FontEngine>, f: ptr<Font>, gid: i32) -> i32 {
+    var s: f32 = (e.size as f32) / (f.upem as f32);
+    var a: f32 = (advance_units(f, gid) as f32) * s;
+    var r: i32 = iceil(a - 0.5);                      // round half up
+    if (r > 0) { return r; }
+    return 0;
+}
+
+// ---- public API ---------------------------------------------------------------
+
+pub fun font_ready(e: ptr<FontEngine>) -> bool { return e.nfonts > 0; }
+
+pub fun font_ascent(e: ptr<FontEngine>) -> i32 {
+    var f: ptr<Font> = e.fonts[0];
+    return iceil((f.ascent as f32) * (e.size as f32) / (f.upem as f32) - 0.5);
+}
+
+// Draws UTF-8 text with its top-left at (x, y), blended into `px` (row width
+// bw) inside the clip rectangle [cx0, cx1) x [cy0, cy1).
+pub fun font_draw(e: ptr<FontEngine>, text: ptr<u8>, len: i64, x: i32, y: i32, color: u32,
+                  px: ptr<u32>, bw: i32, cx0: i32, cy0: i32, cx1: i32, cy1: i32) {
+    var baseline: i32 = y + font_ascent(e);
+    var pen: i32 = x;
+    var i: i64 = 0;
+    var gid: i32 = 0;
+    while (i < len) {
+        var cp: u32 = next_cp(text, len, &i);
+        var fi: i32 = pick(e, cp, &gid);
+        if (cp != 32) {
+            var slot: i32 = glyph_bitmap(e, fi, gid);
+            var off: i64 = e.goff[slot] as i64;
+            var gw: i32 = e.gw[slot];
+            var gh: i32 = e.gh[slot];
+            var r: i32 = 0;
+            while (r < gh) {
+                var yy: i32 = baseline + e.gy[slot] + r;
+                var c: i32 = 0;
+                while (c < gw) {
+                    var v: u32 = e.pool[off + ((r * gw + c) as i64)] as u32;
+                    if (v != 0) {
+                        var a: u32 = ((color >> 24) * v + 127) / 255;
+                        gfx_put(px, bw, cx0, cy0, cx1, cy1, pen + e.gx[slot] + c, yy, (a << 24) | (color & 0x00FFFFFF));
+                    }
+                    c += 1;
+                }
+                r += 1;
+            }
+        }
+        pen += px_advance(e, e.fonts[fi], gid);
+    }
+}
+
+// Registers font `index` of a .ttf/.otf/.ttc image. The data must stay alive
+// as long as the engine. Up to 4 fonts form a fallback chain (first one that
+// has the character wins). Returns false if it is not a usable font.
+pub fun font_add(e: ptr<FontEngine>, data: ptr<u8>, len: i64, index: i32) -> bool {
+    if (len < 12 || e.nfonts >= MAX_FONTS) { return false; }
+    var f: ptr<Font> = mem_alloc((size_of<Font>() as i64)) as ptr<Font>;
+    f.d = data;
+    f.n = len;
+    f.glyf = 0; f.loca = 0; f.hmtx = 0; f.cmap_sub = 0; f.cmap_fmt = 0;
+    f.cff = false; f.cid = false;
+    f.cs_index = 0; f.gsubr = 0; f.fdselect = 0; f.fdselect_fmt = 0; f.nfd = 0;
+    f.lsubr = mem_alloc((MAX_FD * 8) as i64) as ptr<i64>;
+    var z: i32 = 0;
+    while (z < MAX_FD) { f.lsubr[z] = 0; z += 1; }
+    f.upem = 0; f.loca_fmt = 0; f.num_glyphs = 0; f.num_hm = 0; f.ascent = 0; f.descent = 0; f.gap = 0;
+    if (!font_init(f, index)) {
+        mem_free(f.lsubr as ptr<u8>, (MAX_FD * 8) as i64);
+        mem_free(f as ptr<u8>, (size_of<Font>() as i64));
+        return false;
+    }
+    e.fonts[e.nfonts] = f;
+    e.nfonts += 1;
+    var i: i32 = 0;
+    while (i < PICK_SLOTS) { e.pick_font[i] = 0; i += 1; }   // the fallback chain changed
+    cache_clear(e);
+    return true;
+}
+
+fun font_init(f: ptr<Font>, index: i32) -> bool {
+    var sfnt: i64 = 0;
+    if (rd32(f, 0) == 0x74746366) {                   // 'ttcf'
+        if ((index as u32) >= rd32(f, 8)) { return false; }
+        sfnt = rd32(f, 12 + 4 * (index as i64)) as i64;
+    } else if (index != 0) { return false; }
+    var ver: u32 = rd32(f, sfnt);
+    var otto: bool = (ver == 0x4F54544F);             // 'OTTO': CFF outlines
+    if (ver != 0x00010000 && ver != 0x74727565 && !otto) { return false; }
+    var head: u32 = find_table(f, sfnt, "head");
+    var maxp: u32 = find_table(f, sfnt, "maxp");
+    var hhea: u32 = find_table(f, sfnt, "hhea");
+    f.glyf = find_table(f, sfnt, "glyf");
+    f.loca = find_table(f, sfnt, "loca");
+    f.hmtx = find_table(f, sfnt, "hmtx");
+    if (head == 0 || maxp == 0 || hhea == 0 || f.hmtx == 0) { return false; }
+    if (otto) {
+        var cff: u32 = find_table(f, sfnt, "CFF ");
+        if (cff == 0 || !cff_init(f, cff as i64)) { return false; }
+        f.cff = true;
+    } else if (f.glyf == 0 || f.loca == 0) {
+        return false;
+    }
+    f.upem = rd16(f, (head as i64) + 18) as i32;
+    f.loca_fmt = rds16(f, (head as i64) + 50);
+    f.num_glyphs = rd16(f, (maxp as i64) + 4) as i32;
+    f.ascent = rds16(f, (hhea as i64) + 4);
+    f.descent = rds16(f, (hhea as i64) + 6);
+    f.gap = rds16(f, (hhea as i64) + 8);
+    f.num_hm = rd16(f, (hhea as i64) + 34) as i32;
+    if (f.upem < 16 || f.upem > 16384 || f.num_glyphs <= 0 || !pick_cmap(f, sfnt)) { return false; }
+    return true;
+}
+
+pub fun font_set_size(e: ptr<FontEngine>, px: i32) {
+    cache_clear(e);
+    var v: i32 = px;
+    if (v < 6) { v = 6; }
+    if (v > 96) { v = 96; }
+    e.size = v;
+}
+
+// Width in pixels of UTF-8 text. Without a font, 1 byte = 1 box glyph.
+pub fun font_text_width(e: ptr<FontEngine>, text: ptr<u8>, len: i64) -> i32 {
+    if (len <= 0) { return 0; }
+    if (e.nfonts == 0) { return (len * (FONT_GLYPH_W as i64)) as i32; }
+    var w: i32 = 0;
+    var i: i64 = 0;
+    var gid: i32 = 0;
+    while (i < len) {
+        var cp: u32 = next_cp(text, len, &i);
+        var fi: i32 = pick(e, cp, &gid);
+        w += px_advance(e, e.fonts[fi], gid);
+    }
+    return w;
+}
+
+pub fun font_text_height(e: ptr<FontEngine>) -> i32 {
+    if (e.nfonts == 0) { return FONT_GLYPH_H; }
+    var f: ptr<Font> = e.fonts[0];
+    var s: f32 = (e.size as f32) / (f.upem as f32);
+    return iceil(((f.ascent - f.descent + f.gap) as f32) * s - 0.5);
+}
+
+// ---- text at a given size ---------------------------------------------------------------------
+//
+// The engine has a default size (font_set_size); these measure and draw at another one without
+// disturbing it. The glyph cache is keyed by size, so switching is cheap. A size of 0 or less
+// means the default. Without any font loaded, text is hollow boxes size / 2 wide and `size` high.
+
+fun pick_size(e: ptr<FontEngine>, size: i32) -> i32 {
+    if (size <= 0) { return e.size; }
+    if (size < 6) { return 6; }
+    if (size > 96) { return 96; }
+    return size;
+}
+
+pub fun font_text_width_sz(e: ptr<FontEngine>, text: ptr<u8>, len: i64, size: i32) -> i32 {
+    var sz: i32 = pick_size(e, size);
+    if (len <= 0) { return 0; }
+    if (e.nfonts == 0) { return (len * ((sz / 2) as i64)) as i32; }
+    var old: i32 = e.size;
+    e.size = sz;
+    var w: i32 = font_text_width(e, text, len);
+    e.size = old;
+    return w;
+}
+
+pub fun font_text_height_sz(e: ptr<FontEngine>, size: i32) -> i32 {
+    var sz: i32 = pick_size(e, size);
+    if (e.nfonts == 0) { return sz; }
+    var old: i32 = e.size;
+    e.size = sz;
+    var h: i32 = font_text_height(e);
+    e.size = old;
+    return h;
+}
+
+// font_draw at `size`; `bold` draws every glyph a second time one pixel to the right (a
+// synthetic bold: no bold font is needed).
+pub fun font_draw_sz(e: ptr<FontEngine>, text: ptr<u8>, len: i64, x: i32, y: i32, color: u32, px: ptr<u32>, bw: i32,
+                     cx0: i32, cy0: i32, cx1: i32, cy1: i32, size: i32, bold: bool) {
+    var old: i32 = e.size;
+    e.size = pick_size(e, size);
+    font_draw(e, text, len, x, y, color, px, bw, cx0, cy0, cx1, cy1);
+    if (bold) {
+        var shift: i32 = e.size / 14;
+        if (shift < 1) { shift = 1; }
+        font_draw(e, text, len, x + shift, y, color, px, bw, cx0, cy0, cx1, cy1);
+    }
+    e.size = old;
+}

@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Software rasterizer for wui draw lists, in pure Wave.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./gfx")::{gfx_blend, gfx_put};
+import("./font")::{FontEngine, font_ready, font_draw_sz, FONT_GLYPH_W, FONT_GLYPH_H};
+
+pub const CMD_FILL: i32 = 1;          // filled rectangle
+pub const CMD_BORDER: i32 = 2;        // 1px rectangle outline
+pub const CMD_TEXT: i32 = 3;          // UTF-8 text, (x, y) = top-left of line; w = font size in px (0: the engine's), h = flags
+pub const TEXT_BOLD: i32 = 1;         // h flag of a text command: draw it bold
+pub const CMD_CLIP: i32 = 4;          // restrict drawing to the rectangle (x, y, w, h)
+pub const CMD_CLIP_END: i32 = 5;      // back to the previous clip
+pub const CMD_LINE: i32 = 6;          // anti-aliased stroke from (x, y) to (w, h);
+                                      // coordinates and the width (in text_len) are in 1/16 pixel
+pub const CMD_ROUND_FILL: i32 = 7;    // anti-aliased rounded rectangle; corner radius in text_len (px)
+pub const CMD_ROUND_BORDER: i32 = 8;  // its 1px outline, same radius
+
+const CLIP_DEPTH: i32 = 16;
+
+// One draw command. The layout is the C layout of the old `WuiCmd`
+// (kind, x, y, w, h, color, text, text_len): 40 bytes.
+pub struct DrawCmd {
+    kind: i32;
+    x: i32;
+    y: i32;
+    w: i32;
+    h: i32;
+    color: u32;
+    text: ptr<u8>;
+    text_len: i64;
+}
+
+pub const DRAW_CMD_SIZE: i64 = 40;
+
+// Pixel buffer plus the active clip rectangle (half-open) and the stack of
+// enclosing clips (CLIP nests: it intersects with the current one, CLIP_END pops).
+struct Rd {
+    px: ptr<u32>;
+    bw: i32;
+    bh: i32;
+    x0: i32;
+    y0: i32;
+    x1: i32;
+    y1: i32;
+    stack: ptr<i32>;                  // CLIP_DEPTH rectangles of 4 ints
+    top: i32;
+}
+
+fun put(r: ptr<Rd>, x: i32, y: i32, color: u32) {
+    gfx_put(r.px, r.bw, r.x0, r.y0, r.x1, r.y1, x, y, color);
+}
+
+// Fills [rx, rx + rw) x [ry, ry + rh) clipped to the buffer and the active clip.
+fun fill(r: ptr<Rd>, rx: i32, ry: i32, rw: i32, rh: i32, color: u32) {
+    var x0: i32 = rx;
+    var y0: i32 = ry;
+    var x1: i32 = rx + rw;
+    var y1: i32 = ry + rh;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > r.bw) { x1 = r.bw; }
+    if (y1 > r.bh) { y1 = r.bh; }
+    if (x0 < r.x0) { x0 = r.x0; }
+    if (y0 < r.y0) { y0 = r.y0; }
+    if (x1 > r.x1) { x1 = r.x1; }
+    if (y1 > r.y1) { y1 = r.y1; }
+    if (x0 >= x1 || y0 >= y1) { return; }
+    var a: u32 = color >> 24;
+    if (a == 0) { return; }
+    var y: i32 = y0;
+    if (a == 255) {                                   // opaque: plain row writes
+        var v: u32 = color | 0xFF000000;
+        while (y < y1) {
+            var row: i64 = (y as i64) * (r.bw as i64);
+            var x: i32 = x0;
+            while (x < x1) { r.px[row + (x as i64)] = v; x += 1; }
+            y += 1;
+        }
+        return;
+    }
+    while (y < y1) {
+        var row: i64 = (y as i64) * (r.bw as i64);
+        var x: i32 = x0;
+        while (x < x1) {
+            r.px[row + (x as i64)] = gfx_blend(r.px[row + (x as i64)], color);
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
+fun border(r: ptr<Rd>, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    if (w <= 0 || h <= 0) { return; }
+    fill(r, x, y, w, 1, color);                       // top
+    fill(r, x, y + h - 1, w, 1, color);               // bottom
+    if (h - 2 > 0) {
+        fill(r, x, y + 1, 1, h - 2, color);           // left
+        fill(r, x + w - 1, y + 1, 1, h - 2, color);   // right
+    }
+}
+
+// sqrt without libm: Newton steps are plenty for a coverage value.
+fun fsqrt(v: f32) -> f32 {
+    if (v <= 0.0) { return 0.0; }
+    var g: f32 = 1.0;
+    if (v > 1.0) { g = v * 0.5; }
+    var i: i32 = 0;
+    while (i < 6) { g = 0.5 * (g + v / g); i += 1; }
+    return g;
+}
+
+// Signed distance (pixels) from the centre of pixel (x, y) to the edge of the
+// rounded rectangle (cx, cy, cw, ch): negative inside, positive outside.
+fun round_dist(cx: i32, cy: i32, cw: i32, ch: i32, radius: i32, x: i32, y: i32) -> f32 {
+    var hx: f32 = (cw as f32) * 0.5;
+    var hy: f32 = (ch as f32) * 0.5;
+    var px: f32 = (x as f32) + 0.5 - ((cx as f32) + hx);
+    var py: f32 = (y as f32) + 0.5 - ((cy as f32) + hy);
+    if (px < 0.0) { px = 0.0 - px; }
+    if (py < 0.0) { py = 0.0 - py; }
+    var qx: f32 = px - (hx - (radius as f32));
+    var qy: f32 = py - (hy - (radius as f32));
+    var ox: f32 = 0.0;
+    if (qx > 0.0) { ox = qx; }
+    var oy: f32 = 0.0;
+    if (qy > 0.0) { oy = qy; }
+    var inner: f32 = qy;
+    if (qx > qy) { inner = qx; }
+    var neg: f32 = 0.0;
+    if (inner < 0.0) { neg = inner; }
+    return fsqrt(ox * ox + oy * oy) + neg - (radius as f32);
+}
+
+fun clamp01(v: f32) -> f32 {
+    if (v < 0.0) { return 0.0; }
+    if (v > 1.0) { return 1.0; }
+    return v;
+}
+
+fun clamp_radius(c: ptr<DrawCmd>) -> i32 {
+    var r: i32 = c.text_len as i32;
+    var m: i32 = c.h / 2;
+    if (c.w < c.h) { m = c.w / 2; }
+    if (r < 0) { return 0; }
+    if (r > m) { return m; }
+    return r;
+}
+
+fun put_cov(r: ptr<Rd>, x: i32, y: i32, color: u32, cov: f32) {
+    if (cov <= 0.0) { return; }
+    var a: u32 = (((color >> 24) as f32) * cov + 0.5) as u32;
+    put(r, x, y, (a << 24) | (color & 0x00FFFFFF));
+}
+
+// Filled rounded rectangle: straight parts are plain fills, only the four
+// corner squares pay for the distance test.
+fun round_fill(r: ptr<Rd>, c: ptr<DrawCmd>) {
+    var rad: i32 = clamp_radius(c);
+    if (rad == 0) { fill(r, c.x, c.y, c.w, c.h, c.color); return; }
+    fill(r, c.x + rad, c.y, c.w - 2 * rad, c.h, c.color);                        // centre column
+    fill(r, c.x, c.y + rad, rad, c.h - 2 * rad, c.color);                        // left strip
+    fill(r, c.x + c.w - rad, c.y + rad, rad, c.h - 2 * rad, c.color);            // right strip
+    var cy: i32 = 0;
+    while (cy < 2) {
+        var cx: i32 = 0;
+        while (cx < 2) {
+            var x0: i32 = c.x;
+            if (cx != 0) { x0 = c.x + c.w - rad; }
+            var y0: i32 = c.y;
+            if (cy != 0) { y0 = c.y + c.h - rad; }
+            var y: i32 = y0;
+            while (y < y0 + rad) {
+                var x: i32 = x0;
+                while (x < x0 + rad) {
+                    if (x >= 0 && y >= 0 && x < r.bw && y < r.bh) {
+                        put_cov(r, x, y, c.color, clamp01(0.5 - round_dist(c.x, c.y, c.w, c.h, rad, x, y)));
+                    }
+                    x += 1;
+                }
+                y += 1;
+            }
+            cx += 1;
+        }
+        cy += 1;
+    }
+}
+
+// 1 px outline just inside the edge of the rounded rectangle.
+fun round_border(r: ptr<Rd>, c: ptr<DrawCmd>) {
+    var rad: i32 = clamp_radius(c);
+    if (rad == 0) { border(r, c.x, c.y, c.w, c.h, c.color); return; }
+    var band: i32 = 2;
+    if (rad > 2) { band = rad; }
+    var y: i32 = c.y;
+    while (y < c.y + c.h) {
+        if (y >= 0 && y < r.bh) {
+            var edge_row: bool = y < c.y + band || y >= c.y + c.h - band;
+            var x: i32 = c.x;
+            while (x < c.x + c.w) {
+                if (x >= 0 && x < r.bw) {
+                    if (!edge_row && x >= c.x + band && x < c.x + c.w - band) {
+                        x = c.x + c.w - band - 1;     // jump over the empty middle
+                    } else {
+                        var d: f32 = round_dist(c.x, c.y, c.w, c.h, rad, x, y);
+                        put_cov(r, x, y, c.color, clamp01(0.5 - d) - clamp01(-0.5 - d));
+                    }
+                }
+                x += 1;
+            }
+        }
+        y += 1;
+    }
+}
+
+// Anti-aliased stroke with round caps. (x, y) -> (w, h) in 1/16 px, width in
+// text_len (1/16 px). Coverage comes from the distance of each pixel centre to
+// the segment.
+fun stroke(r: ptr<Rd>, c: ptr<DrawCmd>) {
+    var k: f32 = 1.0 / 16.0;
+    var x0: f32 = (c.x as f32) * k;
+    var y0: f32 = (c.y as f32) * k;
+    var x1: f32 = (c.w as f32) * k;
+    var y1: f32 = (c.h as f32) * k;
+    var half: f32 = (c.text_len as f32) * k * 0.5;
+    if (half <= 0.0) { return; }
+    var lo_x: f32 = x1;
+    var hi_x: f32 = x0;
+    if (x0 < x1) { lo_x = x0; hi_x = x1; }
+    var lo_y: f32 = y1;
+    var hi_y: f32 = y0;
+    if (y0 < y1) { lo_y = y0; hi_y = y1; }
+    lo_x = lo_x - half - 1.0;
+    hi_x = hi_x + half + 1.0;
+    lo_y = lo_y - half - 1.0;
+    hi_y = hi_y + half + 1.0;
+    var ix0: i32 = lo_x as i32;
+    var ix1: i32 = (hi_x as i32) + 1;
+    var iy0: i32 = lo_y as i32;
+    var iy1: i32 = (hi_y as i32) + 1;
+    if (ix0 < 0) { ix0 = 0; }
+    if (iy0 < 0) { iy0 = 0; }
+    if (ix1 > r.bw) { ix1 = r.bw; }
+    if (iy1 > r.bh) { iy1 = r.bh; }
+    var dx: f32 = x1 - x0;
+    var dy: f32 = y1 - y0;
+    var len2: f32 = dx * dx + dy * dy;
+    var alpha: u32 = c.color >> 24;
+    var y: i32 = iy0;
+    while (y < iy1) {
+        var x: i32 = ix0;
+        while (x < ix1) {
+            var qx: f32 = (x as f32) + 0.5 - x0;
+            var qy: f32 = (y as f32) + 0.5 - y0;
+            var t: f32 = 0.0;
+            if (len2 > 0.0) { t = (qx * dx + qy * dy) / len2; }
+            if (t < 0.0) { t = 0.0; }
+            if (t > 1.0) { t = 1.0; }
+            var ex: f32 = qx - t * dx;
+            var ey: f32 = qy - t * dy;
+            var d: f32 = fsqrt(ex * ex + ey * ey);
+            var cov: f32 = half + 0.5 - d;
+            if (cov > 0.0) {
+                if (cov > 1.0) { cov = 1.0; }
+                var a: u32 = ((alpha as f32) * cov + 0.5) as u32;
+                put(r, x, y, (a << 24) | (c.color & 0x00FFFFFF));
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+}
+
+fun text(r: ptr<Rd>, fe: ptr<FontEngine>, c: ptr<DrawCmd>) {
+    var bold: bool = (c.h & TEXT_BOLD) != 0;
+    if (font_ready(fe)) {
+        font_draw_sz(fe, c.text, c.text_len, c.x, c.y, c.color, r.px, r.bw, r.x0, r.y0, r.x1, r.y1, c.w, bold);
+        return;
+    }
+    // No system font could be loaded: draw each byte as a hollow box so the
+    // layout is still visible.
+    var size: i32 = c.w;
+    if (size <= 0) { size = FONT_GLYPH_H; }
+    var gw: i32 = size / 2;
+    var pen: i32 = c.x;
+    var i: i64 = 0;
+    while (i < c.text_len) {
+        if (c.text[i] != 32) {
+            border(r, pen + 1, c.y + size * 3 / 16, gw - 2, size - size * 6 / 16, c.color);
+        }
+        pen += gw;
+        i += 1;
+    }
+}
+
+fun clip_push(r: ptr<Rd>, c: ptr<DrawCmd>) {
+    var x0: i32 = c.x;
+    var y0: i32 = c.y;
+    var x1: i32 = c.x + c.w;
+    var y1: i32 = c.y + c.h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > r.bw) { x1 = r.bw; }
+    if (y1 > r.bh) { y1 = r.bh; }
+    if (r.top < CLIP_DEPTH) {
+        r.stack[r.top * 4] = r.x0;
+        r.stack[r.top * 4 + 1] = r.y0;
+        r.stack[r.top * 4 + 2] = r.x1;
+        r.stack[r.top * 4 + 3] = r.y1;
+    }
+    r.top += 1;                                       // deeper than the stack: counted, so ENDs still pair up
+    if (x0 < r.x0) { x0 = r.x0; }
+    if (y0 < r.y0) { y0 = r.y0; }
+    if (x1 > r.x1) { x1 = r.x1; }
+    if (y1 > r.y1) { y1 = r.y1; }
+    r.x0 = x0;
+    r.y0 = y0;
+    r.x1 = x1;
+    r.y1 = y1;
+}
+
+fun clip_pop(r: ptr<Rd>) {
+    if (r.top > 0) {
+        r.top -= 1;
+        if (r.top < CLIP_DEPTH) {
+            r.x0 = r.stack[r.top * 4];
+            r.y0 = r.stack[r.top * 4 + 1];
+            r.x1 = r.stack[r.top * 4 + 2];
+            r.y1 = r.stack[r.top * 4 + 3];
+        } else {
+            r.x0 = 0;
+            r.y0 = 0;
+            r.x1 = r.bw;
+            r.y1 = r.bh;
+        }
+    }
+}
+
+// Paints `count` draw commands (at `cmds`, DRAW_CMD_SIZE bytes each) into
+// `pixels` (width * height, row-major, 0xAARRGGBB). Text is drawn with `fe`.
+pub fun render(fe: ptr<FontEngine>, cmds: ptr<u8>, count: i64, pixels: ptr<u32>, width: i32, height: i32) {
+    if (cmds == null || pixels == null || width <= 0 || height <= 0) { return; }
+    var r: Rd = Rd { px: pixels, bw: width, bh: height, x0: 0, y0: 0, x1: width, y1: height,
+                     stack: mem_alloc((CLIP_DEPTH * 16) as i64) as ptr<i32>, top: 0 };
+    var i: i64 = 0;
+    while (i < count) {
+        var c: ptr<DrawCmd> = &cmds[i * DRAW_CMD_SIZE] as ptr<DrawCmd>;
+        var kind: i32 = c.kind;
+        if (kind == CMD_CLIP) { clip_push(&r, c); }
+        else if (kind == CMD_CLIP_END) { clip_pop(&r); }
+        else if (kind == CMD_LINE) { stroke(&r, c); }
+        else if (kind == CMD_ROUND_FILL) { round_fill(&r, c); }
+        else if (kind == CMD_ROUND_BORDER) { round_border(&r, c); }
+        else if (kind == CMD_FILL) { fill(&r, c.x, c.y, c.w, c.h, c.color); }
+        else if (kind == CMD_BORDER) { border(&r, c.x, c.y, c.w, c.h, c.color); }
+        else if (kind == CMD_TEXT) { if (c.text != null) { text(&r, fe, c); } }
+        i += 1;
+    }
+    mem_free(r.stack as ptr<u8>, (CLIP_DEPTH * 16) as i64);
+}

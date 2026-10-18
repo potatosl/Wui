@@ -1,0 +1,712 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// X11 window backend in pure Wave, through libX11 (Linux / BSD; also works on
+// Wayland desktops through XWayland). Link
+// with --link=:libX11.so.6 (the plain libX11.so symlink only exists with the
+// -dev package).
+//
+// The window owns a 0xAARRGGBB pixel buffer that the renderer paints into;
+// xw_present copies it to the screen with XPutImage.
+//
+// An XEvent is a 192-byte union; it is read here at the x86_64 / aarch64 (LP64)
+// field offsets of the Xlib structs XKeyEvent, XButtonEvent, XMotionEvent,
+// XConfigureEvent and XClientMessageEvent.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+import("std::time::clock")::{time_now_monotonic_ns};
+
+extern(c, "XOpenDisplay") fun x_open_display(name: ptr<u8>) -> ptr<u8>;
+extern(c, "XCloseDisplay") fun x_close_display(d: ptr<u8>) -> i32;
+extern(c, "XDefaultScreen") fun x_default_screen(d: ptr<u8>) -> i32;
+extern(c, "XRootWindow") fun x_root_window(d: ptr<u8>, screen: i32) -> u64;
+extern(c, "XDefaultVisual") fun x_default_visual(d: ptr<u8>, screen: i32) -> ptr<u8>;
+extern(c, "XDefaultDepth") fun x_default_depth(d: ptr<u8>, screen: i32) -> i32;
+extern(c, "XDefaultGC") fun x_default_gc(d: ptr<u8>, screen: i32) -> ptr<u8>;
+extern(c, "XCreateSimpleWindow") fun x_create_simple_window(d: ptr<u8>, parent: u64, x: i32, y: i32, w: u32, h: u32,
+                                                             border_width: u32, border: u64, background: u64) -> u64;
+extern(c, "XStoreName") fun x_store_name(d: ptr<u8>, w: u64, name: ptr<u8>) -> i32;
+extern(c, "XSelectInput") fun x_select_input(d: ptr<u8>, w: u64, mask: i64) -> i32;
+extern(c, "XMapWindow") fun x_map_window(d: ptr<u8>, w: u64) -> i32;
+extern(c, "XDestroyWindow") fun x_destroy_window(d: ptr<u8>, w: u64) -> i32;
+extern(c, "XInternAtom") fun x_intern_atom(d: ptr<u8>, name: ptr<u8>, only_if_exists: i32) -> u64;
+extern(c, "XSetWMProtocols") fun x_set_wm_protocols(d: ptr<u8>, w: u64, protocols: ptr<u64>, count: i32) -> i32;
+extern(c, "XNextEvent") fun x_next_event(d: ptr<u8>, ev: ptr<u8>) -> i32;
+extern(c, "XPending") fun x_pending(d: ptr<u8>) -> i32;
+extern(c, "XCreateImage") fun x_create_image(d: ptr<u8>, visual: ptr<u8>, depth: u32, format: i32, offset: i32, data: ptr<u8>,
+                                              w: u32, h: u32, pad: i32, bytes_per_line: i32) -> ptr<u8>;
+extern(c, "XPutImage") fun x_put_image(d: ptr<u8>, drawable: u64, gc: ptr<u8>, img: ptr<u8>, sx: i32, sy: i32,
+                                        dx: i32, dy: i32, w: u32, h: u32) -> i32;
+extern(c, "XDestroyImage") fun x_destroy_image(img: ptr<u8>) -> i32;
+extern(c, "XFlush") fun x_flush(d: ptr<u8>) -> i32;
+extern(c, "XLookupKeysym") fun x_lookup_keysym(ev: ptr<u8>, index: i32) -> u64;
+extern(c, "XSetSelectionOwner") fun x_set_selection_owner(d: ptr<u8>, selection: u64, owner: u64, time: u64) -> i32;
+extern(c, "XGetSelectionOwner") fun x_get_selection_owner(d: ptr<u8>, selection: u64) -> u64;
+extern(c, "XConvertSelection") fun x_convert_selection(d: ptr<u8>, selection: u64, target: u64, property: u64,
+                                                        requestor: u64, time: u64) -> i32;
+extern(c, "XChangeProperty") fun x_change_property(d: ptr<u8>, w: u64, property: u64, ptype: u64, format: i32, mode: i32,
+                                                    data: ptr<u8>, count: i32) -> i32;
+extern(c, "XGetWindowProperty") fun x_get_window_property(d: ptr<u8>, w: u64, property: u64, offset: i64, length: i64,
+                                                           delete: i32, req_type: u64, actual_type: ptr<u64>,
+                                                           actual_format: ptr<i32>, nitems: ptr<u64>, bytes_after: ptr<u64>,
+                                                           data: ptr<ptr<u8>>) -> i32;
+extern(c, "XFree") fun x_free(p: ptr<u8>) -> i32;
+extern(c, "XSendEvent") fun x_send_event(d: ptr<u8>, w: u64, propagate: i32, mask: i64, ev: ptr<u8>) -> i32;
+extern(c, "XCheckTypedWindowEvent") fun x_check_typed_window_event(d: ptr<u8>, w: u64, etype: i32, ev: ptr<u8>) -> i32;
+// Input method (text input).
+extern(c, "XFilterEvent") fun x_filter_event(ev: ptr<u8>, w: u64) -> i32;
+extern(c, "XSetLocaleModifiers") fun x_set_locale_modifiers(modifiers: ptr<u8>) -> ptr<u8>;
+extern(c, "XOpenIM") fun x_open_im(d: ptr<u8>, db: ptr<u8>, res_name: ptr<u8>, res_class: ptr<u8>) -> ptr<u8>;
+extern(c, "XCloseIM") fun x_close_im(im: ptr<u8>) -> i32;
+// XCreateIC is variadic in C; this fixed list is exactly the call made below
+// (three name / value pairs and the NULL terminator), which is call-compatible
+// on x86_64 and aarch64 Linux.
+extern(c, "XCreateIC") fun x_create_ic(im: ptr<u8>, k1: ptr<u8>, v1: u64, k2: ptr<u8>, v2: u64, k3: ptr<u8>, v3: u64,
+                                        terminator: ptr<u8>) -> ptr<u8>;
+extern(c, "XDestroyIC") fun x_destroy_ic(ic: ptr<u8>);
+extern(c, "XSetICFocus") fun x_set_ic_focus(ic: ptr<u8>);
+extern(c, "Xutf8LookupString") fun x_utf8_lookup_string(ic: ptr<u8>, ev: ptr<u8>, buf: ptr<u8>, n: i32, keysym: ptr<u64>,
+                                                         status: ptr<i32>) -> i32;
+extern(c, "XGetDefault") fun x_get_default(d: ptr<u8>, program: ptr<u8>, option: ptr<u8>) -> ptr<u8>;
+extern(c, "XDisplayWidth") fun x_display_width(d: ptr<u8>, screen: i32) -> i32;
+extern(c, "XDisplayWidthMM") fun x_display_width_mm(d: ptr<u8>, screen: i32) -> i32;
+extern(c, "XConnectionNumber") fun x_connection_number(d: ptr<u8>) -> i32;
+extern(c, "poll") fun c_poll(fds: ptr<u8>, nfds: u64, timeout: i32) -> i32;
+extern(c, "setlocale") fun c_setlocale(category: i32, locale: ptr<u8>) -> ptr<u8>;
+extern(c, "usleep") fun c_usleep(usec: u32) -> i32;
+
+const LC_ALL: i32 = 6;
+
+// X11 protocol constants.
+const KEY_PRESS: i32 = 2;
+const BUTTON_PRESS: i32 = 4;
+const BUTTON_RELEASE: i32 = 5;
+const MOTION_NOTIFY: i32 = 6;
+const EXPOSE: i32 = 12;
+const CONFIGURE_NOTIFY: i32 = 22;
+const CLIENT_MESSAGE: i32 = 33;
+const SELECTION_CLEAR: i32 = 29;
+const SELECTION_REQUEST: i32 = 30;
+const SELECTION_NOTIFY: i32 = 31;
+// KeyPress | KeyRelease | ButtonPress | ButtonRelease | PointerMotion | Exposure | StructureNotify
+const EVENT_MASK: i64 = 1 + 2 + 4 + 8 + 64 + 32768 + 131072;
+const Z_PIXMAP: i32 = 2;
+const XA_ATOM: u64 = 4;
+const XA_STRING: u64 = 31;
+const CLIPBOARD_WAIT_MS: i32 = 400;   // how long a paste waits for the owner to answer
+const EVENT_BYTES: i64 = 192;
+
+// Event kinds and key codes (the same on every OS, see lib.wave).
+const EV_NONE: i32 = 0;
+const EV_CLOSE: i32 = 1;
+const EV_MOVE: i32 = 2;
+const EV_DOWN: i32 = 3;
+const EV_UP: i32 = 4;
+const EV_RESIZE: i32 = 5;
+const EV_EXPOSE: i32 = 6;
+const EV_KEY: i32 = 7;
+const EV_TEXT: i32 = 8;
+const EV_WHEEL: i32 = 9;
+const EV_HWHEEL: i32 = 10;
+const EV_TIMEOUT: i32 = 11;
+
+const KEY_BACKSPACE: i32 = 8;
+const KEY_TAB: i32 = 9;
+const KEY_ENTER: i32 = 13;
+const KEY_ESCAPE: i32 = 27;
+const KEY_DELETE: i32 = 127;
+const KEY_LEFT: i32 = 1001;
+const KEY_RIGHT: i32 = 1002;
+const KEY_UP: i32 = 1003;
+const KEY_DOWN: i32 = 1004;
+const KEY_HOME: i32 = 1005;
+const KEY_END: i32 = 1006;
+const KEY_PAGE_UP: i32 = 1007;
+const KEY_PAGE_DOWN: i32 = 1008;
+
+const MOD_SHIFT: i32 = 1;
+const MOD_CTRL: i32 = 2;
+const MOD_ALT: i32 = 4;
+
+pub const TEXT_MAX: i32 = 32;
+pub const MAX_SIDE: i32 = 16384;
+const BACKGROUND: u32 = 0xFFF0F0F0;
+
+// One decoded event: `kind` is an EV_* code; the other fields depend on it
+// (x, y: pointer position; a: button (1 left, 2 middle, 3 right) or key code;
+// width, height: new client size; mods: MOD_* bits for pointer and key events;
+// text / text_len: the UTF-8 bytes of an EV_TEXT event, TEXT_MAX at most).
+pub struct XEv {
+    kind: i32;
+    x: i32;
+    y: i32;
+    a: i32;
+    width: i32;
+    height: i32;
+    mods: i32;
+    text: ptr<u8>;                    // TEXT_MAX bytes
+    text_len: i32;
+}
+
+pub struct XW {
+    dpy: ptr<u8>;
+    screen: i32;
+    window: u64;
+    wm_delete: u64;
+    im: ptr<u8>;                      // input method and context, null without one
+    ic: ptr<u8>;
+    clipboard: u64;                   // atoms of the clipboard protocol
+    utf8: u64;
+    targets: u64;
+    property: u64;                    // where a paste asks the owner to put the data
+    clip_text: ptr<u8>;               // the text we currently own, null = none
+    clip_len: i64;
+    width: i32;
+    height: i32;
+    pixels: ptr<u32>;
+}
+
+// ---- raw event access ----------------------------------------------------------------
+
+fun ev_int(ev: ptr<u8>, off: i64) -> i32 {
+    var p: ptr<i32> = &ev[off] as ptr<i32>;
+    return p[0];
+}
+
+fun ev_long(ev: ptr<u8>, off: i64) -> i64 {
+    var p: ptr<i64> = &ev[off] as ptr<i64>;
+    return p[0];
+}
+
+fun ev_set_int(ev: ptr<u8>, off: i64, v: i32) {
+    var p: ptr<i32> = &ev[off] as ptr<i32>;
+    p[0] = v;
+}
+
+fun ev_set_long(ev: ptr<u8>, off: i64, v: i64) {
+    var p: ptr<i64> = &ev[off] as ptr<i64>;
+    p[0] = v;
+}
+
+fun new_raw_event() -> ptr<u8> {
+    var ev: ptr<u8> = mem_alloc(EVENT_BYTES);
+    var i: i64 = 0;
+    while (i < EVENT_BYTES) { ev[i] = 0; i += 1; }
+    return ev;
+}
+
+fun free_raw_event(ev: ptr<u8>) {
+    mem_free(ev, EVENT_BYTES);
+}
+
+// ---- key and modifier mapping --------------------------------------------------------
+
+// X keysym -> wui key code (0 = not a key wui reports).
+pub fun x11_key_from_keysym(ks: u32) -> i32 {
+    if (ks == 0xff08) { return KEY_BACKSPACE; }
+    if (ks == 0xff09 || ks == 0xfe20) { return KEY_TAB; }          // Tab; Shift+Tab is ISO_Left_Tab
+    if (ks == 0xff0d || ks == 0xff8d) { return KEY_ENTER; }       // Return, keypad Enter
+    if (ks == 0xff1b) { return KEY_ESCAPE; }
+    if (ks == 0xffff) { return KEY_DELETE; }
+    if (ks == 0xff51) { return KEY_LEFT; }
+    if (ks == 0xff52) { return KEY_UP; }
+    if (ks == 0xff53) { return KEY_RIGHT; }
+    if (ks == 0xff54) { return KEY_DOWN; }
+    if (ks == 0xff50) { return KEY_HOME; }
+    if (ks == 0xff57) { return KEY_END; }
+    if (ks == 0xff55) { return KEY_PAGE_UP; }
+    if (ks == 0xff56) { return KEY_PAGE_DOWN; }
+    return 0;
+}
+
+pub fun x11_mods_from_state(state: i32) -> i32 {
+    var m: i32 = 0;
+    if ((state & 1) != 0) { m = m | MOD_SHIFT; }
+    if ((state & 4) != 0) { m = m | MOD_CTRL; }
+    if ((state & 8) != 0) { m = m | MOD_ALT; }
+    return m;
+}
+
+// ---- events ------------------------------------------------------------------------------
+
+fun clear_event(e: ptr<XEv>) {
+    e.kind = EV_NONE;
+    e.x = 0; e.y = 0; e.a = 0; e.width = 0; e.height = 0; e.mods = 0;
+    e.text_len = 0;
+}
+
+// Makes `e` an EV_TEXT event carrying `n` bytes (cut at the last whole
+// character that fits).
+pub fun x11_set_text(e: ptr<XEv>, bytes: ptr<u8>, n: i32) {
+    var k: i32 = n;
+    if (k > TEXT_MAX) { k = TEXT_MAX; }
+    while (k > 0 && k < n && (bytes[k] & 0xC0) == 0x80) { k -= 1; }
+    clear_event(e);
+    e.kind = EV_TEXT;
+    var i: i32 = 0;
+    while (i < k) { e.text[i] = bytes[i]; i += 1; }
+    e.text_len = k;
+}
+
+// True for text worth delivering: not empty, not a control character.
+pub fun x11_is_text(bytes: ptr<u8>, n: i32) -> bool {
+    return n > 0 && bytes[0] >= 0x20 && bytes[0] != 0x7F;
+}
+
+pub fun x11_new_event() -> ptr<XEv> {
+    var e: ptr<XEv> = mem_alloc(size_of<XEv>() as i64) as ptr<XEv>;
+    e.text = mem_alloc(TEXT_MAX as i64);
+    clear_event(e);
+    return e;
+}
+
+pub fun x11_free_event(e: ptr<XEv>) {
+    mem_free(e.text, TEXT_MAX as i64);
+    mem_free(e as ptr<u8>, size_of<XEv>() as i64);
+}
+
+// ---- opening -------------------------------------------------------------------------------
+
+// Sets up the X input method + context: turns key presses into text, composing
+// Hangul / CJK through the user's IME (ibus, fcitx, ...) when one is running.
+fun open_input(w: ptr<XW>) {
+    w.im = null;
+    w.ic = null;
+    c_setlocale(LC_ALL, "" as ptr<u8>);                // XIM needs the user's locale
+    x_set_locale_modifiers("" as ptr<u8>);
+    var im: ptr<u8> = x_open_im(w.dpy, null, null, null);
+    if (im == null) {
+        x_set_locale_modifiers("@im=none" as ptr<u8>);
+        im = x_open_im(w.dpy, null, null, null);
+    }
+    if (im == null) { return; }
+    // XIMPreeditNothing | XIMStatusNothing: the IME draws its own composition window.
+    var style: u64 = 8 + 1024;
+    var ic: ptr<u8> = x_create_ic(im, "inputStyle" as ptr<u8>, style, "clientWindow" as ptr<u8>, w.window,
+                                  "focusWindow" as ptr<u8>, w.window, null);
+    if (ic == null) {
+        x_close_im(im);
+        return;
+    }
+    x_set_ic_focus(ic);
+    w.im = im;
+    w.ic = ic;
+}
+
+fun fill_background(w: ptr<XW>) {
+    var n: i64 = (w.width as i64) * (w.height as i64);
+    var i: i64 = 0;
+    while (i < n) { w.pixels[i] = BACKGROUND; i += 1; }
+}
+
+// Opens a window with a `width` x `height` client area. `visible` = false
+// leaves it unmapped (the tests only exchange selections). Returns null when
+// the size is invalid or there is no display.
+pub fun xw_open(title: ptr<u8>, len: i64, width: i32, height: i32, visible: bool) -> ptr<XW> {
+    if (width <= 0 || height <= 0 || width > MAX_SIDE || height > MAX_SIDE) { return null; }
+    var dpy: ptr<u8> = x_open_display(null);
+    if (dpy == null) { return null; }
+    var w: ptr<XW> = mem_alloc(size_of<XW>() as i64) as ptr<XW>;
+    w.dpy = dpy;
+    w.screen = x_default_screen(dpy);
+    var root: u64 = x_root_window(dpy, w.screen);
+    w.window = x_create_simple_window(dpy, root, 0, 0, width as u32, height as u32, 0, 0, 0xF0F0F0);
+    // the title without NUL bytes, as a C string
+    var name: ptr<u8> = mem_alloc(len + 1);
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while (title != null && i < len) {
+        if (title[i] != 0) { name[n] = title[i]; n += 1; }
+        i += 1;
+    }
+    name[n] = 0;
+    x_store_name(dpy, w.window, name);
+    mem_free(name, len + 1);
+    x_select_input(dpy, w.window, EVENT_MASK);
+    w.wm_delete = x_intern_atom(dpy, "WM_DELETE_WINDOW" as ptr<u8>, 0);
+    var protocols: ptr<u64> = mem_alloc(8) as ptr<u64>;
+    protocols[0] = w.wm_delete;
+    x_set_wm_protocols(dpy, w.window, protocols, 1);
+    mem_free(protocols as ptr<u8>, 8);
+    if (visible) { x_map_window(dpy, w.window); }
+    open_input(w);
+    w.clipboard = x_intern_atom(dpy, "CLIPBOARD" as ptr<u8>, 0);
+    w.utf8 = x_intern_atom(dpy, "UTF8_STRING" as ptr<u8>, 0);
+    w.targets = x_intern_atom(dpy, "TARGETS" as ptr<u8>, 0);
+    w.property = x_intern_atom(dpy, "WUI_CLIPBOARD" as ptr<u8>, 0);
+    w.clip_text = null;
+    w.clip_len = 0;
+    w.width = width;
+    w.height = height;
+    w.pixels = mem_alloc((width as i64) * (height as i64) * 4) as ptr<u32>;
+    fill_background(w);
+    x_flush(dpy);
+    return w;
+}
+
+pub fun xw_close(w: ptr<XW>) {
+    if (w == null) { return; }
+    if (w.ic != null) { x_destroy_ic(w.ic); }
+    if (w.im != null) { x_close_im(w.im); }
+    x_destroy_window(w.dpy, w.window);
+    x_close_display(w.dpy);
+    if (w.clip_text != null) { mem_free(w.clip_text, w.clip_len + 1); }
+    mem_free(w.pixels as ptr<u8>, (w.width as i64) * (w.height as i64) * 4);
+    mem_free(w as ptr<u8>, size_of<XW>() as i64);
+}
+
+pub fun xw_width(w: ptr<XW>) -> i32 { return w.width; }
+pub fun xw_height(w: ptr<XW>) -> i32 { return w.height; }
+
+// The pixel buffer (0xAARRGGBB, width * height, no padding); replaced on resize.
+pub fun xw_pixels(w: ptr<XW>) -> ptr<u32> { return w.pixels; }
+
+// True when xw_next_event will not block.
+pub fun xw_pending(w: ptr<XW>) -> bool { return x_pending(w.dpy) > 0; }
+
+// ---- clipboard ----------------------------------------------------------------------------------
+
+// Answers another program's request for the clipboard we own.
+pub fun serve_selection(w: ptr<XW>, ev: ptr<u8>) {
+    var requestor: u64 = ev_long(ev, 40) as u64;
+    var selection: u64 = ev_long(ev, 48) as u64;
+    var target: u64 = ev_long(ev, 56) as u64;
+    var wanted: u64 = ev_long(ev, 64) as u64;
+    var prop: u64 = target;
+    if (wanted != 0) { prop = wanted; }
+    var answered: u64 = 0;                              // property that holds the answer, 0 = refused
+    if (selection == w.clipboard) {
+        if (target == w.targets) {
+            var list: ptr<u64> = mem_alloc(24) as ptr<u64>;
+            list[0] = w.targets;
+            list[1] = w.utf8;
+            list[2] = XA_STRING;
+            x_change_property(w.dpy, requestor, prop, XA_ATOM, 32, 0, list as ptr<u8>, 3);
+            mem_free(list as ptr<u8>, 24);
+            answered = prop;
+        } else if (w.clip_text != null) {
+            var ascii: bool = true;
+            var i: i64 = 0;
+            while (i < w.clip_len) { if (w.clip_text[i] >= 0x80) { ascii = false; } i += 1; }
+            var plain: bool = target == XA_STRING && ascii;
+            if (target == w.utf8 || plain) {
+                var ty: u64 = w.utf8;
+                if (plain) { ty = XA_STRING; }
+                x_change_property(w.dpy, requestor, prop, ty, 8, 0, w.clip_text, w.clip_len as i32);
+                answered = prop;
+            }
+        }
+    }
+    var reply: ptr<u8> = new_raw_event();
+    ev_set_int(reply, 0, SELECTION_NOTIFY);
+    ev_set_long(reply, 24, w.dpy as i64);
+    ev_set_long(reply, 32, requestor as i64);
+    ev_set_long(reply, 40, selection as i64);
+    ev_set_long(reply, 48, target as i64);
+    ev_set_long(reply, 56, answered as i64);
+    ev_set_long(reply, 64, ev_long(ev, 72));            // time of the request
+    x_send_event(w.dpy, requestor, 0, 0, reply);
+    x_flush(w.dpy);
+    free_raw_event(reply);
+}
+
+// Puts UTF-8 text on the system clipboard.
+pub fun xw_clipboard_set(w: ptr<XW>, text: ptr<u8>, len: i64) {
+    if (w.clip_text != null) { mem_free(w.clip_text, w.clip_len + 1); }
+    w.clip_text = mem_alloc(len + 1);
+    var i: i64 = 0;
+    while (i < len) { w.clip_text[i] = text[i]; i += 1; }
+    w.clip_text[len] = 0;
+    w.clip_len = len;
+    x_set_selection_owner(w.dpy, w.clipboard, w.window, 0);
+    // A round trip, not just a flush: once this returns the server has really
+    // made us the owner, so a paste from another connection that follows right
+    // away is not told "no owner".
+    x_get_selection_owner(w.dpy, w.clipboard);
+}
+
+// First half of a paste: asks the owner of the clipboard for its text.
+// Returns true when we own it ourselves (then there is nothing to wait for).
+pub fun xw_clipboard_request(w: ptr<XW>) -> bool {
+    if (x_get_selection_owner(w.dpy, w.clipboard) == w.window) { return true; }
+    x_convert_selection(w.dpy, w.clipboard, w.utf8, w.property, w.window, 0);
+    x_flush(w.dpy);
+    return false;
+}
+
+// Second half of a paste: waits up to `wait_ms` for the owner's answer and
+// copies its text (NUL-terminated) into buf. Returns its length, or -1 when
+// nobody answered, the owner has no text, or `cap` is too small.
+pub fun xw_clipboard_collect(w: ptr<XW>, buf: ptr<u8>, cap: i64, wait_ms: i32) -> i64 {
+    var ev: ptr<u8> = new_raw_event();
+    var waited: i32 = 0;
+    var got: bool = false;
+    var gave_up: bool = false;
+    while (!got && !gave_up) {
+        if (x_check_typed_window_event(w.dpy, w.window, SELECTION_NOTIFY, ev) != 0) { got = true; }
+        else if (waited >= wait_ms) { gave_up = true; }       // nobody answered
+        else { c_usleep(5000); waited += 5; }
+    }
+    var result: i64 = -1;
+    if (got && ev_long(ev, 56) != 0) {                    // 0: the owner has no text in that format
+        var ty: u64 = 0;
+        var fmt: i32 = 0;
+        var n: u64 = 0;
+        var after: u64 = 0;
+        var data: ptr<u8> = null;
+        var status: i32 = x_get_window_property(w.dpy, w.window, w.property, 0, 1048576, 1, 0, &ty, &fmt, &n, &after, &data);
+        // anything else (e.g. INCR transfers of huge data) is not supported
+        if (status == 0 && data != null && fmt == 8 && ty == w.utf8 && (n as i64) + 1 <= cap) {
+            var i: i64 = 0;
+            while (i < (n as i64)) { buf[i] = data[i]; i += 1; }
+            buf[n as i64] = 0;
+            result = n as i64;
+        }
+        if (data != null) { x_free(data); }
+    }
+    free_raw_event(ev);
+    return result;
+}
+
+// The clipboard's text (NUL-terminated UTF-8) in buf; its length, or -1 when
+// there is no text or `cap` is too small.
+pub fun xw_clipboard_get(w: ptr<XW>, buf: ptr<u8>, cap: i64) -> i64 {
+    if (xw_clipboard_request(w)) {                        // our own clipboard: no round trip needed
+        if (w.clip_text == null || cap < w.clip_len + 1) { return -1; }
+        var i: i64 = 0;
+        while (i <= w.clip_len) { buf[i] = w.clip_text[i]; i += 1; }
+        return w.clip_len;
+    }
+    return xw_clipboard_collect(w, buf, cap, CLIPBOARD_WAIT_MS);
+}
+
+// ---- reading events ---------------------------------------------------------------------------
+
+// Handles the clipboard traffic of one raw event; false when it is not any.
+fun handle_selection(w: ptr<XW>, ev: ptr<u8>, kind: i32) -> bool {
+    if (kind == SELECTION_REQUEST) {
+        serve_selection(w, ev);
+        return true;
+    }
+    if (kind == SELECTION_CLEAR) {
+        if (w.clip_text != null) {                         // another program took the clipboard
+            mem_free(w.clip_text, w.clip_len + 1);
+            w.clip_text = null;
+            w.clip_len = 0;
+        }
+        return true;
+    }
+    return false;
+}
+
+// Serves the clipboard requests that are waiting, without blocking. A program
+// that only owns the clipboard (and has no event loop of its own) calls this.
+pub fun xw_service(w: ptr<XW>) {
+    var ev: ptr<u8> = new_raw_event();
+    while (x_pending(w.dpy) > 0) {
+        x_next_event(w.dpy, ev);
+        handle_selection(w, ev, ev_int(ev, 0));
+    }
+    free_raw_event(ev);
+}
+
+// Turns a KeyPress into an EV_KEY / EV_TEXT event; false: nothing to report.
+fun key_event(w: ptr<XW>, ev: ptr<u8>, outp: ptr<XEv>) -> bool {
+    var state: i32 = ev_int(ev, 80);
+    var mods: i32 = x11_mods_from_state(state);
+    var keysym: u32 = x_lookup_keysym(ev, 0) as u32;
+    var key: i32 = x11_key_from_keysym(keysym);
+    if (key != 0) {
+        clear_event(outp);
+        outp.kind = EV_KEY;
+        outp.a = key;
+        outp.mods = mods;
+        return true;
+    }
+    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) {
+        // shortcuts: report the plain letter, lower case
+        if (keysym >= 0x20 && keysym < 0x7f) {
+            var a: u32 = keysym;
+            if (keysym >= 65 && keysym <= 90) { a = keysym + 32; }
+            clear_event(outp);
+            outp.kind = EV_KEY;
+            outp.a = a as i32;
+            outp.mods = mods;
+            return true;
+        }
+        return false;
+    }
+    if (w.ic == null) {
+        // no input method: ASCII straight from the keysym
+        if (keysym >= 0x20 && keysym < 0x7f) {
+            var one: ptr<u8> = mem_alloc(1);
+            one[0] = keysym as u8;
+            x11_set_text(outp, one, 1);
+            mem_free(one, 1);
+            return true;
+        }
+        return false;
+    }
+    var buf: ptr<u8> = mem_alloc(TEXT_MAX as i64);
+    var sym: u64 = 0;
+    var status: i32 = 0;
+    var n: i32 = x_utf8_lookup_string(w.ic, ev, buf, TEXT_MAX - 1, &sym, &status);
+    var produced: bool = false;
+    // XBufferOverflow (-1) and "no chars" statuses give nothing usable.
+    if (n > 0 && (status == 2 || status == 4) && x11_is_text(buf, n)) {
+        x11_set_text(outp, buf, n);
+        produced = true;
+    }
+    mem_free(buf, TEXT_MAX as i64);
+    return produced;
+}
+
+// Translates one raw X event into `outp`. False when it is nothing wui reports
+// (input method traffic, clipboard requests, wheel releases, ...).
+fun translate(w: ptr<XW>, ev: ptr<u8>, outp: ptr<XEv>) -> bool {
+    var reported: bool = false;
+    clear_event(outp);
+    // The input method gets the first look at every event; it swallows the
+    // ones that are part of a composition in progress.
+    if (x_filter_event(ev, 0) != 0) { return false; }
+    var kind: i32 = ev_int(ev, 0);
+    if (handle_selection(w, ev, kind)) {
+        // selection traffic: nothing to report
+    } else if (kind == MOTION_NOTIFY) {
+        clear_event(outp);
+        outp.kind = EV_MOVE; outp.x = ev_int(ev, 64); outp.y = ev_int(ev, 68);
+        outp.mods = x11_mods_from_state(ev_int(ev, 80));
+        reported = true;
+    } else if (kind == BUTTON_PRESS && ev_int(ev, 84) >= 4 && ev_int(ev, 84) <= 5) {
+        // buttons 4/5 are the wheel (up/down); only the press matters
+        clear_event(outp);
+        outp.kind = EV_WHEEL; outp.x = ev_int(ev, 64); outp.y = ev_int(ev, 68);
+        if (ev_int(ev, 84) == 4) { outp.a = -1; } else { outp.a = 1; }
+        outp.mods = x11_mods_from_state(ev_int(ev, 80));
+        reported = true;
+    } else if (kind == BUTTON_PRESS && ev_int(ev, 84) >= 6 && ev_int(ev, 84) <= 7) {
+        // buttons 6/7: the horizontal wheel (left / right)
+        clear_event(outp);
+        outp.kind = EV_HWHEEL; outp.x = ev_int(ev, 64); outp.y = ev_int(ev, 68);
+        if (ev_int(ev, 84) == 6) { outp.a = -1; } else { outp.a = 1; }
+        outp.mods = x11_mods_from_state(ev_int(ev, 80));
+        reported = true;
+    } else if ((kind == BUTTON_PRESS || kind == BUTTON_RELEASE) && ev_int(ev, 84) >= 4 && ev_int(ev, 84) <= 7) {
+        // wheel button releases: ignored
+    } else if (kind == BUTTON_PRESS || kind == BUTTON_RELEASE) {
+        clear_event(outp);
+        if (kind == BUTTON_PRESS) { outp.kind = EV_DOWN; } else { outp.kind = EV_UP; }
+        outp.x = ev_int(ev, 64); outp.y = ev_int(ev, 68); outp.a = ev_int(ev, 84);
+        outp.mods = x11_mods_from_state(ev_int(ev, 80));
+        reported = true;
+    } else if (kind == KEY_PRESS) {
+        if (key_event(w, ev, outp)) { reported = true; }
+    } else if (kind == EXPOSE) {
+        clear_event(outp);
+        outp.kind = EV_EXPOSE;
+        reported = true;
+    } else if (kind == CONFIGURE_NOTIFY) {
+        var nw: i32 = ev_int(ev, 56);
+        var nh: i32 = ev_int(ev, 60);
+        if (nw > 0 && nh > 0 && (nw != w.width || nh != w.height)) {
+            mem_free(w.pixels as ptr<u8>, (w.width as i64) * (w.height as i64) * 4);
+            w.width = nw;
+            w.height = nh;
+            w.pixels = mem_alloc((nw as i64) * (nh as i64) * 4) as ptr<u32>;
+            fill_background(w);
+            clear_event(outp);
+            outp.kind = EV_RESIZE; outp.width = nw; outp.height = nh;
+            reported = true;
+        }
+    } else if (kind == CLIENT_MESSAGE && ev_long(ev, 56) == (w.wm_delete as i64)) {
+        clear_event(outp);
+        outp.kind = EV_CLOSE;
+        reported = true;
+    }
+    return reported;
+}
+
+// Blocks until the next event wui cares about and describes it in `outp`;
+// returns its kind. A resize event has already replaced the pixel buffer when
+// it is returned.
+pub fun xw_next_event(w: ptr<XW>, outp: ptr<XEv>) -> i32 {
+    var ev: ptr<u8> = new_raw_event();
+    var done: bool = false;
+    clear_event(outp);
+    while (!done) {
+        x_next_event(w.dpy, ev);
+        if (translate(w, ev, outp)) { done = true; }
+    }
+    free_raw_event(ev);
+    return outp.kind;
+}
+
+// Like xw_next_event, but gives up after `ms` milliseconds: the kind is then
+// EV_TIMEOUT. The wait is a poll on the X connection, so it costs no CPU.
+pub fun xw_next_event_timeout(w: ptr<XW>, outp: ptr<XEv>, ms: i32) -> i32 {
+    var ev: ptr<u8> = new_raw_event();
+    var fds: ptr<u8> = mem_alloc(8);                  // one struct pollfd { int fd; short events; short revents; }
+    var deadline: i64 = time_now_monotonic_ns() + (ms as i64) * 1000000;
+    var done: bool = false;
+    clear_event(outp);
+    while (!done) {
+        if (x_pending(w.dpy) > 0) {                   // also reads what is waiting on the socket
+            x_next_event(w.dpy, ev);
+            if (translate(w, ev, outp)) { done = true; }
+        } else {
+            var left: i64 = deadline - time_now_monotonic_ns();
+            if (left <= 0) {
+                clear_event(outp);
+                outp.kind = EV_TIMEOUT;
+                done = true;
+            } else {
+                x_flush(w.dpy);
+                var pfd: ptr<i32> = fds as ptr<i32>;
+                pfd[0] = x_connection_number(w.dpy);
+                pfd[1] = 1;                           // events = POLLIN, revents = 0
+                c_poll(fds, 1, ((left + 999999) / 1000000) as i32);
+            }
+        }
+    }
+    mem_free(fds, 8);
+    free_raw_event(ev);
+    return outp.kind;
+}
+
+// How much bigger than normal this screen's pixels want things: 100 at 96 dpi, 150 at 144, ... It
+// reads the Xft.dpi setting the desktop publishes, else works it out from the screen's size in
+// millimetres. Between 50 and 400.
+pub fun xw_dpi_percent(w: ptr<XW>) -> i32 {
+    var dpi: i64 = 0;
+    var v: ptr<u8> = x_get_default(w.dpy, "Xft" as ptr<u8>, "dpi" as ptr<u8>);
+    if (v != null) {
+        var i: i32 = 0;
+        while (v[i] >= 48 && v[i] <= 57) { dpi = dpi * 10 + ((v[i] - 48) as i64); i += 1; }
+    }
+    if (dpi <= 0) {
+        var mm: i32 = x_display_width_mm(w.dpy, w.screen);
+        if (mm > 0) { dpi = ((x_display_width(w.dpy, w.screen) as i64) * 254) / ((mm as i64) * 10); }
+    }
+    if (dpi <= 0) { return 100; }
+    var percent: i64 = dpi * 100 / 96;
+    if (percent < 50) { percent = 50; }
+    if (percent > 400) { percent = 400; }
+    return percent as i32;
+}
+
+// Shows the pixel buffer in the window.
+pub fun xw_present(w: ptr<XW>) {
+    var visual: ptr<u8> = x_default_visual(w.dpy, w.screen);
+    var depth: i32 = x_default_depth(w.dpy, w.screen);
+    var gc: ptr<u8> = x_default_gc(w.dpy, w.screen);
+    var img: ptr<u8> = x_create_image(w.dpy, visual, depth as u32, Z_PIXMAP, 0, w.pixels as ptr<u8>,
+                                      w.width as u32, w.height as u32, 32, w.width * 4);
+    if (img == null) { return; }
+    x_put_image(w.dpy, w.window, gc, img, 0, 0, 0, 0, w.width as u32, w.height as u32);
+    // XImage.data is at offset 16; the buffer is ours, so detach it before
+    // XDestroyImage, which would otherwise free it.
+    var data_slot: ptr<ptr<u8>> = &img[16] as ptr<ptr<u8>>;
+    data_slot[0] = null;
+    x_destroy_image(img);
+    x_flush(w.dpy);
+}

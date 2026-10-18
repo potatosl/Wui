@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The dark theme without a window: renders the widgets of examples/theme.wave with
+// the focus ring on a button to build/theme.ppm.
+// Run with:  WUI_RUN=theme_headless wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Theme, ui_new, ui_free, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_checkbox, ui_input,
+                ui_input_set, ui_layout, ui_render, ui_align, ui_theme_copy, ui_set_theme, theme_dark, ui_focus_next,
+                UI_ROOT, UI_STRETCH};
+import("std::fs::file")::{write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+const W: i32 = 320;
+const H: i32 = 260;
+
+fun build(ui: ptr<Ui>) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 16, 10);
+    ui_align(ui, page, UI_STRETCH);
+    ui_text(ui, page, "Dark theme / 어두운 테마");
+    var row: i32 = ui_row(ui, page, 0, 8);
+    ui_button(ui, row, "Light", 1);
+    ui_button(ui, row, "Dark", 2);
+    ui_button(ui, row, "Round", 3);
+    ui_checkbox(ui, page, "A checkbox / 체크박스", true, 4);
+    ui_checkbox(ui, page, "Another one", false, 5);
+    ui_input(ui, page, 1, "an input / 입력창");
+    ui_layout(ui, W, H);
+}
+
+fun main() {
+    var ui: Ui = ui_new();
+    var t: Theme = ui_theme_copy(&ui);
+    theme_dark(&t);
+    ui_set_theme(&ui, &t);
+    build(&ui);
+    ui_focus_next(&ui, false);          // the first button
+    ui_focus_next(&ui, false);          // the second one: a focus ring appears around it
+    build(&ui);
+    var pixels: ptr<u8> = mem_alloc((W * H * 4) as i64);
+    ui_render(&ui, pixels, W, H);
+    var n: i32 = W * H;
+    var rgb: ptr<u8> = mem_alloc((n * 3) as i64);
+    var i: i32 = 0;
+    while (i < n) {
+        rgb[i * 3] = pixels[i * 4 + 2];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4];
+        i += 1;
+    }
+    var header: str = "P6\n320 260\n255\n";
+    var hp: ptr<u8> = header as ptr<u8>;
+    var hlen: i64 = 0;
+    while (hp[hlen] != 0) { hlen += 1; }
+    var total: i64 = hlen + (n as i64) * 3;
+    var img: ptr<u8> = mem_alloc(total);
+    var k: i64 = 0;
+    while (k < hlen) { img[k] = hp[k]; k += 1; }
+    var j: i64 = 0;
+    while (j < (n as i64) * 3) { img[hlen + j] = rgb[j]; j += 1; }
+    write("build/theme.ppm", img, total);
+    mem_free(img, total);
+    mem_free(rgb, (n * 3) as i64);
+    mem_free(pixels, (W * H * 4) as i64);
+    ui_free(&ui);
+    println("wrote build/theme.ppm");
+}

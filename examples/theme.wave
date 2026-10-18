@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Themes: one set of widgets, restyled at run time. The buttons switch between the
+// light and the dark theme, change the accent colour and make the corners round
+// or square; Tab moves the keyboard focus (a ring shows it) and Enter / Space
+// press the focused button. Esc quits.
+// Run with:  WUI_RUN=theme wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Window, WinEvent, Theme, ui_new, ui_free, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_checkbox,
+                ui_input, ui_scroll_box, ui_layout, ui_align, ui_grow, ui_gap, ui_padding, ui_background, ui_border,
+                ui_click, ui_drag, ui_release, ui_set_pointer, ui_scroll, ui_feed_text, ui_activated, ui_theme_copy,
+                ui_set_theme, theme_light, theme_dark,
+                win_open, win_ok, win_close, win_next_timeout, ui_wake_ms, win_text, win_draw, win_pending, win_width, win_height, win_feed_key,
+                UI_ROOT, UI_NO_MSG, UI_STRETCH, UI_ACTIVATED,
+                EV_CLOSE, EV_EXPOSE, EV_MOVE, EV_DOWN, EV_UP, EV_WHEEL, EV_TEXT, EV_KEY, KEY_ESCAPE};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+const MSG_LIGHT: i32 = 1;
+const MSG_DARK: i32 = 2;
+const MSG_GREEN: i32 = 3;
+const MSG_BLUE: i32 = 4;
+const MSG_ROUND: i32 = 5;
+const MSG_SQUARE: i32 = 6;
+const MSG_CHECK: i32 = 7;
+
+struct Model {
+    ticked: bool;
+}
+
+// Applies a button to the Ui's theme: copy it, change it, set it.
+fun update(ui: ptr<Ui>, m: ptr<Model>, msg: i32) {
+    var t: Theme = ui_theme_copy(ui);
+    if (msg == MSG_LIGHT) { theme_light(&t); }
+    if (msg == MSG_DARK) { theme_dark(&t); }
+    if (msg == MSG_GREEN) { t.accent = 0xFF22C55E; t.field_focus = 0xFF22C55E; }
+    if (msg == MSG_BLUE) { t.accent = 0xFF3B82F6; t.field_focus = 0xFF3B82F6; }
+    if (msg == MSG_ROUND) { t.radius_button = 14; t.radius_field = 14; t.radius_check = 8; }
+    if (msg == MSG_SQUARE) { t.radius_button = 0; t.radius_field = 0; t.radius_check = 0; }
+    if (msg == MSG_CHECK) { m.ticked = !m.ticked; }
+    ui_set_theme(ui, &t);
+}
+
+fun view(ui: ptr<Ui>, m: ptr<Model>, w: i32, h: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 16, 10);
+    ui_align(ui, page, UI_STRETCH);
+    ui_text(ui, page, "Theme / 테마");
+    var row1: i32 = ui_row(ui, page, 0, 8);
+    ui_button(ui, row1, "Light", MSG_LIGHT);
+    ui_button(ui, row1, "Dark", MSG_DARK);
+    var row2: i32 = ui_row(ui, page, 0, 8);
+    ui_button(ui, row2, "Green accent", MSG_GREEN);
+    ui_button(ui, row2, "Blue accent", MSG_BLUE);
+    var row3: i32 = ui_row(ui, page, 0, 8);
+    ui_button(ui, row3, "Round", MSG_ROUND);
+    ui_button(ui, row3, "Square", MSG_SQUARE);
+    ui_checkbox(ui, page, "A checkbox / 체크박스", m.ticked, MSG_CHECK);
+    ui_input(ui, page, 1, "an input / 입력창");
+    var list: i32 = ui_scroll_box(ui, page, 1);
+    ui_grow(ui, list, 1);
+    ui_align(ui, list, UI_STRETCH);
+    ui_padding(ui, list, 8);
+    ui_gap(ui, list, 4);
+    var i: i32 = 0;
+    while (i < 12) {
+        ui_text(ui, list, "a line in a scroll box / 스크롤 상자의 한 줄");
+        i += 1;
+    }
+    ui_layout(ui, w, h);
+}
+
+fun main() {
+    var win: Window = win_open("wui theme", 360, 520);
+    if (!win_ok(&win)) {
+        println("cannot open a window (no X display or libX11)");
+        return;
+    }
+    var ui: Ui = ui_new();
+    var model: Model = Model { ticked: true };
+    var piece: ptr<u8> = mem_alloc(64);
+    var ev: WinEvent = WinEvent { kind: 0, x: 0, y: 0, a: 0, width: 0, height: 0, mods: 0 };
+    view(&ui, &model, win_width(&win), win_height(&win));
+    win_draw(&win, &ui);
+
+    var running: bool = true;
+    var down: bool = false;
+    while (running) {
+        // wakes up by itself when the caret of the focused input has to blink (EV_TIMEOUT: just redraw)
+        var kind: i32 = win_next_timeout(&win, &ev, ui_wake_ms(&ui));
+        if (kind == EV_CLOSE) {
+            running = false;
+        } else {
+            if (kind == EV_DOWN && ev.a == 1) {
+                down = true;
+                var msg: i32 = ui_click(&ui, ev.x, ev.y, ev.mods);
+                if (msg != UI_NO_MSG) { update(&ui, &model, msg); }
+            }
+            if (kind == EV_UP && ev.a == 1) { down = false; ui_release(&ui); }
+            if (kind == EV_MOVE) {
+                ui_set_pointer(&ui, ev.x, ev.y, false);
+                if (down) { ui_drag(&ui, ev.x, ev.y); }
+            }
+            if (kind == EV_WHEEL) { ui_scroll(&ui, ev.x, ev.y, ev.a); }
+            if (kind == EV_TEXT) {
+                var n: i64 = win_text(&win, piece, 64);
+                var r: i32 = ui_feed_text(&ui, piece, n);
+                if ((r & UI_ACTIVATED) != 0) { update(&ui, &model, ui_activated(&ui)); }
+            }
+            if (kind == EV_KEY) {
+                if (ev.a == KEY_ESCAPE) { running = false; }
+                var r: i32 = win_feed_key(&win, &ui, ev.a, ev.mods);
+                if ((r & UI_ACTIVATED) != 0) { update(&ui, &model, ui_activated(&ui)); }
+            }
+            if (kind == EV_EXPOSE) {
+                if (!win_pending(&win)) { win_draw(&win, &ui); }
+            } else {
+                view(&ui, &model, win_width(&win), win_height(&win));
+                win_draw(&win, &ui);
+            }
+        }
+    }
+    mem_free(piece, 64);
+    ui_free(&ui);
+    win_close(&win);
+}

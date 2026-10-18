@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The view of the widget gallery (examples/widgets.wave and its headless render): tabs,
+// radio buttons, a checkbox, a slider with a progress bar, a drop-down, a multi-line text
+// input and a modal dialog (an overlay).
+
+import("wui")::{Ui, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_checkbox, ui_radio, ui_tab, ui_slider, ui_slider_get,
+                ui_progress, ui_dropdown, ui_dropdown_get, ui_textarea, ui_overlay, ui_layout, ui_align, ui_justify, ui_grow,
+                ui_background, ui_border, ui_radius, ui_padding, ui_color, ui_width, ui_gap,
+                UI_ROOT, UI_STRETCH, UI_CENTER, OVERLAY_FULL};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+pub const MSG_TAB: i32 = 1;            // + tab number 0..2
+pub const MSG_SIZE: i32 = 10;          // + radio number 0..2
+pub const MSG_CHECK: i32 = 20;
+pub const MSG_ABOUT: i32 = 21;
+pub const MSG_CLOSE: i32 = 22;
+
+pub const ID_SLIDER: i32 = 1;
+pub const ID_DROPDOWN: i32 = 2;
+pub const ID_NOTES: i32 = 3;
+
+pub struct Model {
+    tab: i32;
+    size: i32;                         // the selected radio button
+    ticked: bool;
+    about: bool;                       // the dialog is open
+}
+
+fun put_num(buf: ptr<u8>, at: i32, v: i32) -> i32 {
+    if (v >= 10) {
+        var m: i32 = put_num(buf, at, v / 10);
+        buf[m] = (48 + v % 10) as u8;
+        return m + 1;
+    }
+    buf[at] = (48 + v) as u8;
+    return at + 1;
+}
+
+fun put_str(buf: ptr<u8>, at: i32, s: str) -> i32 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var i: i32 = 0;
+    while (p[i] != 0) { buf[at + i] = p[i]; i += 1; }
+    return at + i;
+}
+
+fun basics(ui: ptr<Ui>, m: ptr<Model>, page: i32) {
+    ui_text(ui, page, "Size / 크기");
+    ui_radio(ui, page, "Small", m.size == 0, MSG_SIZE);
+    ui_radio(ui, page, "Medium", m.size == 1, MSG_SIZE + 1);
+    ui_radio(ui, page, "Large", m.size == 2, MSG_SIZE + 2);
+    ui_checkbox(ui, page, "Notify me / 알림 받기", m.ticked, MSG_CHECK);
+    var buf: ptr<u8> = mem_alloc(48);
+    var v: i32 = ui_slider_get(ui, ID_SLIDER);
+    var n: i32 = put_str(buf, 0, "Volume / 음량: ");
+    n = put_num(buf, n, v);
+    buf[n] = 0;
+    ui_text(ui, page, buf as str);
+    ui_slider(ui, page, ID_SLIDER, 0, 100);
+    ui_progress(ui, page, v, 100);
+    mem_free(buf, 48);
+}
+
+fun choose(ui: ptr<Ui>, page: i32) {
+    ui_text(ui, page, "Colour / 색");
+    ui_dropdown(ui, page, ID_DROPDOWN, "Red / 빨강\nGreen / 초록\nBlue / 파랑\nYellow / 노랑");
+    var pick: i32 = ui_dropdown_get(ui, ID_DROPDOWN);
+    var label: i32 = 0;
+    if (pick == 0) { label = ui_text(ui, page, "You picked red."); ui_color(ui, label, 0xFFB91C1C); }
+    else if (pick == 1) { label = ui_text(ui, page, "You picked green."); ui_color(ui, label, 0xFF15803D); }
+    else if (pick == 2) { label = ui_text(ui, page, "You picked blue."); ui_color(ui, label, 0xFF1E3A8A); }
+    else { label = ui_text(ui, page, "You picked yellow."); ui_color(ui, label, 0xFFA16207); }
+}
+
+fun notes(ui: ptr<Ui>, page: i32) {
+    ui_text(ui, page, "Notes / 메모");
+    ui_textarea(ui, page, ID_NOTES, "type here... Enter starts a new line", 6);
+}
+
+// Builds the page for `m` and lays it out in w x h.
+pub fun widgets_view(ui: ptr<Ui>, m: ptr<Model>, w: i32, h: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 16, 10);
+    ui_align(ui, page, UI_STRETCH);
+    var tabs: i32 = ui_row(ui, page, 0, 4);
+    ui_tab(ui, tabs, "Basics", m.tab == 0, MSG_TAB);
+    ui_tab(ui, tabs, "Choose", m.tab == 1, MSG_TAB + 1);
+    ui_tab(ui, tabs, "Text", m.tab == 2, MSG_TAB + 2);
+    var body: i32 = ui_column(ui, page, 0, 8);
+    ui_grow(ui, body, 1);
+    if (m.tab == 0) { basics(ui, m, body); }
+    else if (m.tab == 1) { choose(ui, body); }
+    else { notes(ui, body); }
+    var foot: i32 = ui_row(ui, page, 0, 8);
+    ui_button(ui, foot, "About / 정보", MSG_ABOUT);
+    if (m.about) {
+        // a modal dialog: a window-sized overlay (it takes every click) with the dialog box centred in it
+        var back: i32 = ui_overlay(ui, UI_ROOT, OVERLAY_FULL, 0, 0);
+        ui_background(ui, back, 0x99000000);
+        ui_align(ui, back, UI_CENTER);
+        ui_justify(ui, back, UI_CENTER);
+        var box: i32 = ui_column(ui, back, 18, 12);
+        ui_background(ui, box, 0xFFFFFFFF);
+        ui_border(ui, box, 0xFFC8C8C8);
+        ui_radius(ui, box, 10);
+        var t: i32 = ui_text(ui, box, "Wui widget gallery");
+        ui_color(ui, t, 0xFF1E3A8A);
+        ui_text(ui, box, "Tabs, radio buttons, slider, progress bar,");
+        ui_text(ui, box, "drop-down, text area and this dialog.");
+        ui_button(ui, box, "OK", MSG_CLOSE);
+    }
+    ui_layout(ui, w, h);
+}

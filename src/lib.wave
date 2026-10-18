@@ -1,0 +1,890 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// wui — a declarative GUI for Wave (Elm style: Model, view, update).
+//
+// Each frame the program rebuilds its view tree from the model:
+//
+//   var ui: Ui = ui_new();
+//   ui_clear(&ui);
+//   var col: i32 = ui_column(&ui, UI_ROOT, 12, 6);
+//   ui_text(&ui, col, "Count: 3");
+//   ui_button(&ui, col, "+", MSG_INC);
+//   ui_layout(&ui);
+//
+// Layout is flexbox-style: every container is a box with a direction, padding,
+// gap, and its children can have a fixed size, a grow share, and be aligned:
+//
+//   var row: i32 = ui_row(&ui, col, 0, 8);
+//   ui_justify(&ui, row, UI_CENTER);      // main axis
+//   ui_align(&ui, row, UI_STRETCH);       // cross axis
+//   ui_grow(&ui, btn, 1);                 // take a share of the free space
+//   ui_layout(&ui, window_width, window_height);   // the root fills the window
+//
+// Buttons carry a message number (>= 0) instead of a callback; ui_hit()
+// returns the message of the button under a point, or UI_NO_MSG. The program
+// handles it in its own `update` and rebuilds the view.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::time::clock")::{time_now_monotonic_ns};
+
+// The window backend of the target: X11 on Linux / FreeBSD (src/window/x11.wave, libX11
+// through extern "C"), Win32 on Windows (src/window/win32.wave over the Rust crate winplat/,
+// which Wave cannot replace: a window procedure needs a function address), Cocoa on macOS
+// (the same winplat crate and the same file, its platform/macos.rs); other targets have none
+// (src/window/none.wave).
+#[target(os="linux")]
+import("./window/x11")::{XW, XEv, TEXT_MAX, x11_new_event, x11_free_event, xw_open, xw_close, xw_width, xw_height, xw_pixels,
+                         xw_pending, xw_next_event, xw_next_event_timeout, xw_dpi_percent, xw_present, xw_clipboard_set, xw_clipboard_get};
+#[target(os="freebsd")]
+import("./window/x11")::{XW, XEv, TEXT_MAX, x11_new_event, x11_free_event, xw_open, xw_close, xw_width, xw_height, xw_pixels,
+                         xw_pending, xw_next_event, xw_next_event_timeout, xw_dpi_percent, xw_present, xw_clipboard_set, xw_clipboard_get};
+#[target(os="windows")]
+import("./window/win32")::{XW, XEv, TEXT_MAX, x11_new_event, x11_free_event, xw_open, xw_close, xw_width, xw_height, xw_pixels,
+                           xw_pending, xw_next_event, xw_next_event_timeout, xw_dpi_percent, xw_present, xw_clipboard_set, xw_clipboard_get};
+#[target(os="macos")]
+import("./window/win32")::{XW, XEv, TEXT_MAX, x11_new_event, x11_free_event, xw_open, xw_close, xw_width, xw_height, xw_pixels,
+                           xw_pending, xw_next_event, xw_next_event_timeout, xw_dpi_percent, xw_present, xw_clipboard_set, xw_clipboard_get};
+import("./core")::{
+    Ctx, core_new, core_free, core_clear, core_column, core_row, core_text, core_button, core_checkbox, core_input,
+    core_input_set, core_input_get, core_input_focus, core_focused, core_click, core_drag, core_release, core_selection,
+    core_text_input, core_key_input, core_box, core_scroll_box, core_scroll, core_scroll_key, core_scroll_set,
+    core_scroll_get, core_textarea, core_dropdown, core_dropdown_set, core_dropdown_get, core_dropdown_open, core_overlay, core_tooltip, core_left, core_menu, core_slider, core_slider_set, core_slider_get, core_radio, core_tab, core_progress, core_set_time, core_wake_ms, core_focus_next, core_activated, core_focused_msg, core_scroll_box_xy, core_scroll_h, core_scroll_set_x, core_scroll_get_x, core_style, core_layout, core_rect, core_set_pointer, core_hit, core_paint, core_changed, core_cmds,
+    core_fe, core_theme, core_set_theme,
+};
+pub import("./theme")::{Theme, theme_light, theme_dark, theme_scale};
+pub import("./dirlist")::{DirList, dirlist_new, dirlist_free, dirlist_read, dirlist_count, dirlist_name, dirlist_is_dir, path_cwd, path_push, path_pop};
+pub import("./core")::{OVERLAY_AT, OVERLAY_BELOW, OVERLAY_ABOVE, OVERLAY_RIGHT, OVERLAY_MATCH_WIDTH, OVERLAY_FULL};
+import("./render")::{render};
+
+pub const UI_ROOT: i32 = -1;      // parent id of the top-level node
+pub const UI_INVALID: i32 = -1;   // returned when a node could not be added
+pub const UI_NO_MSG: i32 = -1;    // no button under the pointer
+pub const UI_NO_INPUT: i32 = -1;  // no input has focus
+
+// Result bits of ui_feed_text / ui_feed_key.
+pub const UI_CHANGED: i32 = 1;    // the focused input's text changed
+pub const UI_SUBMIT: i32 = 2;     // Enter was pressed in the focused input
+pub const UI_COPY: i32 = 4;       // Ctrl+C with a selection (win_feed_key does the copying)
+pub const UI_CUT: i32 = 8;        // Ctrl+X with a selection
+pub const UI_PASTE: i32 = 16;     // Ctrl+V
+pub const UI_ACTIVATED: i32 = 32; // Enter / Space pressed the focused button or checkbox: its message is ui_activated
+pub const UI_FOCUS_MOVED: i32 = 64; // Tab / Shift+Tab moved the keyboard focus
+
+// Style properties (ui_style) and their values.
+pub const UI_P_DIRECTION: i32 = 0;
+pub const UI_P_PADDING: i32 = 1;
+pub const UI_P_GAP: i32 = 2;
+pub const UI_P_WIDTH: i32 = 3;
+pub const UI_P_HEIGHT: i32 = 4;
+pub const UI_P_GROW: i32 = 5;
+pub const UI_P_ALIGN: i32 = 6;
+pub const UI_P_JUSTIFY: i32 = 7;
+pub const UI_P_BACKGROUND: i32 = 8;
+pub const UI_P_BORDER: i32 = 9;
+pub const UI_P_MARGIN: i32 = 10;
+pub const UI_P_RADIUS: i32 = 11;
+pub const UI_P_COLOR: i32 = 12;
+pub const UI_P_FONT_SIZE: i32 = 13;
+pub const UI_P_BOLD: i32 = 14;
+
+pub const UI_COLUMN: i64 = 0;
+pub const UI_ROW: i64 = 1;
+pub const UI_START: i64 = 0;
+pub const UI_CENTER: i64 = 1;
+pub const UI_END: i64 = 2;
+pub const UI_STRETCH: i64 = 3;    // ui_align only
+pub const UI_BETWEEN: i64 = 3;    // ui_justify only
+pub const UI_AUTO: i64 = -1;      // ui_width / ui_height
+
+pub struct Ui {
+    ctx: ptr<Ctx>;
+}
+
+// Event kinds returned by win_next().
+pub const EV_NONE: i32 = 0;
+pub const EV_CLOSE: i32 = 1;    // the user closed the window
+pub const EV_MOVE: i32 = 2;     // pointer moved: x, y
+pub const EV_DOWN: i32 = 3;     // button pressed: x, y, a = button (1 = left)
+pub const EV_UP: i32 = 4;       // button released: x, y, a = button
+pub const EV_RESIZE: i32 = 5;   // window resized: width, height
+pub const EV_EXPOSE: i32 = 6;   // needs a redraw
+pub const EV_KEY: i32 = 7;      // control key / shortcut: a = KEY_* code (or a lower-case letter with Ctrl/Alt)
+pub const EV_TEXT: i32 = 8;     // typed text: fetch it with win_text() (UTF-8, IME-composed text included)
+pub const EV_WHEEL: i32 = 9;   // mouse wheel: x, y = pointer, a = notches (positive = down); pass them to ui_scroll
+pub const EV_TIMEOUT: i32 = 11; // win_next_timeout: nothing happened within the time
+pub const EV_HWHEEL: i32 = 10; // horizontal wheel (touchpad, tilt wheel): a = notches (positive = right); pass them to ui_scroll_h
+
+// Key codes (EV_KEY, WinEvent.a) - the same on every OS.
+pub const KEY_BACKSPACE: i32 = 8;
+pub const KEY_TAB: i32 = 9;
+pub const KEY_ENTER: i32 = 13;
+pub const KEY_ESCAPE: i32 = 27;
+pub const KEY_DELETE: i32 = 127;
+pub const KEY_LEFT: i32 = 1001;
+pub const KEY_RIGHT: i32 = 1002;
+pub const KEY_UP: i32 = 1003;
+pub const KEY_DOWN: i32 = 1004;
+pub const KEY_HOME: i32 = 1005;
+pub const KEY_END: i32 = 1006;
+pub const KEY_PAGE_UP: i32 = 1007;
+pub const KEY_PAGE_DOWN: i32 = 1008;
+
+// Modifier bits (WinEvent.mods) of pointer and key events.
+pub const MOD_SHIFT: i32 = 1;
+pub const MOD_CTRL: i32 = 2;
+pub const MOD_ALT: i32 = 4;
+
+pub struct Window {
+    x: ptr<XW>;                  // the backend's window, null when there is none
+    ev: ptr<XEv>;                // scratch for the event being read
+    text: ptr<u8>;               // the text of the last EV_TEXT event
+    text_len: i32;
+    needs_present: bool;         // the screen lost or never got the current picture
+}
+
+pub struct WinEvent {
+    kind: i32;
+    x: i32;
+    y: i32;
+    a: i32;
+    width: i32;
+    height: i32;
+    mods: i32;
+}
+
+pub struct UiRect {
+    x: i32;
+    y: i32;
+    w: i32;
+    h: i32;
+}
+
+fun _cstr_len(s: ptr<u8>) -> i64 {
+    if (s == null) {
+        return 0;
+    }
+    var i: i64 = 0;
+    while (s[i] != 0) {
+        i += 1;
+    }
+    return i;
+}
+
+pub fun ui_version() -> str { return "0.1.0"; }
+
+pub fun ui_new() -> Ui { return Ui { ctx: core_new(null) }; }
+
+pub fun ui_free(ui: ptr<Ui>) {
+    core_free(ui.ctx);
+    ui.ctx = null;
+}
+
+// Starts a new frame: drops the previous tree.
+pub fun ui_clear(ui: ptr<Ui>) { core_clear(ui.ctx); }
+
+pub fun ui_column(ui: ptr<Ui>, parent: i32, padding: i32, spacing: i32) -> i32 {
+    return core_column(ui.ctx, parent, padding, spacing);
+}
+
+pub fun ui_row(ui: ptr<Ui>, parent: i32, padding: i32, spacing: i32) -> i32 {
+    return core_row(ui.ctx, parent, padding, spacing);
+}
+
+pub fun ui_text(ui: ptr<Ui>, parent: i32, text: str) -> i32 {
+    var p: ptr<u8> = text as ptr<u8>;
+    return core_text(ui.ctx, parent, p, _cstr_len(p));
+}
+
+pub fun ui_button(ui: ptr<Ui>, parent: i32, text: str, msg: i32) -> i32 {
+    var p: ptr<u8> = text as ptr<u8>;
+    return core_button(ui.ctx, parent, p, _cstr_len(p), msg);
+}
+
+// A tooltip for node `id` (any widget or container): a small box with `text` that appears
+// next to the pointer once it has rested on the node for half a second, and goes away when
+// the pointer leaves or clicks. It needs the clock (win_draw sets it; a headless program
+// calls ui_set_time) and ui_wake_ms to wake the loop up in time.
+pub fun ui_tooltip(ui: ptr<Ui>, id: i32, text: str) {
+    var p: ptr<u8> = text as ptr<u8>;
+    core_tooltip(ui.ctx, id, p, _cstr_len(p));
+}
+
+// A container (vertical, no padding); see ui_direction/ui_padding/ui_gap.
+pub fun ui_box(ui: ptr<Ui>, parent: i32) -> i32 { return core_box(ui.ctx, parent); }
+
+// ---- overlays -------------------------------------------------------------------------
+//
+// An overlay is a box that floats above everything else - a dialog, a menu, a tooltip.
+// It is laid out after the main tree (at a window position, or next to another node),
+// painted last, and takes every click and wheel turn over its area; Tab stays inside
+// the topmost one. Build it like any box, with the returned id as the parent:
+//
+//   var menu: i32 = ui_overlay(&ui, button, OVERLAY_BELOW, 0, 4);
+//   ui_button(&ui, menu, "Open", MSG_OPEN);
+//   ui_button(&ui, menu, "Save", MSG_SAVE);
+//
+// An overlay as big as the window (OVERLAY_FULL, with a background colour if you like)
+// is a modal backdrop: nothing below it can be clicked; put the dialog box inside it
+// (ui_align / ui_justify centre it). `anchor` is a node of the main tree; the placements are OVERLAY_AT
+// (window position dx, dy), OVERLAY_BELOW, OVERLAY_ABOVE, OVERLAY_RIGHT (against the
+// anchor, moved by dx, dy), and OVERLAY_MATCH_WIDTH can be added to make it at least as
+// wide as the anchor. It is moved back inside the window when it would stick out.
+// (UI_ROOT as the anchor means none.)
+pub fun ui_overlay(ui: ptr<Ui>, anchor: i32, placement: i32, dx: i32, dy: i32) -> i32 {
+    return core_overlay(ui.ctx, anchor, placement, dx, dy);
+}
+
+// ---- scrolling -----------------------------------------------------------------
+//
+// A scroll box is a column whose content may be taller than the box: it is
+// clipped, scrolled with the mouse wheel and shows a scrollbar. Pick an id
+// (>= 0) per scroll box and keep it the same every frame - the offset lives in
+// the library under that id, like an input's text. Give the box a height
+// (ui_height) or let it take the free space (ui_grow):
+//
+//   var list: i32 = ui_scroll_box(&ui, page, ID_LIST);
+//   ui_grow(&ui, list, 1);
+//   ...                                        // children as in any box
+//   if (kind == EV_WHEEL) { ui_scroll(&ui, ev.x, ev.y, ev.a); }   // then rebuild + redraw
+
+pub fun ui_scroll_box(ui: ptr<Ui>, parent: i32, scroll_id: i32) -> i32 {
+    return core_scroll_box(ui.ctx, parent, scroll_id);
+}
+
+// Like ui_scroll_box, but the box also scrolls sideways when its content is
+// wider than it (a horizontal scrollbar along the bottom edge, ui_scroll_h, the
+// Left / Right keys). It needs a width as well as a height: stretch it in a
+// column (ui_align(parent, UI_STRETCH)), grow it in a row, or ui_width it.
+pub fun ui_scroll_box_xy(ui: ptr<Ui>, parent: i32, scroll_id: i32) -> i32 {
+    return core_scroll_box_xy(ui.ctx, parent, scroll_id);
+}
+
+// The horizontal wheel turned `notches` (positive = right) over (x, y) - pass
+// EV_HWHEEL events here, and EV_WHEEL events with Shift held (MOD_SHIFT in
+// WinEvent.mods) too: scrolls the innermost sideways-scrolling box there that
+// can still move. Returns true when something scrolled.
+pub fun ui_scroll_h(ui: ptr<Ui>, x: i32, y: i32, notches: i32) -> bool {
+    return core_scroll_h(ui.ctx, x, y, notches) != 0;
+}
+
+// The wheel turned `notches` (positive = down) over (x, y): scrolls the
+// innermost scroll box there that can still move. Returns true when something
+// scrolled (the view needs rebuilding).
+pub fun ui_scroll(ui: ptr<Ui>, x: i32, y: i32, notches: i32) -> bool {
+    return core_scroll(ui.ctx, x, y, notches) != 0;
+}
+
+// A scroll key: KEY_UP / KEY_DOWN scroll a step, KEY_PAGE_UP / KEY_PAGE_DOWN a
+// page, KEY_HOME / KEY_END jump to the ends, KEY_LEFT / KEY_RIGHT scroll a step
+// sideways (ui_scroll_box_xy boxes). The scroll box under the pointer
+// moves (else the first one that can). Returns true when something scrolled.
+// win_feed_key calls this for you whenever the key is not meant for an input.
+pub fun ui_scroll_key(ui: ptr<Ui>, key: i32) -> bool { return core_scroll_key(ui.ctx, key) != 0; }
+
+// Sets a scroll box's offset in pixels; a huge value scrolls to the end.
+pub fun ui_scroll_set(ui: ptr<Ui>, scroll_id: i32, offset: i32) { core_scroll_set(ui.ctx, scroll_id, offset); }
+
+// The horizontal offset of a scroll box made with ui_scroll_box_xy.
+pub fun ui_scroll_set_x(ui: ptr<Ui>, scroll_id: i32, offset: i32) { core_scroll_set_x(ui.ctx, scroll_id, offset); }
+pub fun ui_scroll_get_x(ui: ptr<Ui>, scroll_id: i32) -> i32 { return core_scroll_get_x(ui.ctx, scroll_id); }
+
+// A scroll box's offset in pixels as of the last layout, or -1 if unknown.
+pub fun ui_scroll_get(ui: ptr<Ui>, scroll_id: i32) -> i32 { return core_scroll_get(ui.ctx, scroll_id); }
+
+// Sets one style property of a node. Returns false for a bad node/property.
+pub fun ui_style(ui: ptr<Ui>, id: i32, prop: i32, value: i64) -> bool {
+    return core_style(ui.ctx, id, prop, value) != 0;
+}
+
+pub fun ui_direction(ui: ptr<Ui>, id: i32, dir: i64) -> bool { return ui_style(ui, id, UI_P_DIRECTION, dir); }
+pub fun ui_padding(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_PADDING, px); }
+pub fun ui_gap(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_GAP, px); }
+pub fun ui_width(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_WIDTH, px); }
+pub fun ui_height(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_HEIGHT, px); }
+pub fun ui_grow(ui: ptr<Ui>, id: i32, share: i64) -> bool { return ui_style(ui, id, UI_P_GROW, share); }
+pub fun ui_align(ui: ptr<Ui>, id: i32, a: i64) -> bool { return ui_style(ui, id, UI_P_ALIGN, a); }
+pub fun ui_justify(ui: ptr<Ui>, id: i32, j: i64) -> bool { return ui_style(ui, id, UI_P_JUSTIFY, j); }
+// Colors are 0xAARRGGBB; 0 means none.
+pub fun ui_background(ui: ptr<Ui>, id: i32, argb: i64) -> bool { return ui_style(ui, id, UI_P_BACKGROUND, argb); }
+pub fun ui_border(ui: ptr<Ui>, id: i32, argb: i64) -> bool { return ui_style(ui, id, UI_P_BORDER, argb); }
+// Space around the node, on all sides; it counts in the parent's layout.
+pub fun ui_margin(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_MARGIN, px); }
+// Corner radius in pixels (boxes are square by default; buttons, inputs and
+// checkboxes have a small default radius, -1 restores it).
+pub fun ui_radius(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_RADIUS, px); }
+// Text colour (0xAARRGGBB). It is inherited: set it on a box and everything
+// inside uses it unless a child sets its own.
+pub fun ui_color(ui: ptr<Ui>, id: i32, argb: i64) -> bool { return ui_style(ui, id, UI_P_COLOR, argb); }
+
+// Text size in pixels for this node and everything inside it (0 = inherit; the default is
+// Theme.font_size, 16). Boxes, buttons, inputs and the rest measure and draw with it.
+pub fun ui_font_size(ui: ptr<Ui>, id: i32, px: i64) -> bool { return ui_style(ui, id, UI_P_FONT_SIZE, px); }
+// Bold text for this node and everything inside it (false = regular again, even inside a bold parent).
+pub fun ui_bold(ui: ptr<Ui>, id: i32, bold: bool) -> bool {
+    if (bold) { return ui_style(ui, id, UI_P_BOLD, 1); }
+    return ui_style(ui, id, UI_P_BOLD, 0);
+}
+
+// A checkbox with a label. `checked` is the app's current state; a click
+// yields `msg` through ui_click / ui_hit, and the app flips its state:
+//
+//   ui_checkbox(&ui, col, "Subscribe", model.subscribed, MSG_SUBSCRIBE);
+pub fun ui_checkbox(ui: ptr<Ui>, parent: i32, label: str, checked: bool, msg: i32) -> i32 {
+    var p: ptr<u8> = label as ptr<u8>;
+    return core_checkbox(ui.ctx, parent, p, _cstr_len(p), checked, msg);
+}
+
+// A radio button: a round checkbox for "one of several". `selected` is the app's state;
+// a click (or Enter / Space on the focused one) yields `msg`, the app selects that
+// choice and rebuilds. Tab walks through the choices (give each its own message).
+pub fun ui_radio(ui: ptr<Ui>, parent: i32, label: str, selected: bool, msg: i32) -> i32 {
+    var p: ptr<u8> = label as ptr<u8>;
+    return core_radio(ui.ctx, parent, p, _cstr_len(p), selected, msg);
+}
+
+// A tab: a flat button that marks the `selected` one with an underline. The app keeps
+// which tab is selected and shows the matching content.
+pub fun ui_tab(ui: ptr<Ui>, parent: i32, label: str, selected: bool, msg: i32) -> i32 {
+    var p: ptr<u8> = label as ptr<u8>;
+    return core_tab(ui.ctx, parent, p, _cstr_len(p), selected, msg);
+}
+
+// A progress bar showing `value` of `max` (the app's numbers; the bar is not interactive).
+// It is as wide as an input unless you ui_width / ui_grow / stretch it.
+pub fun ui_progress(ui: ptr<Ui>, parent: i32, value: i32, max: i32) -> i32 {
+    return core_progress(ui.ctx, parent, value, max);
+}
+
+// A slider for a whole number from `min` to `max`. Its value lives in the Ui under
+// `slider_id` (like an input's text, and in the same id space: pick numbers no input
+// uses): it starts at `min`; a click or drag moves it, and so do Left / Right, Home /
+// End and PageUp / PageDown while it has the keyboard focus. Read it with
+// ui_slider_get - in your view, every frame, no message needed.
+pub fun ui_slider(ui: ptr<Ui>, parent: i32, slider_id: i32, min: i32, max: i32) -> i32 {
+    return core_slider(ui.ctx, parent, slider_id, min, max);
+}
+pub fun ui_slider_set(ui: ptr<Ui>, slider_id: i32, value: i32) { core_slider_set(ui.ctx, slider_id, value); }
+pub fun ui_slider_get(ui: ptr<Ui>, slider_id: i32) -> i32 { return core_slider_get(ui.ctx, slider_id); }
+
+// A multi-line text input, `rows` lines tall (ui_height / ui_grow change that). It is an input
+// in every other respect - its text lives in the Ui under `input_id` (ui_input_get /
+// ui_input_set, newlines included); selection, clipboard, focus and the caret work the same.
+// Enter types a newline (Ctrl+Enter reports UI_SUBMIT); Up / Down move between lines; Home / End go
+// to the start / end of the line (with Ctrl: of the text); PageUp / PageDown move a page; the wheel
+// scrolls it. Lines are not wrapped: a long one scrolls sideways.
+pub fun ui_textarea(ui: ptr<Ui>, parent: i32, input_id: i32, placeholder: str, rows: i32) -> i32 {
+    var p: ptr<u8> = placeholder as ptr<u8>;
+    return core_textarea(ui.ctx, parent, input_id, p, _cstr_len(p), rows);
+}
+
+// A drop-down: a box showing the chosen option; a click (or Enter / Space with the keyboard
+// focus) opens the list of options under it. `options` is one text, the options separated
+// by newlines: "Red\nGreen\nBlue". The choice - the number of the option, from 0 - lives in
+// the Ui under `dropdown_id` (the id space of inputs and sliders): read it with
+// ui_dropdown_get in your view, set it with ui_dropdown_set. While the list is closed Up /
+// Down change the choice; while it is open they move the highlight, Enter picks it and
+// Escape closes the list (win_feed_key delivers all of that).
+pub fun ui_dropdown(ui: ptr<Ui>, parent: i32, dropdown_id: i32, options: str) -> i32 {
+    var p: ptr<u8> = options as ptr<u8>;
+    return core_dropdown(ui.ctx, parent, dropdown_id, p, _cstr_len(p));
+}
+pub fun ui_dropdown_set(ui: ptr<Ui>, dropdown_id: i32, index: i32) { core_dropdown_set(ui.ctx, dropdown_id, index); }
+pub fun ui_dropdown_get(ui: ptr<Ui>, dropdown_id: i32) -> i32 { return core_dropdown_get(ui.ctx, dropdown_id); }
+// The id of the drop-down whose list is open, or UI_NO_INPUT.
+pub fun ui_dropdown_open(ui: ptr<Ui>) -> i32 { return core_dropdown_open(ui.ctx); }
+
+// ---- menus ---------------------------------------------------------------------------
+//
+// A menu bar is a row of menus. Each menu is a flat label that opens a list of items; picking
+// an item yields a message, like a button: ui_click returns it for the mouse, ui_activated() for
+// the keyboard (UI_ACTIVATED in the result of ui_feed_key / win_feed_key). While one menu is open,
+// moving the pointer over another opens that one; Left / Right do the same from the keyboard.
+//
+//   var bar: i32 = ui_menu_bar(&ui, page);
+//   ui_menu(&ui, bar, MENU_FILE, "File\nOpen\nSave\n-\nQuit", MSG_FILE);   // MSG_FILE + 0 = Open, + 1 = Save, + 3 = Quit
+//   ui_menu(&ui, bar, MENU_EDIT, "Edit\nCopy\nPaste", MSG_EDIT);
+
+// The row that holds the menus; give it ui_align(page, UI_STRETCH) in its parent to span the window.
+pub fun ui_menu_bar(ui: ptr<Ui>, parent: i32) -> i32 {
+    var bar: i32 = core_row(ui.ctx, parent, 2, 2);
+    ui_background(ui, bar, core_theme(ui.ctx).field as i64);
+    return bar;
+}
+
+// A menu. `items` is the label, then the items, one per line; a line of "-" is a separator.
+// Picking item number k (counted from 0 after the label, separators included) yields msg_base + k.
+// `menu_id` (>= 0) is a control id in the space of inputs, sliders and drop-downs.
+pub fun ui_menu(ui: ptr<Ui>, parent: i32, menu_id: i32, items: str, msg_base: i32) -> i32 {
+    var p: ptr<u8> = items as ptr<u8>;
+    return core_menu(ui.ctx, parent, menu_id, p, _cstr_len(p), msg_base);
+}
+
+// ---- tree ----------------------------------------------------------------------------
+//
+// A tree is a column of indented rows; the app keeps which nodes are expanded and which is
+// selected, and only builds the rows of expanded nodes. A row has a +/- marker (a button that
+// yields msg_toggle) and a label (a flat button that yields msg_select, underlined while
+// `selected`).
+//
+//   ui_tree_item(&ui, col, 0, "src", UI_EXPANDED, false, MSG_TOGGLE + 0, MSG_PICK + 0);
+//   ui_tree_item(&ui, col, 1, "core.wave", UI_LEAF, sel == 1, UI_NO_MSG, MSG_PICK + 1);
+
+pub const UI_LEAF: i32 = 0;               // no children: no marker
+pub const UI_COLLAPSED: i32 = 1;          // "+"
+pub const UI_EXPANDED: i32 = 2;           // "-"
+pub const UI_TREE_INDENT: i32 = 18;       // pixels per level
+
+pub fun ui_tree_item(ui: ptr<Ui>, parent: i32, depth: i32, label: str, state: i32, selected: bool, msg_toggle: i32, msg_select: i32) -> i32 {
+    var row: i32 = core_row(ui.ctx, parent, 0, 2);
+    if (row == UI_INVALID) { return UI_INVALID; }
+    ui_align(ui, row, UI_CENTER);
+    var pad: i32 = core_box(ui.ctx, row);
+    ui_width(ui, pad, (depth * UI_TREE_INDENT) as i64);
+    ui_height(ui, pad, 1);
+    if (state == UI_LEAF) {
+        var gap: i32 = core_box(ui.ctx, row);
+        ui_width(ui, gap, 22);
+        ui_height(ui, gap, 1);
+    } else {
+        var m: str = "+";
+        if (state == UI_EXPANDED) { m = "-"; }
+        var mp: ptr<u8> = m as ptr<u8>;
+        var mk: i32 = core_tab(ui.ctx, row, mp, _cstr_len(mp), false, msg_toggle);
+        ui_width(ui, mk, 22);
+    }
+    var lp: ptr<u8> = label as ptr<u8>;
+    var lb: i32 = core_tab(ui.ctx, row, lp, _cstr_len(lp), selected, msg_select);
+    core_left(ui.ctx, lb);
+    return row;
+}
+
+// ---- tables --------------------------------------------------------------------------
+//
+// A table is rows of cells with fixed widths, so the columns line up. Put the rows in a scroll
+// box (ui_scroll_box_xy) when there are many. Text wider than its cell is cut at the cell edge.
+//
+//   var head: i32 = ui_table_row(&ui, col, -1);           // -1 = the header row
+//   ui_cell(&ui, head, "Name", 160);  ui_cell(&ui, head, "Size", 80);
+//   var r: i32 = ui_table_row(&ui, col, i);                // i = the row's number: even and odd rows differ
+//   ui_cell_button(&ui, r, "main.wave", 160, MSG_ROW + i); ui_cell(&ui, r, "4 KB", 80);
+
+pub fun ui_table_row(ui: ptr<Ui>, parent: i32, index: i32) -> i32 {
+    var row: i32 = core_row(ui.ctx, parent, 0, 0);
+    if (row == UI_INVALID) { return UI_INVALID; }
+    ui_align(ui, row, UI_CENTER);
+    if (index < 0) {                                   // the header
+        ui_background(ui, row, core_theme(ui.ctx).button as i64);
+        ui_bold(ui, row, true);
+    } else if (index % 2 == 1) {
+        ui_background(ui, row, core_theme(ui.ctx).field as i64);
+    }
+    return row;
+}
+
+// A text cell `width` pixels wide (its text is indented 4 px, like the label of a ui_cell_button).
+pub fun ui_cell(ui: ptr<Ui>, row: i32, text: str, width: i32) -> i32 {
+    var cell: i32 = ui_text(ui, row, text);
+    ui_width(ui, cell, (width - 8) as i64);            // 4 px of margin each side: the cell is `width` wide in all
+    ui_margin(ui, cell, 4);
+    return cell;
+}
+
+// A cell that is a flat button yielding `msg`: make one per row to select it.
+pub fun ui_cell_button(ui: ptr<Ui>, row: i32, text: str, width: i32, msg: i32) -> i32 {
+    var p: ptr<u8> = text as ptr<u8>;
+    var cell: i32 = core_tab(ui.ctx, row, p, _cstr_len(p), false, msg);
+    core_left(ui.ctx, cell);
+    ui_width(ui, cell, width as i64);
+    return cell;
+}
+
+
+// ---- dialogs and file lists ------------------------------------------------------------
+//
+// A dialog is an overlay: it dims the window and takes every click (and Tab) until the app stops
+// building it. Fill the returned box with anything; closing it is up to the app (a button whose
+// message clears the model's "dialog open" flag).
+//
+//   if (m.about) {
+//       var box: i32 = ui_dialog(&ui, 0);
+//       ui_text(&ui, box, "Wui");
+//       ui_button(&ui, box, "OK", MSG_CLOSE);
+//   }
+//
+// A file picker is a dialog with a ui_file_list in it. DirList (dirlist.wave) reads a directory,
+// folders first; path_cwd / path_push / path_pop walk the path:
+//
+//   dirlist_read(&m.list, m.path);                       // when the path changes
+//   ui_file_list(&ui, box, ID_FILES, &m.list, m.selected, MSG_ENTRY);   // entry i yields MSG_ENTRY + i
+
+// A modal dialog box (centred, `width` px wide, 0 = as wide as its content). Returns the box.
+pub fun ui_dialog(ui: ptr<Ui>, width: i32) -> i32 {
+    var back: i32 = core_overlay(ui.ctx, UI_ROOT, OVERLAY_FULL, 0, 0);
+    ui_background(ui, back, 0x99000000);
+    ui_align(ui, back, UI_CENTER);
+    ui_justify(ui, back, UI_CENTER);
+    var t: ptr<Theme> = core_theme(ui.ctx);
+    var box: i32 = core_column(ui.ctx, back, 18, 10);
+    ui_background(ui, box, t.bg as i64);
+    ui_border(ui, box, t.border as i64);
+    ui_radius(ui, box, 10);
+    if (width > 0) { ui_width(ui, box, width as i64); }
+    return box;
+}
+
+// A scroll box (id `scroll_id`) with one row per entry of `list`: folders get a "dir" tag. Clicking
+// entry i yields msg_base + i; `selected` (-1 for none) is underlined. Give it a height.
+pub fun ui_file_list(ui: ptr<Ui>, parent: i32, scroll_id: i32, list: ptr<DirList>, selected: i32, msg_base: i32) -> i32 {
+    var box: i32 = core_scroll_box(ui.ctx, parent, scroll_id);
+    if (box == UI_INVALID) { return UI_INVALID; }
+    ui_align(ui, box, UI_STRETCH);
+    ui_background(ui, box, core_theme(ui.ctx).field as i64);
+    ui_border(ui, box, core_theme(ui.ctx).border as i64);
+    var i: i32 = 0;
+    while (i < dirlist_count(list)) {
+        var row: i32 = core_row(ui.ctx, box, 0, 0);
+        ui_align(ui, row, UI_CENTER);
+        var tag_text: str = "";
+        var tag_len: i64 = 0;
+        if (dirlist_is_dir(list, i)) { tag_text = "dir"; tag_len = 3; }
+        var tag: i32 = core_text(ui.ctx, row, tag_text as ptr<u8>, tag_len);
+        ui_color(ui, tag, core_theme(ui.ctx).placeholder as i64);
+        ui_width(ui, tag, 36);
+        ui_margin(ui, tag, 4);
+        var name: ptr<u8> = dirlist_name(list, i) as ptr<u8>;
+        var label: i32 = core_tab(ui.ctx, row, name, _cstr_len(name), i == selected, msg_base + i);
+        core_left(ui.ctx, label);
+        ui_grow(ui, label, 1);
+        i += 1;
+    }
+    return box;
+}
+
+
+// ---- inputs --------------------------------------------------------------------
+//
+// An input is a single-line text field. Pick an id (>= 0) per input and keep
+// it the same every frame: the text and caret live in the library under that
+// id, so rebuilding the view tree does not lose them.
+//
+//   ui_input(&ui, col, ID_NAME, "your name");     // in view()
+//   ...
+//   var msg: i32 = ui_click(&ui, ev.x, ev.y);     // on EV_DOWN: focuses inputs, returns button msgs
+//   ui_feed_text(&ui, buf, n);                    // on EV_TEXT (text from win_text)
+//   ui_feed_key(&ui, ev.a);                       // on EV_KEY: Backspace, Delete, arrows, Home, End, Enter
+//   var n: i64 = ui_input_get(&ui, ID_NAME, buf, cap);   // read it back
+
+pub fun ui_input(ui: ptr<Ui>, parent: i32, input_id: i32, placeholder: str) -> i32 {
+    var p: ptr<u8> = placeholder as ptr<u8>;
+    return core_input(ui.ctx, parent, input_id, p, _cstr_len(p));
+}
+
+// Replaces the text of an input; the caret goes to the end.
+pub fun ui_input_set(ui: ptr<Ui>, input_id: i32, text: str) -> bool {
+    var p: ptr<u8> = text as ptr<u8>;
+    return core_input_set(ui.ctx, input_id, p, _cstr_len(p)) != 0;
+}
+
+// Copies the text into buf (NUL-terminated UTF-8); returns its byte length,
+// or -1 if the input is unknown or cap is too small.
+pub fun ui_input_get(ui: ptr<Ui>, input_id: i32, buf: ptr<u8>, cap: i64) -> i64 {
+    return core_input_get(ui.ctx, input_id, buf, cap);
+}
+
+pub fun ui_input_focus(ui: ptr<Ui>, input_id: i32) {
+    ui_set_time(ui, win_time_ms());
+    core_input_focus(ui.ctx, input_id);
+}
+
+// Id of the focused input, or UI_NO_INPUT.
+pub fun ui_focused(ui: ptr<Ui>) -> i32 { return core_focused(ui.ctx); }
+
+// ---- theme --------------------------------------------------------------------------
+//
+// The look of the built-in widgets (colours, radii, paddings, scrollbar size) lives in a
+// Theme (theme.wave). Start from theme_light or theme_dark, change what you like, set it:
+//
+//   var t: Theme = ui_theme_copy(&ui);
+//   theme_dark(&t);
+//   t.accent = 0xFF22C55E;
+//   ui_set_theme(&ui, &t);
+//
+// Styles set on single nodes still win over the theme.
+
+// The Ui's theme, to read or change in place (edits apply from the next layout).
+pub fun ui_theme(ui: ptr<Ui>) -> ptr<Theme> { return core_theme(ui.ctx); }
+
+// Replaces the Ui's theme with a copy of `t`.
+pub fun ui_set_theme(ui: ptr<Ui>, t: ptr<Theme>) { core_set_theme(ui.ctx, t); }
+
+// A copy of the Ui's current theme.
+pub fun ui_theme_copy(ui: ptr<Ui>) -> Theme {
+    var cur: ptr<Theme> = core_theme(ui.ctx);
+    return cur[0];
+}
+
+// ---- time ---------------------------------------------------------------------------
+//
+// The Ui has no clock of its own. win_draw tells it the time before it paints, which is
+// all a window program needs; a headless program calls ui_set_time itself. The text caret
+// of a focused input blinks (Theme.caret_blink_ms), so the picture changes while nothing
+// else happens: ui_wake_ms says when, and win_next_timeout wakes the loop up then:
+//
+//   var kind: i32 = win_next_timeout(&win, &ev, ui_wake_ms(&ui));   // EV_TIMEOUT: just redraw
+
+// Sets the current time in milliseconds (any steady clock; only differences matter).
+pub fun ui_set_time(ui: ptr<Ui>, ms: i64) { core_set_time(ui.ctx, ms); }
+
+// Milliseconds until the picture next changes without input, or -1 when it will not.
+pub fun ui_wake_ms(ui: ptr<Ui>) -> i32 { return core_wake_ms(ui.ctx); }
+
+// ---- keyboard focus ---------------------------------------------------------------
+//
+// Inputs, buttons and checkboxes can have the keyboard focus. Tab / Shift+Tab move it
+// (win_feed_key does that for EV_KEY events), Enter or Space press the focused button
+// or checkbox: ui_feed_key / ui_feed_text / win_feed_key then return UI_ACTIVATED and
+// ui_activated() is the message to handle, just like a click:
+//
+//   var r: i32 = win_feed_key(&win, &ui, ev.a, ev.mods);
+//   if ((r & UI_ACTIVATED) != 0) { update(&ui, &model, ui_activated(&ui)); }
+//
+// Buttons and checkboxes are found again after a rebuild by their message number, so
+// give each focusable one its own message. The focus ring is drawn while the focus
+// came from the keyboard; a mouse click moves the focus without it.
+
+// Moves the focus to the next (or, with `backward`, the previous) focusable widget.
+pub fun ui_focus_next(ui: ptr<Ui>, backward: bool) -> bool {
+    ui_set_time(ui, win_time_ms());
+    return core_focus_next(ui.ctx, backward) != 0;
+}
+
+// The message of the widget the last UI_ACTIVATED pressed, or UI_NO_MSG.
+pub fun ui_activated(ui: ptr<Ui>) -> i32 { return core_activated(ui.ctx); }
+
+// The message of the focused button or checkbox, or UI_NO_MSG (an input may have the focus).
+pub fun ui_focused_msg(ui: ptr<Ui>) -> i32 { return core_focused_msg(ui.ctx); }
+
+// A mouse press (mods = WinEvent.mods): focuses the input under the pointer
+// (or clears focus), puts the caret there - with Shift held the selection grows
+// to it - and returns the message of the button that was hit, or UI_NO_MSG.
+// Keep the button's state yourself and call ui_drag while it is held.
+pub fun ui_click(ui: ptr<Ui>, x: i32, y: i32, mods: i32) -> i32 {
+    ui_set_time(ui, win_time_ms());
+    return core_click(ui.ctx, x, y, mods);
+}
+
+// The pointer moved while the button is held after a press on an input: extends
+// the selection. Returns true when it changed (the view needs redrawing).
+pub fun ui_drag(ui: ptr<Ui>, x: i32, y: i32) -> bool { return core_drag(ui.ctx, x, y) != 0; }
+
+// The mouse button was released: ends the drag.
+pub fun ui_release(ui: ptr<Ui>) { core_release(ui.ctx); }
+
+// The focused input's selected text, NUL-terminated UTF-8, in buf. Returns its
+// length in bytes (0 = nothing selected), or -1 if there is no focus / cap is too small.
+pub fun ui_selection(ui: ptr<Ui>, buf: ptr<u8>, cap: i64) -> i64 { return core_selection(ui.ctx, buf, cap); }
+
+// Typed text (UTF-8, n bytes) for the focused input; returns UI_* bits.
+pub fun ui_feed_text(ui: ptr<Ui>, text: ptr<u8>, n: i64) -> i32 {
+    ui_set_time(ui, win_time_ms());
+    return core_text_input(ui.ctx, text, n);
+}
+
+// A control key for the focused input (KEY_* code, or a lower-case letter with
+// MOD_CTRL), with WinEvent.mods. Editing and selecting happen here: arrows,
+// Home/End and Ctrl+arrows (extending the selection with Shift), Backspace,
+// Delete, Ctrl+A. Returns UI_* bits. UI_COPY / UI_CUT / UI_PASTE are left for
+// the app - or use win_feed_key, which does the clipboard part too.
+pub fun ui_feed_key(ui: ptr<Ui>, key: i32, mods: i32) -> i32 {
+    ui_set_time(ui, win_time_ms());
+    return core_key_input(ui.ctx, key, mods);
+}
+
+// Lays the tree out in a width x height area (usually the window); the root fills it.
+pub fun ui_layout(ui: ptr<Ui>, width: i32, height: i32) { core_layout(ui.ctx, width, height); }
+
+pub fun ui_rect(ui: ptr<Ui>, id: i32) -> UiRect {
+    var rc: array<i32, 4>;
+    rc[0] = 0; rc[1] = 0; rc[2] = 0; rc[3] = 0;
+    core_rect(ui.ctx, id, &rc[0]);
+    return UiRect { x: rc[0], y: rc[1], w: rc[2], h: rc[3] };
+}
+
+pub fun ui_set_pointer(ui: ptr<Ui>, x: i32, y: i32, down: bool) {
+    core_set_pointer(ui.ctx, x, y, down);
+}
+
+// Message of the button at (x, y), or UI_NO_MSG.
+pub fun ui_hit(ui: ptr<Ui>, x: i32, y: i32) -> i32 { return core_hit(ui.ctx, x, y); }
+
+// Paints the current tree into `pixels` (width * height u32, 0xAARRGGBB).
+// Returns false, and leaves `pixels` alone, when the picture is identical to
+// the previous one - so a view that did not change costs almost nothing.
+pub fun ui_render(ui: ptr<Ui>, pixels: ptr<u8>, width: i32, height: i32) -> bool {
+    core_paint(ui.ctx, width, height);
+    if (!core_changed(ui.ctx)) {
+        return false;
+    }
+    var count: i64 = 0;
+    var cmds: ptr<u8> = core_cmds(ui.ctx, &count);
+    render(core_fe(ui.ctx), cmds, count, pixels as ptr<u32>, width, height);
+    return true;
+}
+
+// ---- window ----------------------------------------------------------------
+
+// Opens a window. Check win_ok(): false when there is no display.
+pub fun win_open(title: str, width: i32, height: i32) -> Window {
+    var p: ptr<u8> = title as ptr<u8>;
+    var x: ptr<XW> = xw_open(p, _cstr_len(p), width, height, true);
+    var win: Window = Window { x: x, ev: null, text: null, text_len: 0, needs_present: true };
+    if (x != null) {
+        win.ev = x11_new_event();
+        win.text = mem_alloc((TEXT_MAX + 1) as i64);
+        win.text[0] = 0;
+    }
+    return win;
+}
+
+pub fun win_ok(win: ptr<Window>) -> bool { return win.x != null; }
+
+pub fun win_close(win: ptr<Window>) {
+    if (win.x == null) { return; }
+    xw_close(win.x);
+    x11_free_event(win.ev);
+    mem_free(win.text, (TEXT_MAX + 1) as i64);
+    win.x = null;
+    win.ev = null;
+    win.text = null;
+}
+
+// Blocks until the next event and fills `ev`. Returns the event kind.
+pub fun win_next(win: ptr<Window>, ev: ptr<WinEvent>) -> i32 {
+    if (win.x == null) { return EV_NONE; }
+    var kind: i32 = xw_next_event(win.x, win.ev);
+    var e: ptr<XEv> = win.ev;
+    ev.kind = e.kind; ev.x = e.x; ev.y = e.y;
+    ev.a = e.a; ev.width = e.width; ev.height = e.height; ev.mods = e.mods;
+    if (kind == EV_TEXT) {
+        var i: i32 = 0;
+        while (i < e.text_len) { win.text[i] = e.text[i]; i += 1; }
+        win.text_len = e.text_len;
+    }
+    if (kind == EV_EXPOSE || kind == EV_RESIZE) { win.needs_present = true; }
+    return kind;
+}
+
+// Like win_next, but waits at most `ms` milliseconds: when nothing happens by
+// then it returns EV_TIMEOUT (and `ev` is cleared). The wait costs no CPU. A
+// negative `ms` waits forever, like win_next. Use it for anything that moves
+// without user input - a clock, an animation, a blinking caret:
+//
+//   var kind: i32 = win_next_timeout(&win, &ev, ui_wake_ms(&ui));
+//   if (kind == EV_TIMEOUT) { /* rebuild the view and win_draw it */ }
+pub fun win_next_timeout(win: ptr<Window>, ev: ptr<WinEvent>, ms: i32) -> i32 {
+    if (win.x == null) { return EV_NONE; }
+    if (ms < 0) { return win_next(win, ev); }
+    var kind: i32 = xw_next_event_timeout(win.x, win.ev, ms);
+    var e: ptr<XEv> = win.ev;
+    ev.kind = e.kind; ev.x = e.x; ev.y = e.y;
+    ev.a = e.a; ev.width = e.width; ev.height = e.height; ev.mods = e.mods;
+    if (kind == EV_TEXT) {
+        var i: i32 = 0;
+        while (i < e.text_len) { win.text[i] = e.text[i]; i += 1; }
+        win.text_len = e.text_len;
+    }
+    if (kind == EV_EXPOSE || kind == EV_RESIZE) { win.needs_present = true; }
+    return kind;
+}
+
+// Copies the text of the last EV_TEXT event into `buf` as NUL-terminated UTF-8
+// and returns its length in bytes (0 if `cap` is too small; 33 bytes always fit).
+pub fun win_text(win: ptr<Window>, buf: ptr<u8>, cap: i64) -> i64 {
+    if (win.x == null || buf == null || cap < (win.text_len as i64) + 1) { return 0; }
+    var i: i32 = 0;
+    while (i < win.text_len) { buf[i] = win.text[i]; i += 1; }
+    buf[win.text_len] = 0;
+    return win.text_len as i64;
+}
+
+// System clipboard. win_clipboard_set puts `n` bytes of UTF-8 on it;
+// win_clipboard_get copies its text into buf (NUL-terminated) and returns the
+// length, or -1 if there is no text or cap is too small.
+pub fun win_clipboard_set(win: ptr<Window>, text: ptr<u8>, n: i64) -> bool {
+    if (win.x == null || text == null || n < 0) { return false; }
+    xw_clipboard_set(win.x, text, n);
+    return true;
+}
+
+pub fun win_clipboard_get(win: ptr<Window>, buf: ptr<u8>, cap: i64) -> i64 {
+    if (win.x == null || buf == null) { return -1; }
+    return xw_clipboard_get(win.x, buf, cap);
+}
+
+const CLIP_CAP: i64 = 4200;   // an input holds at most 4096 bytes
+
+// ui_feed_key plus the clipboard: Ctrl+C copies the selection, Ctrl+X cuts it,
+// Ctrl+V pastes. Use this for EV_KEY events instead of ui_feed_key. It also
+// scrolls: PageUp / PageDown always, Up / Down / Home / End / Left / Right when no input has
+// focus (with an input focused they move its caret) - see ui_scroll_key.
+pub fun win_feed_key(win: ptr<Window>, ui: ptr<Ui>, key: i32, mods: i32) -> i32 {
+    var r: i32 = ui_feed_key(ui, key, mods);
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN || ui_focused(ui) == UI_NO_INPUT) {
+        ui_scroll_key(ui, key);
+    }
+    if ((r & UI_COPY) != 0 || (r & UI_CUT) != 0) {
+        var buf: ptr<u8> = mem_alloc(CLIP_CAP);
+        var n: i64 = ui_selection(ui, buf, CLIP_CAP);
+        if (n > 0) { win_clipboard_set(win, buf, n); }
+        mem_free(buf, CLIP_CAP);
+        if ((r & UI_CUT) != 0) {
+            r = r | ui_feed_key(ui, KEY_BACKSPACE, 0);     // cut = copy, then delete the selection
+        }
+    }
+    if ((r & UI_PASTE) != 0) {
+        var text: ptr<u8> = mem_alloc(CLIP_CAP);
+        var n: i64 = win_clipboard_get(win, text, CLIP_CAP);
+        if (n > 0) { r = r | ui_feed_text(ui, text, n); }
+        mem_free(text, CLIP_CAP);
+    }
+    return r;
+}
+
+// How much bigger than normal this screen wants things: 100 at 96 dpi, 150 at 144 dpi, ...
+// (200 on a typical high-resolution laptop). Scale the theme with it - theme_scale(&t, percent) -
+// and your own sizes. Always 100 where the window system does not say.
+pub fun win_dpi_percent(win: ptr<Window>) -> i32 {
+    if (win.x == null) { return 100; }
+    return xw_dpi_percent(win.x);
+}
+
+pub fun win_pending(win: ptr<Window>) -> bool {
+    if (win.x == null) { return false; }
+    return xw_pending(win.x);
+}
+
+// A steady clock in milliseconds (it only goes forward; its zero is arbitrary).
+pub fun win_time_ms() -> i64 { return time_now_monotonic_ns() / 1000000; }
+
+// Renders `ui` into the window's pixel buffer and shows it. Does nothing when
+// the picture did not change, except after an expose / resize, when the
+// existing picture is shown again.
+pub fun win_draw(win: ptr<Window>, ui: ptr<Ui>) {
+    if (win.x == null) { return; }
+    ui_set_time(ui, win_time_ms());
+    var changed: bool = ui_render(ui, xw_pixels(win.x) as ptr<u8>, xw_width(win.x), xw_height(win.x));
+    if (changed || win.needs_present) {
+        xw_present(win.x);
+        win.needs_present = false;
+    }
+}
+
+pub fun win_width(win: ptr<Window>) -> i32 {
+    if (win.x == null) { return 0; }
+    return xw_width(win.x);
+}
+
+pub fun win_height(win: ptr<Window>) -> i32 {
+    if (win.x == null) { return 0; }
+    return xw_height(win.x);
+}

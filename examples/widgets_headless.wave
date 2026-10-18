@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Renders the widget gallery without a window to build/widgets_*.ppm: the first tab with a
+// half-way slider, the open drop-down list, the text area with some text, and the dialog.
+// Run with:  WUI_RUN=widgets_headless wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, ui_new, ui_free, ui_render, ui_slider_set, ui_dropdown_set, ui_input_set, ui_click, ui_input_focus,
+                ui_set_pointer, ui_focus_next, ui_set_time};
+import("std::fs::file")::{write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./widgets_view")::{Model, widgets_view, ID_NOTES, ID_SLIDER, ID_DROPDOWN};
+
+const W: i32 = 380;
+const H: i32 = 470;
+
+fun save(ui: ptr<Ui>, name: str) {
+    var pixels: ptr<u8> = mem_alloc((W * H * 4) as i64);
+    ui_render(ui, pixels, W, H);
+    var n: i32 = W * H;
+    var rgb: ptr<u8> = mem_alloc((n * 3) as i64);
+    var i: i32 = 0;
+    while (i < n) {
+        rgb[i * 3] = pixels[i * 4 + 2];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4];
+        i += 1;
+    }
+    var header: str = "P6\n380 470\n255\n";
+    var hp: ptr<u8> = header as ptr<u8>;
+    var hlen: i64 = 0;
+    while (hp[hlen] != 0) { hlen += 1; }
+    var total: i64 = hlen + (n as i64) * 3;
+    var img: ptr<u8> = mem_alloc(total);
+    var k: i64 = 0;
+    while (k < hlen) { img[k] = hp[k]; k += 1; }
+    var j: i64 = 0;
+    while (j < (n as i64) * 3) { img[hlen + j] = rgb[j]; j += 1; }
+    write(name, img, total);
+    mem_free(img, total);
+    mem_free(rgb, (n * 3) as i64);
+    mem_free(pixels, (W * H * 4) as i64);
+}
+
+fun main() {
+    var ui: Ui = ui_new();
+    var m: Model = Model { tab: 0, size: 2, ticked: true, about: false };
+    ui_set_time(&ui, 0);
+    // tab 1: a slider at 60, keyboard focus on it
+    widgets_view(&ui, &m, W, H);
+    ui_slider_set(&ui, ID_SLIDER, 60);
+    ui_focus_next(&ui, false);                          // the first tab button
+    ui_focus_next(&ui, false);
+    ui_focus_next(&ui, false);
+    ui_focus_next(&ui, false);                          // the first radio button ...
+    widgets_view(&ui, &m, W, H);
+    save(&ui, "build/widgets_basics.ppm");
+    // tab 2: the drop-down list open
+    m.tab = 1;
+    widgets_view(&ui, &m, W, H);
+    ui_dropdown_set(&ui, ID_DROPDOWN, 1);
+    ui_click(&ui, 100, 112, 0);                         // the box
+    widgets_view(&ui, &m, W, H);
+    ui_set_pointer(&ui, 100, 160, false);
+    widgets_view(&ui, &m, W, H);
+    save(&ui, "build/widgets_choose.ppm");
+    // tab 3: the text area
+    m.tab = 2;
+    ui_click(&ui, 5, 5, 0);                             // closes the list
+    widgets_view(&ui, &m, W, H);
+    ui_input_set(&ui, ID_NOTES, "Line one\nLine two is a little longer\n한글도 됩니다\nLine four");
+    widgets_view(&ui, &m, W, H);
+    save(&ui, "build/widgets_text.ppm");
+    // the dialog
+    m.about = true;
+    widgets_view(&ui, &m, W, H);
+    save(&ui, "build/widgets_dialog.ppm");
+    ui_free(&ui);
+    println("wrote build/widgets_basics.ppm, widgets_choose.ppm, widgets_text.ppm, widgets_dialog.ppm");
+}

@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// A tree and a table. Click + / - (or Tab to it and press Enter) to open and close a tree node, click a
+// label to select it; the table scrolls with the wheel and its first column is made of buttons. Esc quits.
+// Run with:  WUI_RUN=lists wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Window, WinEvent, ui_new, ui_free, ui_click, ui_drag, ui_release, ui_set_pointer, ui_scroll, ui_feed_text,
+                ui_activated, ui_wake_ms,
+                win_open, win_ok, win_close, win_next_timeout, win_text, win_draw, win_pending, win_width, win_height, win_feed_key,
+                UI_NO_MSG, UI_ACTIVATED,
+                EV_CLOSE, EV_EXPOSE, EV_MOVE, EV_DOWN, EV_UP, EV_WHEEL, EV_TEXT, EV_KEY, KEY_ESCAPE};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./lists_view")::{Model, lists_view, MSG_TOGGLE, MSG_PICK};
+
+fun update(m: ptr<Model>, msg: i32) {
+    if (msg == MSG_TOGGLE) { m.src_open = !m.src_open; }
+    if (msg == MSG_TOGGLE + 1) { m.docs_open = !m.docs_open; }
+    if (msg >= MSG_PICK && msg < MSG_PICK + 6) { m.picked = msg - MSG_PICK; }
+}
+
+fun main() {
+    var win: Window = win_open("wui lists", 420, 430);
+    if (!win_ok(&win)) {
+        println("cannot open a window (no X display or libX11)");
+        return;
+    }
+    var ui: Ui = ui_new();
+    var model: Model = Model { src_open: true, docs_open: false, picked: -1 };
+    var piece: ptr<u8> = mem_alloc(64);
+    var ev: WinEvent = WinEvent { kind: 0, x: 0, y: 0, a: 0, width: 0, height: 0, mods: 0 };
+    lists_view(&ui, &model, win_width(&win), win_height(&win));
+    win_draw(&win, &ui);
+
+    var running: bool = true;
+    var down: bool = false;
+    while (running) {
+        var kind: i32 = win_next_timeout(&win, &ev, ui_wake_ms(&ui));
+        if (kind == EV_CLOSE) {
+            running = false;
+        } else {
+            if (kind == EV_DOWN && ev.a == 1) {
+                down = true;
+                ui_set_pointer(&ui, ev.x, ev.y, true);
+                var msg: i32 = ui_click(&ui, ev.x, ev.y, ev.mods);
+                if (msg != UI_NO_MSG) { update(&model, msg); }
+            }
+            if (kind == EV_UP && ev.a == 1) { down = false; ui_set_pointer(&ui, ev.x, ev.y, false); ui_release(&ui); }
+            if (kind == EV_MOVE) {
+                ui_set_pointer(&ui, ev.x, ev.y, down);
+                if (down) { ui_drag(&ui, ev.x, ev.y); }
+            }
+            if (kind == EV_WHEEL) { ui_scroll(&ui, ev.x, ev.y, ev.a); }
+            if (kind == EV_TEXT) {
+                var n: i64 = win_text(&win, piece, 64);
+                var r: i32 = ui_feed_text(&ui, piece, n);
+                if ((r & UI_ACTIVATED) != 0) { update(&model, ui_activated(&ui)); }
+            }
+            if (kind == EV_KEY) {
+                if (ev.a == KEY_ESCAPE) {
+                    running = false;
+                } else {
+                    var r: i32 = win_feed_key(&win, &ui, ev.a, ev.mods);
+                    if ((r & UI_ACTIVATED) != 0) { update(&model, ui_activated(&ui)); }
+                }
+            }
+            if (kind == EV_EXPOSE) {
+                if (!win_pending(&win)) { win_draw(&win, &ui); }
+            } else {
+                lists_view(&ui, &model, win_width(&win), win_height(&win));
+                win_draw(&win, &ui);
+            }
+        }
+    }
+    mem_free(piece, 64);
+    ui_free(&ui);
+    win_close(&win);
+}

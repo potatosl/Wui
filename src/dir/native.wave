@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Directory reading for Windows and macOS: the Rust crate winplat (std::fs) does it, the same
+// three functions as posix.wave (libc readdir has no Windows version and a different
+// `struct dirent` on macOS).
+
+extern(c, "wui_dir_open") fun c_dir_open(path: ptr<u8>, len: i64) -> ptr<u8>;
+extern(c, "wui_dir_next") fun c_dir_next(dir: ptr<u8>, buf: ptr<u8>, cap: i64, is_dir: ptr<i32>) -> i64;
+extern(c, "wui_dir_close") fun c_dir_close(dir: ptr<u8>);
+
+pub fun dir_open(path: ptr<u8>) -> ptr<u8> {
+    var n: i64 = 0;
+    while (path[n] != 0) { n += 1; }
+    return c_dir_open(path, n);
+}
+
+// (a link to a directory already counts as one here: is_dir is never -1)
+pub fun dir_next(dir: ptr<u8>, buf: ptr<u8>, cap: i64, is_dir: ptr<i32>) -> i64 {
+    return c_dir_next(dir, buf, cap, is_dir);
+}
+
+pub fun dir_close(dir: ptr<u8>) {
+    c_dir_close(dir);
+}

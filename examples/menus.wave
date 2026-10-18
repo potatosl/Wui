@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// A menu bar (File, Edit, Help) and tooltips. Click a menu, or Tab to one and press Enter / Down;
+// Up / Down / Left / Right move inside the menus, Enter picks, Esc closes. Rest the pointer on a
+// button for half a second to see its tooltip. File > Quit (or Esc outside a menu) quits.
+// Run with:  WUI_RUN=menus wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Window, WinEvent, ui_new, ui_free, ui_click, ui_drag, ui_release, ui_set_pointer, ui_feed_text,
+                ui_activated, ui_wake_ms, ui_dropdown_open,
+                win_open, win_ok, win_close, win_next_timeout, win_text, win_draw, win_pending, win_width, win_height, win_feed_key,
+                UI_NO_MSG, UI_ACTIVATED, UI_NO_INPUT,
+                EV_CLOSE, EV_EXPOSE, EV_MOVE, EV_DOWN, EV_UP, EV_TEXT, EV_KEY, KEY_ESCAPE};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./menus_view")::{Model, menus_view, MSG_QUIT};
+
+fun main() {
+    var win: Window = win_open("wui menus", 420, 220);
+    if (!win_ok(&win)) {
+        println("cannot open a window (no X display or libX11)");
+        return;
+    }
+    var ui: Ui = ui_new();
+    var model: Model = Model { last: 0 };
+    var piece: ptr<u8> = mem_alloc(64);
+    var ev: WinEvent = WinEvent { kind: 0, x: 0, y: 0, a: 0, width: 0, height: 0, mods: 0 };
+    menus_view(&ui, &model, win_width(&win), win_height(&win));
+    win_draw(&win, &ui);
+
+    var running: bool = true;
+    while (running) {
+        // wakes up by itself when a tooltip is due
+        var kind: i32 = win_next_timeout(&win, &ev, ui_wake_ms(&ui));
+        if (kind == EV_CLOSE) {
+            running = false;
+        } else {
+            if (kind == EV_DOWN && ev.a == 1) {
+                ui_set_pointer(&ui, ev.x, ev.y, true);
+                var msg: i32 = ui_click(&ui, ev.x, ev.y, ev.mods);
+                if (msg != UI_NO_MSG) { model.last = msg; }
+                if (msg == MSG_QUIT) { running = false; }
+            }
+            if (kind == EV_UP && ev.a == 1) { ui_set_pointer(&ui, ev.x, ev.y, false); ui_release(&ui); }
+            if (kind == EV_MOVE) { ui_set_pointer(&ui, ev.x, ev.y, false); }
+            if (kind == EV_TEXT) {
+                var n: i64 = win_text(&win, piece, 64);
+                var r: i32 = ui_feed_text(&ui, piece, n);
+                if ((r & UI_ACTIVATED) != 0) { model.last = ui_activated(&ui); }
+            }
+            if (kind == EV_KEY) {
+                if (ev.a == KEY_ESCAPE && ui_dropdown_open(&ui) == UI_NO_INPUT) {
+                    running = false;                       // Esc closes an open menu first (the library does that), then quits
+                } else {
+                    var r: i32 = win_feed_key(&win, &ui, ev.a, ev.mods);
+                    if ((r & UI_ACTIVATED) != 0) {
+                        model.last = ui_activated(&ui);
+                        if (model.last == MSG_QUIT) { running = false; }
+                    }
+                }
+            }
+            if (kind == EV_EXPOSE) {
+                if (!win_pending(&win)) { win_draw(&win, &ui); }
+            } else {
+                menus_view(&ui, &model, win_width(&win), win_height(&win));
+                win_draw(&win, &ui);
+            }
+        }
+    }
+    mem_free(piece, 64);
+    ui_free(&ui);
+    win_close(&win);
+}

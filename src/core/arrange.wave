@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Layout: measuring every node bottom-up and arranging it top-down (flexbox-style), overlays last.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./ctx")::{option_count, option_range, scroll_find, scroll_put, scroll_put_x, slider_find, valid};
+import("./types")::{AUTO, BETWEEN, CENTER, Ctx, END, K_BOX, K_BUTTON, K_CHECKBOX, K_DROPDOWN, K_INPUT, K_OPTION,
+    K_PROGRESS, K_SLIDER, K_TEXT, K_TEXTAREA, NONE, Node, OVERLAY_ABOVE, OVERLAY_AT, OVERLAY_BELOW, OVERLAY_FULL,
+    OVERLAY_MATCH_WIDTH, OVERLAY_RIGHT, STRETCH, clamp_i64, max_i32, text_height, text_width};
+import("./widgets")::{ensure_popup, ensure_tip};
+
+// Bottom-up: natural size of every node (fixed width/height win).
+pub fun measure(c: ptr<Ctx>, id: i32, inh_size: i32, inh_bold: bool) {
+    var n: ptr<Node> = &c.nodes[id];
+    n.eff_size = inh_size;
+    if (n.font_size > 0) { n.eff_size = n.font_size; }
+    n.eff_bold = inh_bold;
+    if (n.bold == 1) { n.eff_bold = true; } else if (n.bold == 2) { n.eff_bold = false; }
+    c.cur_size = n.eff_size;                           // text_width / text_height measure at this node's size
+    var line_h: i32 = text_height(c);
+    var tw: i32 = text_width(c, &c.texts[n.text_start], n.text_len);
+    var w: i32 = 0;
+    var h: i32 = 0;
+    if (n.kind == K_TEXT) { w = tw; h = line_h; }
+    else if (n.kind == K_BUTTON) { w = tw + 2 * c.theme.button_pad_x; h = line_h + 2 * c.theme.button_pad_y; }
+    else if (n.kind == K_INPUT) { w = c.theme.field_width; h = line_h + 2 * c.theme.field_pad_y; }
+    else if (n.kind == K_TEXTAREA) { w = c.theme.field_width; h = max_i32(n.val, 1) * line_h + 2 * c.theme.field_pad_y; }
+    else if (n.kind == K_CHECKBOX) { w = c.theme.check_box + c.theme.check_gap + tw; h = max_i32(line_h, c.theme.check_box); }
+    else if (n.kind == K_PROGRESS) { w = c.theme.field_width; h = c.theme.progress_h; }
+    else if (n.kind == K_DROPDOWN) {
+        w = c.theme.field_width;
+        h = line_h + 2 * c.theme.field_pad_y;
+        n.val = option_count(c, n);
+        if (n.menu) {                                  // a menu shows only its label, flat, like a tab
+            var lr: array<i64, 2>;
+            lr[0] = 0; lr[1] = 0;
+            option_range(c, n, 0, &lr[0]);
+            w = text_width(c, &c.texts[lr[0]], lr[1]) + 2 * c.theme.button_pad_x;
+            h = line_h + 2 * c.theme.button_pad_y;
+        }
+        var di: i32 = slider_find(c, n.input_id);
+        if (di >= 0) { c.slider_vals[di] = clamp_i64(c.slider_vals[di] as i64, 0, max_i32(n.val - 1, 0) as i64) as i32; }
+    }
+    else if (n.kind == K_OPTION) { w = tw + 2 * c.theme.field_pad_x; h = line_h + 6; if (n.sep) { w = 8; h = 9; } }
+    else if (n.kind == K_SLIDER) {
+        w = c.theme.field_width;
+        h = c.theme.slider_thumb;
+        var si: i32 = slider_find(c, n.input_id);
+        if (si >= 0) { c.slider_vals[si] = clamp_i64(c.slider_vals[si] as i64, n.val as i64, n.vmax as i64) as i32; }   // keep the value inside the range
+    }
+    else {
+        var main: i32 = 0;
+        var cross: i32 = 0;
+        var ch: i32 = n.first;
+        var i: i32 = 0;
+        while (ch != NONE) {
+            measure(c, ch, n.eff_size, n.eff_bold);
+            var cn: ptr<Node> = &c.nodes[ch];
+            var mg: i32 = 2 * cn.margin;
+            var m: i32 = cn.nat_h + mg;
+            var x: i32 = cn.nat_w + mg;
+            if (n.row) { m = cn.nat_w + mg; x = cn.nat_h + mg; }
+            main += m;
+            if (i > 0) { main += n.gap; }
+            cross = max_i32(cross, x);
+            ch = cn.next;
+            i += 1;
+        }
+        if (n.row) { w = main + 2 * n.padding; h = cross + 2 * n.padding; }
+        else { w = cross + 2 * n.padding; h = main + 2 * n.padding; }
+    }
+    n.content_h = h;
+    n.content_w = w;
+    if (n.width != AUTO) { w = n.width; }
+    else if (n.scroll_id != NONE && n.scroll_x) { w = 0; }   // a sideways scroll box takes the width it is given (width / grow / stretch), not its content's
+    if (n.height != AUTO) { h = n.height; }
+    else if (n.scroll_id != NONE) { h = 0; }          // a scroll box takes the height it is given (height / grow), not its content's
+    n.nat_w = w;
+    n.nat_h = h;
+    n.text_w = tw;
+}
+
+// A scroll box lays its children out in a taller (and, for a sideways box, wider) virtual box that
+// is shifted up / left by the scroll offset; painting clips it to the real one. Clamps the stored
+// offsets and records them on the node; win = [x, y, w, h] of the virtual box.
+pub fun scroll_window(c: ptr<Ctx>, n: ptr<Node>, x: i32, y: i32, w: i32, h: i32, win: ptr<i32>) {
+    var max: i32 = max_i32(n.content_h - h, 0);
+    var off: i32 = 0;
+    var si: i32 = scroll_find(c, n.scroll_id);
+    if (si >= 0) { off = c.scroll_vals[si]; }
+    off = clamp_i64(off as i64, 0, max as i64) as i32;
+    scroll_put(c, n.scroll_id, off);
+    n.scroll_off = off;
+    n.scroll_max = max;
+    win[1] = y - off;
+    win[3] = max_i32(h, n.content_h);
+    if (n.scroll_x) {                                  // the same for the horizontal axis
+        var xmax: i32 = max_i32(n.content_w - w, 0);
+        var xoff: i32 = 0;
+        if (si >= 0) { xoff = c.scroll_xvals[si]; }
+        xoff = clamp_i64(xoff as i64, 0, xmax as i64) as i32;
+        scroll_put_x(c, n.scroll_id, xoff);
+        n.scroll_xoff = xoff;
+        n.scroll_xmax = xmax;
+        win[0] = x - xoff;
+        win[2] = max_i32(w, n.content_w);
+    }
+}
+
+// Hands the free main-axis space `free` to the children that grow, in proportion to their grow
+// shares, by adding to their outer sizes. Cumulative rounding, so the shares add up to exactly `free`.
+pub fun share_free_space(c: ptr<Ctx>, first: i32, sizes: ptr<i32>, free: i32, grow_total: i64) {
+    var acc: i64 = 0;
+    var given: i64 = 0;
+    var ch: i32 = first;
+    var i: i32 = 0;
+    while (ch != NONE) {
+        var cn: ptr<Node> = &c.nodes[ch];
+        var g: i64 = max_i32(cn.grow, 0) as i64;
+        if (g > 0) {
+            acc += g;
+            var target: i64 = (free as i64) * acc / grow_total;
+            sizes[i] += (target - given) as i32;
+            given = target;
+        }
+        ch = cn.next;
+        i += 1;
+    }
+}
+
+// Top-down: gives node `id` the rectangle (x, y, w, h) and lays its children
+// out inside it (flexbox-style, single line).
+pub fun arrange(c: ptr<Ctx>, id: i32, x: i32, y: i32, w: i32, h: i32, inherited: u32) {
+    var n: ptr<Node> = &c.nodes[id];
+    if (n.color != 0) { n.eff_color = n.color; } else { n.eff_color = inherited; }
+    n.x = x;
+    n.y = y;
+    n.w = w;
+    n.h = h;
+    var eff: u32 = n.eff_color;
+    var win: array<i32, 4>;                            // the (possibly scrolled) area the children are laid out in
+    win[0] = x; win[1] = y; win[2] = w; win[3] = h;
+    if (n.scroll_id != NONE) { scroll_window(c, n, x, y, w, h, &win[0]); }
+    var lx: i32 = win[0];
+    var ly: i32 = win[1];
+    var lw: i32 = win[2];
+    var lh: i32 = win[3];
+    if (n.kind != K_BOX || n.nchild == 0) { return; }
+    var row: bool = n.row;
+    var pad: i32 = n.padding;
+    var gap: i32 = n.gap;
+    var inner_w: i32 = max_i32(lw - 2 * pad, 0);
+    var inner_h: i32 = max_i32(lh - 2 * pad, 0);
+    var main: i32 = inner_h;
+    var cross: i32 = inner_w;
+    if (row) { main = inner_w; cross = inner_h; }
+    var count: i32 = n.nchild;
+    var align: i64 = n.align;
+    var justify: i64 = n.justify;
+    var first: i32 = n.first;
+
+    // sizes here are outer sizes: the node plus its margin on both sides
+    var sizes: ptr<i32> = mem_alloc((count * 4) as i64) as ptr<i32>;
+    var grow_total: i64 = 0;
+    var used: i32 = 0;
+    var ch: i32 = first;
+    var i: i32 = 0;
+    while (ch != NONE) {
+        var cn: ptr<Node> = &c.nodes[ch];
+        var nat: i32 = cn.nat_h;
+        if (row) { nat = cn.nat_w; }
+        sizes[i] = nat + 2 * cn.margin;
+        used += sizes[i];
+        grow_total += max_i32(cn.grow, 0) as i64;
+        ch = cn.next;
+        i += 1;
+    }
+    used += gap * (count - 1);
+    var free: i32 = main - used;
+
+    var offset: i32 = 0;
+    var extra_gap: i32 = 0;
+    if (free > 0 && grow_total > 0) {
+        share_free_space(c, first, sizes, free, grow_total);
+    } else if (free > 0) {
+        if (justify == CENTER) { offset = free / 2; }
+        else if (justify == END) { offset = free; }
+        else if (justify == BETWEEN && count > 1) { extra_gap = free / (count - 1); }
+    }
+
+    var pos: i32 = ly + pad + offset;
+    if (row) { pos = lx + pad + offset; }
+    ch = first;
+    i = 0;
+    while (ch != NONE) {
+        var cn: ptr<Node> = &c.nodes[ch];
+        var mg: i32 = 2 * cn.margin;
+        var m: i32 = cn.margin;
+        var nat_cross: i32 = cn.nat_w + mg;
+        var fixed_cross: bool = cn.width != AUTO;
+        if (row) { nat_cross = cn.nat_h + mg; fixed_cross = cn.height != AUTO; }
+        var cs: i32 = nat_cross;
+        if (align == STRETCH && !fixed_cross) { cs = cross; }
+        var co: i32 = 0;
+        if (align == CENTER) { co = (cross - cs) / 2; }
+        else if (align == END) { co = cross - cs; }
+        var outer_w: i32 = cs;
+        var outer_h: i32 = sizes[i];
+        var cx: i32 = lx + pad + co;
+        var cy: i32 = pos;
+        if (row) {
+            outer_w = sizes[i];
+            outer_h = cs;
+            cx = pos;
+            cy = ly + pad + co;
+        }
+        var next: i32 = cn.next;
+        arrange(c, ch, cx + m, cy + m, max_i32(outer_w - 2 * m, 0), max_i32(outer_h - 2 * m, 0), eff);
+        pos += sizes[i] + gap + extra_gap;
+        ch = next;
+        i += 1;
+    }
+    mem_free(sizes as ptr<u8>, (count * 4) as i64);
+}
+
+pub fun layout_overlay(c: ptr<Ctx>, id: i32, width: i32, height: i32) {
+    measure(c, id, c.theme.font_size, false);
+    var n: ptr<Node> = &c.nodes[id];
+    var w: i32 = n.nat_w;
+    var h: i32 = n.nat_h;
+    var place: i32 = n.ov_place & 15;
+    var x: i32 = n.ov_dx;
+    var y: i32 = n.ov_dy;
+    if ((n.ov_place & OVERLAY_FULL) != 0) {            // the whole window
+        arrange(c, id, 0, 0, width, height, c.theme.text);
+        return;
+    }
+    if (n.ov_anchor != NONE && valid(c, n.ov_anchor) && place != OVERLAY_AT) {
+        var a: ptr<Node> = &c.nodes[n.ov_anchor];
+        if ((n.ov_place & OVERLAY_MATCH_WIDTH) != 0) { w = max_i32(w, a.w); }
+        if (place == OVERLAY_BELOW) { x = a.x + n.ov_dx; y = a.y + a.h + n.ov_dy; }
+        else if (place == OVERLAY_ABOVE) { x = a.x + n.ov_dx; y = a.y - h + n.ov_dy; }
+        else if (place == OVERLAY_RIGHT) { x = a.x + a.w + n.ov_dx; y = a.y + n.ov_dy; }
+    }
+    if (x + w > width) { x = width - w; }                  // keep it inside the window
+    if (y + h > height) { y = height - h; }
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    arrange(c, id, x, y, w, h, c.theme.text);
+}
+
+pub fun core_layout(c: ptr<Ctx>, width: i32, height: i32) {
+    if (c == null) { return; }
+    if (c.root != NONE) {
+        var root: i32 = c.root;
+        measure(c, root, c.theme.font_size, false);
+        var m: i32 = c.nodes[root].margin;
+        arrange(c, root, m, m, max_i32(width - 2 * m, 0), max_i32(height - 2 * m, 0), c.theme.text);
+    }
+    ensure_popup(c);                                   // an open drop-down's list is an overlay too
+    ensure_tip(c);
+    // overlays, in the order they were made: after the main tree, so they can sit next to its nodes
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        if (c.nodes[i].overlay) { layout_overlay(c, i, width, height); }
+        i += 1;
+    }
+}

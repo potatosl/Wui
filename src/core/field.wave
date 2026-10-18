@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Text input fields: UTF-8 helpers and the editing operations (caret, selection, word movement,
+// insert, delete) on a Field, plus core_input_set / core_input_get.
+
+import("std::mem::alloc")::{mem_alloc, mem_free, mem_realloc};
+import("std::mem::layout")::{size_of};
+import("wui::unicode")::{unicode_is_alnum, unicode_is_control};
+import("./types")::{Ctx, FIELD_MAX_BYTES, Field, copy_bytes};
+
+// Is buf[0..len] well-formed UTF-8 (no overlong forms, no surrogates, <= U+10FFFF)?
+pub fun utf8_valid(buf: ptr<u8>, len: i64) -> bool {
+    var i: i64 = 0;
+    while (i < len) {
+        var b: u32 = buf[i] as u32;
+        if (b < 0x80) { i += 1; }
+        else if (b >= 0xC2 && b <= 0xDF) {
+            if (i + 1 >= len || (buf[i + 1] & 0xC0) != 0x80) { return false; }
+            i += 2;
+        } else if (b >= 0xE0 && b <= 0xEF) {
+            if (i + 2 >= len || (buf[i + 1] & 0xC0) != 0x80 || (buf[i + 2] & 0xC0) != 0x80) { return false; }
+            var b1: u32 = buf[i + 1] as u32;
+            if (b == 0xE0 && b1 < 0xA0) { return false; }          // overlong
+            if (b == 0xED && b1 >= 0xA0) { return false; }          // surrogates
+            i += 3;
+        } else if (b >= 0xF0 && b <= 0xF4) {
+            if (i + 3 >= len || (buf[i + 1] & 0xC0) != 0x80 || (buf[i + 2] & 0xC0) != 0x80 || (buf[i + 3] & 0xC0) != 0x80) { return false; }
+            var b1: u32 = buf[i + 1] as u32;
+            if (b == 0xF0 && b1 < 0x90) { return false; }           // overlong
+            if (b == 0xF4 && b1 >= 0x90) { return false; }          // above U+10FFFF
+            i += 4;
+        } else { return false; }
+    }
+    return true;
+}
+
+// Length of the character whose first byte is `b`.
+pub fun char_len(b: u8) -> i64 {
+    if (b < 0x80) { return 1; }
+    if (b >= 0xF0) { return 4; }
+    if (b >= 0xE0) { return 3; }
+    return 2;
+}
+
+// The code point at text[i] (valid UTF-8 assumed).
+pub fun decode_at(text: ptr<u8>, i: i64) -> u32 {
+    var b: u32 = text[i] as u32;
+    if (b < 0x80) { return b; }
+    if (b >= 0xF0) {
+        return ((b & 0x07) << 18) | (((text[i + 1] as u32) & 0x3F) << 12) | (((text[i + 2] as u32) & 0x3F) << 6) | ((text[i + 3] as u32) & 0x3F);
+    }
+    if (b >= 0xE0) {
+        return ((b & 0x0F) << 12) | (((text[i + 1] as u32) & 0x3F) << 6) | ((text[i + 2] as u32) & 0x3F);
+    }
+    return ((b & 0x1F) << 6) | ((text[i + 1] as u32) & 0x3F);
+}
+
+// Start of the character that ends at byte offset i (i > 0).
+pub fun prev_start(text: ptr<u8>, i: i64) -> i64 {
+    var j: i64 = i - 1;
+    while (j > 0 && (text[j] & 0xC0) == 0x80) { j -= 1; }
+    return j;
+}
+
+pub fun field_index(c: ptr<Ctx>, id: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < c.nfields) {
+        if (c.fields[i].id == id) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// The field with this id, created empty when it does not exist yet.
+pub fun field_get(c: ptr<Ctx>, id: i32) -> ptr<Field> {
+    var i: i32 = field_index(c, id);
+    if (i >= 0) { return &c.fields[i]; }
+    if (c.nfields == c.cap_fields) {
+        var cap: i32 = c.cap_fields * 2;
+        var item: i64 = size_of<Field>() as i64;
+        c.fields = mem_realloc(c.fields as ptr<u8>, (c.cap_fields as i64) * item, (cap as i64) * item) as ptr<Field>;
+        c.cap_fields = cap;
+    }
+    var f: ptr<Field> = &c.fields[c.nfields];
+    c.nfields += 1;
+    f.id = id;
+    f.text = mem_alloc(FIELD_MAX_BYTES + 1);
+    f.text[0] = 0;
+    f.len = 0;
+    f.cursor = 0;
+    f.anchor = 0;
+    f.scroll = 0;
+    f.multi = false;
+    f.scroll_y = 0;
+    f.want_x = -1;
+    f.seen_cursor = 0;
+    f.seen_len = 0;
+    return f;
+}
+
+pub fun field_lo(f: ptr<Field>) -> i64 {
+    if (f.cursor < f.anchor) { return f.cursor; }
+    return f.anchor;
+}
+
+pub fun field_hi(f: ptr<Field>) -> i64 {
+    if (f.cursor > f.anchor) { return f.cursor; }
+    return f.anchor;
+}
+
+pub fun field_has_selection(f: ptr<Field>) -> bool {
+    return f.cursor != f.anchor;
+}
+
+// Removes bytes [lo, hi) from the text.
+pub fun field_remove(f: ptr<Field>, lo: i64, hi: i64) {
+    var i: i64 = hi;
+    while (i < f.len) { f.text[lo + (i - hi)] = f.text[i]; i += 1; }
+    f.len -= hi - lo;
+    f.text[f.len] = 0;
+}
+
+pub fun field_delete_selection(f: ptr<Field>) -> bool {
+    if (!field_has_selection(f)) { return false; }
+    var lo: i64 = field_lo(f);
+    field_remove(f, lo, field_hi(f));
+    f.cursor = lo;
+    f.anchor = lo;
+    return true;
+}
+
+// Moves the caret; with `extend` the selection grows from the anchor.
+pub fun field_move_to(f: ptr<Field>, pos: i64, extend: bool) {
+    f.cursor = pos;
+    if (!extend) { f.anchor = pos; }
+}
+
+pub fun field_prev(f: ptr<Field>) -> i64 {
+    if (f.cursor == 0) { return 0; }
+    return prev_start(f.text, f.cursor);
+}
+
+pub fun field_next(f: ptr<Field>) -> i64 {
+    if (f.cursor >= f.len) { return f.cursor; }
+    return f.cursor + char_len(f.text[f.cursor]);
+}
+
+// Start of the word before the caret (skips non-word characters, then the word).
+pub fun field_prev_word(f: ptr<Field>) -> i64 {
+    var i: i64 = f.cursor;
+    var going: bool = true;
+    while (going && i > 0) {
+        var j: i64 = prev_start(f.text, i);
+        if (unicode_is_alnum(decode_at(f.text, j))) { going = false; } else { i = j; }
+    }
+    going = true;
+    while (going && i > 0) {
+        var j: i64 = prev_start(f.text, i);
+        if (!unicode_is_alnum(decode_at(f.text, j))) { going = false; } else { i = j; }
+    }
+    return i;
+}
+
+// End of the word after the caret.
+pub fun field_next_word(f: ptr<Field>) -> i64 {
+    var i: i64 = f.cursor;
+    var going: bool = true;
+    while (going && i < f.len) {
+        if (unicode_is_alnum(decode_at(f.text, i))) { going = false; } else { i += char_len(f.text[i]); }
+    }
+    going = true;
+    while (going && i < f.len) {
+        if (!unicode_is_alnum(decode_at(f.text, i))) { going = false; } else { i += char_len(f.text[i]); }
+    }
+    return i;
+}
+
+// Types `s` (valid UTF-8, control characters dropped) at the caret, replacing
+// the selection. False when nothing was inserted or the field would overflow.
+pub fun field_insert(f: ptr<Field>, s: ptr<u8>, n: i64, multi: bool) -> bool {
+    var clean: ptr<u8> = mem_alloc(n + 1);
+    var cl: i64 = 0;
+    var i: i64 = 0;
+    while (i < n) {
+        var l: i64 = char_len(s[i]);
+        var cp: u32 = decode_at(s, i);
+        if (!unicode_is_control(cp) || (multi && cp == 10)) {          // a text area keeps its newlines
+            var k: i64 = 0;
+            while (k < l) { clean[cl + k] = s[i + k]; k += 1; }
+            cl += l;
+        }
+        i += l;
+    }
+    var lo: i64 = field_lo(f);
+    var hi: i64 = field_hi(f);
+    if (cl == 0 || f.len - (hi - lo) + cl > FIELD_MAX_BYTES) {
+        mem_free(clean, n + 1);
+        return false;
+    }
+    field_delete_selection(f);                        // typing or pasting replaces the selection
+    var j: i64 = f.len;
+    while (j > f.cursor) { j -= 1; f.text[j + cl] = f.text[j]; }
+    var k: i64 = 0;
+    while (k < cl) { f.text[f.cursor + k] = clean[k]; k += 1; }
+    f.len += cl;
+    f.text[f.len] = 0;
+    f.cursor += cl;
+    f.anchor = f.cursor;
+    mem_free(clean, n + 1);
+    return true;
+}
+
+pub fun field_backspace(f: ptr<Field>) -> bool {
+    if (field_delete_selection(f)) { return true; }
+    if (f.cursor == 0) { return false; }
+    var p: i64 = field_prev(f);
+    field_remove(f, p, f.cursor);
+    f.cursor = p;
+    f.anchor = p;
+    return true;
+}
+
+pub fun field_delete(f: ptr<Field>) -> bool {
+    if (field_delete_selection(f)) { return true; }
+    var n: i64 = field_next(f);
+    if (n == f.cursor) { return false; }
+    field_remove(f, f.cursor, n);
+    return true;
+}
+
+// Replaces the text of an input (the caret goes to the end). 1 on success.
+pub fun core_input_set(c: ptr<Ctx>, input_id: i32, text: ptr<u8>, len: i64) -> i32 {
+    if (c == null) { return 0; }
+    var n: i64 = len;
+    if (text == null || n < 0) { n = 0; }
+    if (!utf8_valid(text, n)) { return 0; }
+    if (input_id < 0 || n > FIELD_MAX_BYTES) { return 0; }
+    var f: ptr<Field> = field_get(c, input_id);
+    copy_bytes(f.text, text, n);
+    f.text[n] = 0;
+    f.len = n;
+    f.cursor = n;
+    f.anchor = n;
+    f.scroll = 0;
+    return 1;
+}
+
+// Copies the text of an input into `buf` (NUL-terminated, UTF-8). Returns the
+// length in bytes, or -1 when the input is unknown or `cap` is too small.
+pub fun core_input_get(c: ptr<Ctx>, input_id: i32, buf: ptr<u8>, cap: i64) -> i64 {
+    if (c == null) { return -1; }
+    var i: i32 = field_index(c, input_id);
+    if (i < 0) { return -1; }
+    var f: ptr<Field> = &c.fields[i];
+    if (buf == null || cap < f.len + 1) { return -1; }
+    copy_bytes(buf, f.text, f.len);
+    buf[f.len] = 0;
+    return f.len;
+}

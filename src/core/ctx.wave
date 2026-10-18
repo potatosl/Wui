@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The context: creation and destruction, node allocation, text interning and the id-keyed state tables
+// (slider and drop-down values, scroll offsets) that outlive a frame.
+
+import("wui::render")::{DRAW_CMD_SIZE};
+import("wui::font")::{FontEngine, font_new};
+import("wui::theme")::{Theme, theme_light};
+import("wui::fontdb")::{font_load_system};
+import("std::mem::alloc")::{mem_alloc, mem_free, mem_realloc};
+import("std::mem::layout")::{size_of};
+import("./types")::{AUTO, Ctx, FIELD_MAX_BYTES, Field, K_BOX, NONE, Node, START, copy_bytes};
+
+// One font engine per process (the system fonts are big): created and loaded
+// on first use. Tests pass their own font-less engine for fixed 8x16 metrics.
+pub static ENGINE_SLOT: array<i64, 1> = [0];
+
+pub fun core_engine() -> ptr<FontEngine> {
+    if (ENGINE_SLOT[0] == 0) {
+        var e: ptr<FontEngine> = font_new();
+        font_load_system(e);
+        ENGINE_SLOT[0] = e as i64;
+    }
+    return ENGINE_SLOT[0] as ptr<FontEngine>;
+}
+
+// Makes a context. `fe` is the text engine for metrics; pass null for the shared
+// system-font engine (core_engine).
+pub fun core_new(fe: ptr<FontEngine>) -> ptr<Ctx> {
+    var c: ptr<Ctx> = mem_alloc(size_of<Ctx>() as i64) as ptr<Ctx>;
+    c.fe = fe;
+    if (fe == null) { c.fe = core_engine(); }
+    c.theme = mem_alloc(size_of<Theme>() as i64) as ptr<Theme>;
+    theme_light(c.theme);
+    c.cap_nodes = 64;
+    c.nodes = mem_alloc((c.cap_nodes as i64) * (size_of<Node>() as i64)) as ptr<Node>;
+    c.nnodes = 0;
+    c.cap_fields = 8;
+    c.fields = mem_alloc((c.cap_fields as i64) * (size_of<Field>() as i64)) as ptr<Field>;
+    c.nfields = 0;
+    c.cap_scrolls = 8;
+    c.scroll_ids = mem_alloc((c.cap_scrolls * 4) as i64) as ptr<i32>;
+    c.scroll_vals = mem_alloc((c.cap_scrolls * 4) as i64) as ptr<i32>;
+    c.scroll_xvals = mem_alloc((c.cap_scrolls * 4) as i64) as ptr<i32>;
+    c.nscrolls = 0;
+    c.cap_sliders = 8;
+    c.slider_ids = mem_alloc((c.cap_sliders * 4) as i64) as ptr<i32>;
+    c.slider_vals = mem_alloc((c.cap_sliders * 4) as i64) as ptr<i32>;
+    c.nsliders = 0;
+    c.focus = NONE;
+    c.wfocus = NONE;
+    c.focus_visible = false;
+    c.activated = NONE;
+    c.cur_size = 0;
+    c.dd_open = NONE;
+    c.dd_cur = 0;
+    c.tip_node = NONE;
+    c.tip_since = -1;
+    c.tip_blocked = false;
+    c.time_ms = 0;
+    c.blink_epoch = 0;
+    c.drag = NONE;
+    c.bar_active = false;
+    c.bar_horiz = false;
+    c.bar_id = NONE;
+    c.bar_grab = 0;
+    c.root = NONE;
+    c.cap_texts = 1024;
+    c.texts = mem_alloc(c.cap_texts);
+    c.ntexts = 0;
+    c.cap_cmds = 256;
+    c.cmds = mem_alloc(c.cap_cmds * DRAW_CMD_SIZE);
+    c.ncmds = 0;
+    c.pointer_x = -1;
+    c.pointer_y = -1;
+    c.pointer_down = false;
+    c.have_hash = false;
+    c.last_hash = 0;
+    c.changed = true;
+    return c;
+}
+
+pub fun core_free(c: ptr<Ctx>) {
+    if (c == null) { return; }
+    var i: i32 = 0;
+    while (i < c.nfields) {
+        mem_free(c.fields[i].text, FIELD_MAX_BYTES + 1);
+        i += 1;
+    }
+    mem_free(c.nodes as ptr<u8>, (c.cap_nodes as i64) * (size_of<Node>() as i64));
+    mem_free(c.fields as ptr<u8>, (c.cap_fields as i64) * (size_of<Field>() as i64));
+    mem_free(c.scroll_ids as ptr<u8>, (c.cap_scrolls * 4) as i64);
+    mem_free(c.scroll_vals as ptr<u8>, (c.cap_scrolls * 4) as i64);
+    mem_free(c.scroll_xvals as ptr<u8>, (c.cap_scrolls * 4) as i64);
+    mem_free(c.slider_ids as ptr<u8>, (c.cap_sliders * 4) as i64);
+    mem_free(c.slider_vals as ptr<u8>, (c.cap_sliders * 4) as i64);
+    mem_free(c.texts, c.cap_texts);
+    mem_free(c.cmds, c.cap_cmds * DRAW_CMD_SIZE);
+    mem_free(c.theme as ptr<u8>, size_of<Theme>() as i64);
+    mem_free(c as ptr<u8>, size_of<Ctx>() as i64);
+}
+
+// Starts a new frame: drops the tree and the draw list.
+pub fun core_clear(c: ptr<Ctx>) {
+    if (c == null) { return; }
+    c.nnodes = 0;
+    c.ntexts = 0;
+    c.ncmds = 0;
+    c.root = NONE;
+}
+
+pub fun valid(c: ptr<Ctx>, id: i32) -> bool {
+    return id >= 0 && id < c.nnodes;
+}
+
+// Adds a node of `kind` under `parent` (or as the root when `parent` is NONE).
+// Returns NONE when the parent is invalid or cannot hold children, or a second
+// root is added. The node starts with the default style.
+pub fun add_node(c: ptr<Ctx>, parent: i32, kind: i32) -> i32 {
+    if (parent == NONE) {
+        if (c.root != NONE) { return NONE; }
+    } else if (!valid(c, parent) || c.nodes[parent].kind != K_BOX) {
+        return NONE;
+    }
+    return new_node(c, parent, kind, parent == NONE);
+}
+
+// Allocates and links a node (no checks). `as_root`: it becomes the tree's root; an
+// overlay root has parent NONE and is not the root.
+pub fun new_node(c: ptr<Ctx>, parent: i32, kind: i32, as_root: bool) -> i32 {
+    if (c.nnodes == c.cap_nodes) {
+        var cap: i32 = c.cap_nodes * 2;
+        var item: i64 = size_of<Node>() as i64;
+        c.nodes = mem_realloc(c.nodes as ptr<u8>, (c.cap_nodes as i64) * item, (cap as i64) * item) as ptr<Node>;
+        c.cap_nodes = cap;
+    }
+    var id: i32 = c.nnodes;
+    c.nnodes += 1;
+    var n: ptr<Node> = &c.nodes[id];
+    n.kind = kind;
+    n.first = NONE; n.last = NONE; n.next = NONE; n.nchild = 0;
+    n.text_start = 0; n.text_len = 0; n.msg = NONE; n.input_id = NONE; n.checked = false; n.radio = false; n.tab = false; n.val = 0; n.vmax = 0;
+    n.overlay = false; n.in_ov = false; n.ov_anchor = NONE; n.ov_place = 0; n.ov_dx = 0; n.ov_dy = 0; n.popup = false; n.left = false; n.menu = false; n.sep = false; n.tipbox = false; n.tip_start = 0; n.tip_len = 0;
+    n.font_size = 0; n.bold = 0; n.eff_size = c.theme.font_size; n.eff_bold = false;
+    n.parent = parent; n.scroll_id = NONE; n.content_h = 0; n.scroll_off = 0; n.scroll_max = 0;
+    n.scroll_x = false; n.content_w = 0; n.scroll_xoff = 0; n.scroll_xmax = 0;
+    n.row = false; n.padding = 0; n.gap = 0; n.width = AUTO; n.height = AUTO; n.grow = 0;
+    n.align = START; n.justify = START; n.background = 0; n.border = 0;
+    n.margin = 0; n.radius = AUTO; n.color = 0; n.eff_color = c.theme.text;
+    n.nat_w = 0; n.nat_h = 0; n.text_w = 0; n.x = 0; n.y = 0; n.w = 0; n.h = 0;
+    if (parent == NONE) {
+        if (as_root) { c.root = id; }
+    } else {
+        var p: ptr<Node> = &c.nodes[parent];
+        n.in_ov = p.in_ov;
+        if (p.last == NONE) { p.first = id; } else { c.nodes[p.last].next = id; }
+        p.last = id;
+        p.nchild += 1;
+    }
+    return id;
+}
+
+// Copies the bytes into the frame's text store; returns their offset.
+pub fun intern(c: ptr<Ctx>, text: ptr<u8>, len: i64) -> i64 {
+    var n: i64 = len;
+    if (text == null || n < 0) { n = 0; }
+    if (c.ntexts + n > c.cap_texts) {
+        var cap: i64 = c.cap_texts * 2;
+        while (c.ntexts + n > cap) { cap = cap * 2; }
+        c.texts = mem_realloc(c.texts, c.cap_texts, cap);
+        c.cap_texts = cap;
+    }
+    var start: i64 = c.ntexts;
+    copy_bytes(&c.texts[start], text, n);
+    c.ntexts += n;
+    return start;
+}
+
+pub fun slider_find(c: ptr<Ctx>, id: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < c.nsliders) {
+        if (c.slider_ids[i] == id) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// The slot of a slider id, created with the value `init` when it is new.
+pub fun slider_slot(c: ptr<Ctx>, id: i32, init: i32) -> i32 {
+    var i: i32 = slider_find(c, id);
+    if (i >= 0) { return i; }
+    if (c.nsliders == c.cap_sliders) {
+        var cap: i32 = c.cap_sliders * 2;
+        c.slider_ids = mem_realloc(c.slider_ids as ptr<u8>, (c.cap_sliders * 4) as i64, (cap * 4) as i64) as ptr<i32>;
+        c.slider_vals = mem_realloc(c.slider_vals as ptr<u8>, (c.cap_sliders * 4) as i64, (cap * 4) as i64) as ptr<i32>;
+        c.cap_sliders = cap;
+    }
+    c.slider_ids[c.nsliders] = id;
+    c.slider_vals[c.nsliders] = init;
+    c.nsliders += 1;
+    return c.nsliders - 1;
+}
+
+//
+// A drop-down's options are one text, the options separated by newlines.
+pub fun option_count(c: ptr<Ctx>, n: ptr<Node>) -> i32 {
+    if (n.text_len == 0) { return 0; }
+    var k: i32 = 1;
+    var i: i64 = 0;
+    while (i < n.text_len) {
+        if (c.texts[n.text_start + i] == 10) { k += 1; }
+        i += 1;
+    }
+    return k;
+}
+
+// Where option `index` of the drop-down node `n` starts in the text store (res[0]) and its length (res[1]).
+pub fun option_range(c: ptr<Ctx>, n: ptr<Node>, index: i32, res: ptr<i64>) {
+    var start: i64 = n.text_start;
+    var end: i64 = n.text_start + n.text_len;
+    var k: i32 = 0;
+    var i: i64 = n.text_start;
+    while (i < end && k < index) {
+        if (c.texts[i] == 10) { k += 1; start = i + 1; }
+        i += 1;
+    }
+    var stop: i64 = start;
+    while (stop < end && c.texts[stop] != 10) { stop += 1; }
+    res[0] = start;
+    res[1] = stop - start;
+}
+
+// Scroll offsets that outlive frames, keyed by the caller's scroll id.
+pub fun scroll_find(c: ptr<Ctx>, id: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < c.nscrolls) {
+        if (c.scroll_ids[i] == id) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// The slot of a scroll id, created (both offsets 0) when it is new.
+pub fun scroll_slot(c: ptr<Ctx>, id: i32) -> i32 {
+    var i: i32 = scroll_find(c, id);
+    if (i >= 0) { return i; }
+    if (c.nscrolls == c.cap_scrolls) {
+        var cap: i32 = c.cap_scrolls * 2;
+        c.scroll_ids = mem_realloc(c.scroll_ids as ptr<u8>, (c.cap_scrolls * 4) as i64, (cap * 4) as i64) as ptr<i32>;
+        c.scroll_vals = mem_realloc(c.scroll_vals as ptr<u8>, (c.cap_scrolls * 4) as i64, (cap * 4) as i64) as ptr<i32>;
+        c.scroll_xvals = mem_realloc(c.scroll_xvals as ptr<u8>, (c.cap_scrolls * 4) as i64, (cap * 4) as i64) as ptr<i32>;
+        c.cap_scrolls = cap;
+    }
+    c.scroll_ids[c.nscrolls] = id;
+    c.scroll_vals[c.nscrolls] = 0;
+    c.scroll_xvals[c.nscrolls] = 0;
+    c.nscrolls += 1;
+    return c.nscrolls - 1;
+}
+
+pub fun scroll_put(c: ptr<Ctx>, id: i32, off: i32) {
+    c.scroll_vals[scroll_slot(c, id)] = off;
+}
+
+pub fun scroll_put_x(c: ptr<Ctx>, id: i32, off: i32) {
+    c.scroll_xvals[scroll_slot(c, id)] = off;
+}

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MPL-2.0
+[package]
+name = "wui_win"
+authors = ["potatosl"]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Win32 window backend for the wui Wave GUI library (C ABI staticlib; Windows only)"
+license = "MPL-2.0"
+
+[lib]
+name = "wui_win"
+crate-type = ["staticlib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+panic = "abort"

@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Painting: turns the laid-out tree into a draw list (render.wave rasterizes it).
+
+import("wui::render")::{CMD_BORDER, CMD_CLIP, CMD_CLIP_END, CMD_FILL, CMD_LINE, CMD_ROUND_BORDER, CMD_ROUND_FILL, CMD_TEXT, DRAW_CMD_SIZE, DrawCmd, TEXT_BOLD};
+import("std::mem::alloc")::{mem_realloc};
+import("./ctx")::{option_range, slider_slot};
+import("./field")::{field_get, field_has_selection, field_hi, field_lo};
+import("./focus")::{caret_on, has_focus};
+import("./pick")::{button_at, clipped, contains, hscrollbar, scrollbar};
+import("./textarea")::{line_count, line_end_of, line_of, line_start_of};
+import("./types")::{Ctx, Field, K_BUTTON, K_CHECKBOX, K_DROPDOWN, K_INPUT, K_OPTION, K_PROGRESS, K_SLIDER,
+    K_TEXT, K_TEXTAREA, LEFT_PAD, NONE, Node, TIP_DELAY_MS, max_i32, text_height, text_width};
+import("./widgets")::{dropdown_node};
+
+pub fun cmd_at(c: ptr<Ctx>, i: i64) -> ptr<DrawCmd> {
+    return &c.cmds[i * DRAW_CMD_SIZE] as ptr<DrawCmd>;
+}
+
+pub fun push(c: ptr<Ctx>, kind: i32, x: i32, y: i32, w: i32, h: i32, color: u32, text: ptr<u8>, text_len: i64) {
+    if (c.ncmds == c.cap_cmds) {
+        var cap: i64 = c.cap_cmds * 2;
+        c.cmds = mem_realloc(c.cmds, c.cap_cmds * DRAW_CMD_SIZE, cap * DRAW_CMD_SIZE);
+        c.cap_cmds = cap;
+    }
+    var d: ptr<DrawCmd> = cmd_at(c, c.ncmds);
+    d.kind = kind;
+    d.x = x;
+    d.y = y;
+    d.w = w;
+    d.h = h;
+    d.color = color;
+    d.text = text;
+    d.text_len = text_len;
+    c.ncmds += 1;
+}
+
+// A text command in node `n`'s font size and weight.
+pub fun push_text(c: ptr<Ctx>, n: ptr<Node>, x: i32, y: i32, color: u32, text: ptr<u8>, len: i64) {
+    var flags: i32 = 0;
+    if (n.eff_bold) { flags = TEXT_BOLD; }
+    push(c, CMD_TEXT, x, y, n.eff_size, flags, color, text, len);
+}
+
+// Pushes a filled and/or outlined box; rounded when `radius` > 0. Colour 0
+// skips that part.
+pub fun push_shape(c: ptr<Ctx>, x: i32, y: i32, w: i32, h: i32, radius: i32, fill: u32, edge: u32) {
+    var kf: i32 = CMD_FILL;
+    var kb: i32 = CMD_BORDER;
+    var r: i64 = 0;
+    if (radius > 0) { kf = CMD_ROUND_FILL; kb = CMD_ROUND_BORDER; r = radius as i64; }
+    if (fill != 0) { push(c, kf, x, y, w, h, fill, null, r); }
+    if (edge != 0) { push(c, kb, x, y, w, h, edge, null, r); }
+}
+
+// The focus ring: a two pixel outline just outside the rectangle.
+pub fun focus_ring(c: ptr<Ctx>, x: i32, y: i32, w: i32, h: i32, radius: i32) {
+    push(c, CMD_ROUND_BORDER, x - 1, y - 1, w + 2, h + 2, c.theme.field_focus, null, (radius + 1) as i64);
+    push(c, CMD_ROUND_BORDER, x - 2, y - 2, w + 4, h + 4, c.theme.field_focus, null, (radius + 2) as i64);
+}
+
+pub fun radius_or(n: ptr<Node>, fallback: i32) -> i32 {
+    if (n.radius >= 0) { return n.radius; }
+    return fallback;
+}
+
+// A text node (cut at its edge when it is narrower than the text: a table cell).
+fun paint_text(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    if (n.w < n.text_w) {                          // narrower than its text (a table cell): cut at the edge
+        push(c, CMD_CLIP, n.x, n.y, n.w, n.h, 0, null, 0);
+        push_text(c, n, n.x, n.y, n.eff_color, &c.texts[n.text_start], n.text_len);
+        push(c, CMD_CLIP_END, 0, 0, 0, 0, 0, null, 0);
+    } else {
+        push_text(c, n, n.x, n.y, n.eff_color, &c.texts[n.text_start], n.text_len);
+    }
+}
+// A button, tab or flat cell button.
+fun paint_button(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var color: u32 = c.theme.button;
+    var edge: u32 = c.theme.border;
+    if (n.tab) {                                   // a tab is flat: no fill or outline until hovered or selected
+        color = 0;
+        edge = 0;
+        if (n.checked) { color = c.theme.field; }
+    }
+    if (hover == i) {
+        if (c.pointer_down) { color = c.theme.button_down; } else { color = c.theme.button_hover; }
+    }
+    push_shape(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_button), color, edge);
+    if (n.tab && n.checked) { push(c, CMD_FILL, n.x, n.y + n.h - 2, n.w, 2, c.theme.accent, null, 0); }
+    if (n.left || n.text_w > n.w) {                // left-aligned, or too long to centre: starts at the left and is cut at the edge
+        push(c, CMD_CLIP, n.x, n.y, n.w, n.h, 0, null, 0);
+        push_text(c, n, n.x + LEFT_PAD, n.y + (n.h - line_h) / 2, n.eff_color, &c.texts[n.text_start], n.text_len);
+        push(c, CMD_CLIP_END, 0, 0, 0, 0, 0, null, 0);
+    } else {
+        push_text(c, n, n.x + (n.w - n.text_w) / 2, n.y + (n.h - line_h) / 2,
+                  n.eff_color, &c.texts[n.text_start], n.text_len);
+    }
+    if (c.focus_visible && has_focus(c, n)) { focus_ring(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_button)); }
+}
+// A checkbox or radio button.
+fun paint_checkbox(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var bx: i32 = n.x;
+    var by: i32 = n.y + (n.h - c.theme.check_box) / 2;
+    var hot: bool = hover == i;
+    var fill: u32 = c.theme.field;
+    var edge: u32 = c.theme.border;
+    if (n.checked) { fill = c.theme.accent; edge = c.theme.accent; }
+    else if (hot) { edge = c.theme.accent; }
+    if (n.radio) {
+        // a circle; a selected one has a dot
+        var half: i32 = c.theme.check_box / 2;
+        if (n.checked) { fill = c.theme.field; }
+        push(c, CMD_ROUND_FILL, bx, by, c.theme.check_box, c.theme.check_box, fill, null, half as i64);
+        push(c, CMD_ROUND_BORDER, bx, by, c.theme.check_box, c.theme.check_box, edge, null, half as i64);
+        if (n.checked) {
+            var dot: i32 = max_i32(half, 4);
+            var off: i32 = (c.theme.check_box - dot) / 2;
+            push(c, CMD_ROUND_FILL, bx + off, by + off, dot, dot, c.theme.accent, null, (dot / 2) as i64);
+        }
+    } else {
+        push_shape(c, bx, by, c.theme.check_box, c.theme.check_box, radius_or(n, c.theme.radius_check), fill, edge);
+    }
+    if (n.checked && !n.radio) {
+        // a tick: two strokes, coordinates in 1/16 px relative to the square
+        push(c, CMD_LINE, bx * 16 + 56, by * 16 + 136, bx * 16 + 104, by * 16 + 184, c.theme.check_mark, null, 32);
+        push(c, CMD_LINE, bx * 16 + 104, by * 16 + 184, bx * 16 + 200, by * 16 + 72, c.theme.check_mark, null, 32);
+    }
+    if (n.text_len > 0) {
+        push_text(c, n, n.x + c.theme.check_box + c.theme.check_gap, n.y + (n.h - line_h) / 2,
+                  n.eff_color, &c.texts[n.text_start], n.text_len);
+    }
+    if (c.focus_visible && has_focus(c, n)) { focus_ring(c, n.x, n.y, n.w, n.h, c.theme.radius_check); }
+}
+// A progress bar.
+fun paint_progress(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var pr: i32 = radius_or(n, c.theme.radius_field);
+    push_shape(c, n.x, n.y, n.w, n.h, pr, c.theme.scroll_track, 0);
+    if (n.vmax > 0) {
+        var done: i32 = n.val;
+        if (done < 0) { done = 0; }
+        if (done > n.vmax) { done = n.vmax; }
+        var fw: i32 = ((n.w as i64) * (done as i64) / (n.vmax as i64)) as i32;
+        if (fw > 0) { push_shape(c, n.x, n.y, fw, n.h, pr, c.theme.accent, 0); }
+    }
+}
+// A slider: track, filled part and handle.
+fun paint_slider(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var th: i32 = c.theme.slider_thumb;
+    var tr: i32 = c.theme.slider_track;
+    var usable: i32 = max_i32(n.w - th, 1);
+    var range: i32 = n.vmax - n.val;
+    var cur: i32 = c.slider_vals[slider_slot(c, n.input_id, n.val)];
+    var along: i32 = 0;
+    if (range > 0) { along = (((cur - n.val) as i64) * (usable as i64) / (range as i64)) as i32; }
+    var gy: i32 = n.y + (n.h - tr) / 2;
+    push_shape(c, n.x + th / 2, gy, n.w - th, tr, tr / 2, c.theme.scroll_track, 0);          // the groove
+    if (along > 0) { push_shape(c, n.x + th / 2, gy, along, tr, tr / 2, c.theme.accent, 0); }   // the part up to the handle
+    var hx: i32 = n.x + along;
+    var hy: i32 = n.y + (n.h - th) / 2;
+    var rim: u32 = c.theme.border;
+    if (c.focus == n.input_id) { rim = c.theme.field_focus; }
+    push(c, CMD_ROUND_FILL, hx, hy, th, th, c.theme.field, null, (th / 2) as i64);
+    push(c, CMD_ROUND_BORDER, hx, hy, th, th, rim, null, (th / 2) as i64);
+    if (c.focus_visible && c.focus == n.input_id) { focus_ring(c, hx, hy, th, th, th / 2); }
+}
+// A menu's flat label.
+fun paint_menu(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var mopen: bool = c.dd_open == n.input_id;
+    var mr: array<i64, 2>;
+    mr[0] = 0; mr[1] = 0;
+    option_range(c, n, 0, &mr[0]);
+    var mhot: bool = contains(n, c.pointer_x, c.pointer_y) && !clipped(c, i, c.pointer_x, c.pointer_y);
+    if (mopen || mhot) { push_shape(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_button), c.theme.selection, 0); }
+    var lw: i32 = text_width(c, &c.texts[mr[0]], mr[1]);
+    push_text(c, n, n.x + (n.w - lw) / 2, n.y + (n.h - line_h) / 2, n.eff_color, &c.texts[mr[0]], mr[1]);
+    if (c.focus_visible && c.focus == n.input_id) { focus_ring(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_button)); }
+}
+// A drop-down box with its chosen option and chevron.
+fun paint_dropdown(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var dfocus: bool = c.focus == n.input_id;
+    var dopen: bool = c.dd_open == n.input_id;
+    var dedge: u32 = c.theme.border;
+    if (dfocus || dopen) { dedge = c.theme.field_focus; }
+    push_shape(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_field), c.theme.field, dedge);
+    var arrow: i32 = 22;                                       // room for the chevron
+    var sel: i32 = c.slider_vals[slider_slot(c, n.input_id, 0)];
+    var range: array<i64, 2>;
+    range[0] = 0; range[1] = 0;
+    option_range(c, n, sel, &range[0]);
+    push(c, CMD_CLIP, n.x + 1, n.y + 1, n.w - 2 - arrow, n.h - 2, 0, null, 0);
+    if (range[1] > 0) {
+        push_text(c, n, n.x + c.theme.field_pad_x, n.y + (n.h - line_h) / 2, n.eff_color, &c.texts[range[0]], range[1]);
+    }
+    push(c, CMD_CLIP_END, 0, 0, 0, 0, 0, null, 0);
+    var cx: i32 = n.x + n.w - 13;                              // the chevron: two short strokes
+    var cy: i32 = n.y + n.h / 2;
+    push(c, CMD_LINE, (cx - 4) * 16, (cy - 2) * 16, cx * 16, (cy + 2) * 16, n.eff_color, null, 28);
+    push(c, CMD_LINE, cx * 16, (cy + 2) * 16, (cx + 4) * 16, (cy - 2) * 16, n.eff_color, null, 28);
+    if (c.focus_visible && dfocus) { focus_ring(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_field)); }
+}
+// A separator line in a menu's list.
+fun paint_separator(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    push(c, CMD_FILL, n.x + 4, n.y + n.h / 2, n.w - 8, 1, c.theme.border, null, 0);
+}
+// One row of an open drop-down or menu list.
+fun paint_option(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var current: bool = c.dd_cur == n.val;
+    var under: bool = contains(n, c.pointer_x, c.pointer_y);
+    if (current || under) { push_shape(c, n.x, n.y, n.w, n.h, 3, c.theme.selection, 0); }
+    var tint: u32 = n.eff_color;
+    var odn: i32 = dropdown_node(c, n.input_id);
+    if (odn == NONE || !c.nodes[odn].menu) {
+        if (c.slider_vals[slider_slot(c, n.input_id, 0)] == n.val) { tint = c.theme.accent; }   // the chosen one
+    }
+    push_text(c, n, n.x + c.theme.field_pad_x, n.y + 3, tint, &c.texts[n.text_start], n.text_len);
+}
+// A multi-line text area, scrolled to keep the caret in view.
+fun paint_textarea(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var afocus: bool = c.focus == n.input_id;
+    var af: ptr<Field> = field_get(c, n.input_id);
+    var pad_x: i32 = c.theme.field_pad_x;
+    var pad_y: i32 = c.theme.field_pad_y;
+    var inner_w: i32 = n.w - 2 * pad_x;
+    var inner_h: i32 = n.h - 2 * pad_y;
+    // keep the caret inside the visible part
+    var cl: i32 = line_of(af, af.cursor);
+    var cstart: i64 = line_start_of(af, af.cursor);
+    var ccol: i32 = text_width(c, &af.text[cstart], af.cursor - cstart);
+    if (af.cursor != af.seen_cursor || af.len != af.seen_len) {      // follow the caret only when it (or the text) moved,
+        if (ccol - af.scroll > inner_w) { af.scroll = ccol - inner_w; }       // so the wheel can scroll away from it
+        if (ccol < af.scroll) { af.scroll = ccol; }
+        if (cl * line_h < af.scroll_y) { af.scroll_y = cl * line_h; }
+        if ((cl + 1) * line_h > af.scroll_y + inner_h) { af.scroll_y = (cl + 1) * line_h - inner_h; }
+        af.seen_cursor = af.cursor;
+        af.seen_len = af.len;
+    }
+    var total: i32 = line_count(af) * line_h;
+    if (af.scroll_y > max_i32(total - inner_h, 0)) { af.scroll_y = max_i32(total - inner_h, 0); }
+    if (af.scroll_y < 0) { af.scroll_y = 0; }
+    var aedge: u32 = c.theme.border;
+    if (afocus) { aedge = c.theme.field_focus; }
+    push_shape(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_field), c.theme.field, aedge);
+    push(c, CMD_CLIP, n.x + 1, n.y + 1, n.w - 2, n.h - 2, 0, null, 0);
+    var tx: i32 = n.x + pad_x - af.scroll;
+    var ly: i32 = n.y + pad_y - af.scroll_y;
+    var s: i64 = 0;
+    var more: bool = true;
+    var lo: i64 = field_lo(af);
+    var hi: i64 = field_hi(af);
+    while (more) {
+        var e: i64 = line_end_of(af, s);
+        if (ly + line_h > n.y && ly < n.y + n.h) {                      // only the lines that show
+            if (afocus && lo < hi) {
+                var l2: i64 = lo;
+                if (s > l2) { l2 = s; }
+                var h2: i64 = hi;
+                if (e < h2) { h2 = e; }
+                if (l2 < h2) {
+                    var x1: i32 = text_width(c, &af.text[s], l2 - s);
+                    var x2: i32 = text_width(c, &af.text[s], h2 - s);
+                    push(c, CMD_FILL, tx + x1, ly, x2 - x1, line_h, c.theme.selection, null, 0);
+                }
+            }
+            if (e > s) { push_text(c, n, tx, ly, n.eff_color, &af.text[s], e - s); }
+            if (afocus && caret_on(c) && af.cursor >= s && af.cursor <= e && line_of(af, af.cursor) == line_of(af, s)) {
+                var cx2: i32 = text_width(c, &af.text[s], af.cursor - s);
+                push(c, CMD_FILL, tx + cx2, ly, 1, line_h, n.eff_color, null, 0);
+            }
+        }
+        ly += line_h;
+        if (e >= af.len) { more = false; } else { s = e + 1; }
+    }
+    if (af.len == 0 && !afocus && n.text_len > 0) {
+        push_text(c, n, n.x + pad_x, n.y + pad_y, c.theme.placeholder, &c.texts[n.text_start], n.text_len);
+    }
+    push(c, CMD_CLIP_END, 0, 0, 0, 0, 0, null, 0);
+    if (c.focus_visible && afocus) { focus_ring(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_field)); }
+}
+// A single-line text input.
+fun paint_input(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var focused: bool = c.focus == n.input_id;
+    var ty: i32 = n.y + (n.h - line_h) / 2;
+    var inner: i32 = n.w - 2 * c.theme.field_pad_x;
+    var f: ptr<Field> = field_get(c, n.input_id);
+    // keep the caret inside the visible part
+    var caret: i32 = text_width(c, f.text, f.cursor);
+    if (caret - f.scroll > inner) { f.scroll = caret - inner; }
+    if (caret < f.scroll) { f.scroll = caret; }
+    var tx: i32 = n.x + c.theme.field_pad_x - f.scroll;
+    var edge: u32 = c.theme.border;
+    if (focused) { edge = c.theme.field_focus; }
+    push_shape(c, n.x, n.y, n.w, n.h, radius_or(n, c.theme.radius_field), c.theme.field, edge);
+    push(c, CMD_CLIP, n.x + 1, n.y + 1, n.w - 2, n.h - 2, 0, null, 0);
+    if (focused && field_has_selection(f)) {
+        var a: i32 = text_width(c, f.text, field_lo(f));
+        var b: i32 = text_width(c, f.text, field_hi(f));
+        push(c, CMD_FILL, tx + a, ty, b - a, line_h, c.theme.selection, null, 0);
+    }
+    if (f.len > 0) {
+        push_text(c, n, tx, ty, n.eff_color, f.text, f.len);
+    } else if (!focused && n.text_len > 0) {
+        push_text(c, n, n.x + c.theme.field_pad_x, ty, c.theme.placeholder, &c.texts[n.text_start], n.text_len);
+    }
+    if (focused && caret_on(c)) {
+        push(c, CMD_FILL, tx + caret, ty, 1, line_h, n.eff_color, null, 0);
+    }
+    push(c, CMD_CLIP_END, 0, 0, 0, 0, 0, null, 0);
+}
+// A box (or scroll box): its own fill and outline, its children, and the scrollbars.
+fun paint_box(c: ptr<Ctx>, i: i32, hover: i32, line_h: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    push_shape(c, n.x, n.y, n.w, n.h, max_i32(n.radius, 0), n.background, n.border);
+    if (n.scroll_id != NONE) {
+        push(c, CMD_CLIP, n.x, n.y, n.w, n.h, 0, null, 0);
+    }
+    var ch: i32 = n.first;
+    while (ch != NONE) {
+        var next: i32 = c.nodes[ch].next;
+        paint_node(c, ch, hover);
+        ch = next;
+    }
+    n = &c.nodes[i];                               // (the tree does not change while painting)
+    if (n.scroll_id != NONE) {
+        // scrollbars: a track and a thumb along the right edge, and along the
+        // bottom edge for a box that scrolls sideways
+        var bar: array<i32, 4>;
+        bar[0] = 0; bar[1] = 0; bar[2] = 0; bar[3] = 0;
+        if (scrollbar(c, n, &bar[0])) {
+            push(c, CMD_FILL, bar[0], n.y, c.theme.scrollbar_w, bar[3], c.theme.scroll_track, null, 0);
+            push(c, CMD_ROUND_FILL, bar[0], bar[1], c.theme.scrollbar_w, bar[2], c.theme.scroll_thumb, null, (c.theme.scrollbar_w / 2) as i64);
+        }
+        if (hscrollbar(c, n, &bar[0])) {
+            push(c, CMD_FILL, n.x, bar[0], bar[3], c.theme.scrollbar_w, c.theme.scroll_track, null, 0);
+            push(c, CMD_ROUND_FILL, bar[1], bar[0], bar[2], c.theme.scrollbar_w, c.theme.scroll_thumb, null, (c.theme.scrollbar_w / 2) as i64);
+        }
+        push(c, CMD_CLIP_END, 0, 0, 0, 0, 0, null, 0);
+    }
+}
+
+// Paints node `i` (and its children) by what kind of node it is.
+pub fun paint_node(c: ptr<Ctx>, i: i32, hover: i32) {
+    var n: ptr<Node> = &c.nodes[i];
+    var kind: i32 = n.kind;
+    c.cur_size = n.eff_size;
+    var line_h: i32 = text_height(c);
+    if (kind == K_TEXT) { paint_text(c, i, hover, line_h); }
+    else if (kind == K_BUTTON) { paint_button(c, i, hover, line_h); }
+    else if (kind == K_CHECKBOX) { paint_checkbox(c, i, hover, line_h); }
+    else if (kind == K_PROGRESS) { paint_progress(c, i, hover, line_h); }
+    else if (kind == K_SLIDER) { paint_slider(c, i, hover, line_h); }
+    else if (kind == K_DROPDOWN && n.menu) { paint_menu(c, i, hover, line_h); }
+    else if (kind == K_DROPDOWN) { paint_dropdown(c, i, hover, line_h); }
+    else if (kind == K_OPTION && n.sep) { paint_separator(c, i, hover, line_h); }
+    else if (kind == K_OPTION) { paint_option(c, i, hover, line_h); }
+    else if (kind == K_TEXTAREA) { paint_textarea(c, i, hover, line_h); }
+    else if (kind == K_INPUT) { paint_input(c, i, hover, line_h); }
+    else { paint_box(c, i, hover, line_h); }
+}
+
+// FNV-1a over everything that decides the pixels: the target size and every
+// draw command, text bytes included.
+pub fun fingerprint(c: ptr<Ctx>, width: i32, height: i32) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    h = (h ^ ((width as i64) as u64)) * 0x100000001b3;
+    h = (h ^ ((height as i64) as u64)) * 0x100000001b3;
+    var i: i64 = 0;
+    while (i < c.ncmds) {
+        var d: ptr<DrawCmd> = cmd_at(c, i);
+        h = (h ^ ((d.kind as i64) as u64)) * 0x100000001b3;
+        h = (h ^ ((d.x as u32) as u64)) * 0x100000001b3;
+        h = (h ^ ((d.y as u32) as u64)) * 0x100000001b3;
+        h = (h ^ ((d.w as u32) as u64)) * 0x100000001b3;
+        h = (h ^ ((d.h as u32) as u64)) * 0x100000001b3;
+        h = (h ^ (d.color as u64)) * 0x100000001b3;
+        h = (h ^ (d.text_len as u64)) * 0x100000001b3;
+        if (d.text != null && d.text_len > 0) {
+            var k: i64 = 0;
+            while (k < d.text_len) {
+                h = (h ^ (d.text[k] as u64)) * 0x100000001b3;
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    return h;
+}
+
+// Builds the draw list for a window of `width` x `height` pixels.
+pub fun core_paint(c: ptr<Ctx>, width: i32, height: i32) {
+    if (c == null) { return; }
+    c.ncmds = 0;
+    push(c, CMD_FILL, 0, 0, width, height, c.theme.bg, null, 0);
+    var hover: i32 = button_at(c, c.pointer_x, c.pointer_y);
+    if (c.root != NONE) { paint_node(c, c.root, hover); }
+    var ov: i32 = 0;
+    while (ov < c.nnodes) {                            // overlays on top, in the order they were made
+        if (c.nodes[ov].overlay) {
+            if (c.nodes[ov].tipbox) {                  // a tooltip shows once the pointer has rested
+                if (c.tip_since < 0) { c.tip_since = c.time_ms; }
+                if (c.time_ms - c.tip_since >= TIP_DELAY_MS) { paint_node(c, ov, hover); }
+            } else {
+                paint_node(c, ov, hover);
+            }
+        }
+        ov += 1;
+    }
+    var hash: u64 = fingerprint(c, width, height);
+    c.changed = !c.have_hash || c.last_hash != hash;
+    c.last_hash = hash;
+    c.have_hash = true;
+}
+
+// True when the last core_paint produced a different picture than the one
+// before it (or is the first); false when painting it again would change nothing.
+pub fun core_changed(c: ptr<Ctx>) -> bool {
+    if (c == null) { return true; }
+    return c.changed;
+}
+
+// Draw list of the last core_paint (DRAW_CMD_SIZE bytes per command); valid
+// until the next core_clear / core_paint.
+pub fun core_cmds(c: ptr<Ctx>, out_count: ptr<i64>) -> ptr<u8> {
+    if (c == null) { return null; }
+    if (out_count != null) { out_count[0] = c.ncmds; }
+    return c.cmds;
+}

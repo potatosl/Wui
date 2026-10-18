@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Core types: the constants, the Node / Field / Ctx structs and the small helpers every other part
+// of the core shares (src/core.wave re-exports the public ones).
+
+import("wui::font")::{FontEngine, font_text_height_sz, font_text_width_sz};
+import("wui::theme")::{Theme};
+import("std::mem::layout")::{size_of};
+
+pub const NONE: i32 = -1;
+
+pub const FIELD_MAX_BYTES: i64 = 4096;
+
+// Result bits of core_text_input / core_key_input.
+pub const INPUT_CHANGED: i32 = 1;     // the focused input's text changed
+
+pub const INPUT_SUBMIT: i32 = 2;      // Enter was pressed in the focused input
+
+pub const INPUT_COPY: i32 = 4;        // Ctrl+C with a selection: the app copies core_selection
+
+pub const INPUT_CUT: i32 = 8;         // Ctrl+X with a selection: copy it, then delete (Backspace)
+
+pub const INPUT_PASTE: i32 = 16;      // Ctrl+V: the app feeds the clipboard text with core_text_input
+
+pub const INPUT_ACTIVATED: i32 = 32;  // Enter / Space pressed a focused button or checkbox: its message is core_activated
+
+pub const INPUT_FOCUS_MOVED: i32 = 64; // Tab / Shift+Tab moved the keyboard focus
+
+// Key codes of EV_KEY.
+pub const KEY_BACKSPACE: i32 = 8;
+
+pub const KEY_TAB: i32 = 9;
+
+pub const KEY_ESCAPE: i32 = 27;
+
+pub const KEY_ENTER: i32 = 13;
+
+pub const KEY_DELETE: i32 = 127;
+
+pub const KEY_LEFT: i32 = 1001;
+
+pub const KEY_RIGHT: i32 = 1002;
+
+pub const KEY_UP: i32 = 1003;
+
+pub const KEY_DOWN: i32 = 1004;
+
+pub const KEY_HOME: i32 = 1005;
+
+pub const KEY_END: i32 = 1006;
+
+pub const KEY_PAGE_UP: i32 = 1007;
+
+pub const KEY_PAGE_DOWN: i32 = 1008;
+
+pub const MOD_SHIFT: i32 = 1;
+
+pub const MOD_CTRL: i32 = 2;
+
+// Node kinds.
+pub const K_BOX: i32 = 0;
+
+pub const K_TEXT: i32 = 1;
+
+pub const K_BUTTON: i32 = 2;
+
+pub const K_INPUT: i32 = 3;
+
+pub const K_CHECKBOX: i32 = 4;
+
+pub const K_PROGRESS: i32 = 5;
+
+pub const K_SLIDER: i32 = 6;
+
+pub const LEFT_PAD: i32 = 4;                  // text indent of a left-aligned button
+
+pub const TIP_DELAY_MS: i64 = 500;            // how long the pointer rests on a node before its tooltip shows
+
+pub const K_DROPDOWN: i32 = 7;
+
+pub const K_TEXTAREA: i32 = 9;                // a multi-line text input
+
+pub const K_OPTION: i32 = 8;                  // one row of an open drop-down list (made by the core, inside an overlay)
+
+// Style property codes for core_style.
+pub const P_DIRECTION: i32 = 0;
+
+pub const P_PADDING: i32 = 1;
+
+pub const P_GAP: i32 = 2;
+
+pub const P_WIDTH: i32 = 3;
+
+pub const P_HEIGHT: i32 = 4;
+
+pub const P_GROW: i32 = 5;
+
+pub const P_ALIGN: i32 = 6;
+
+pub const P_JUSTIFY: i32 = 7;
+
+pub const P_BACKGROUND: i32 = 8;
+
+pub const P_BORDER: i32 = 9;
+
+pub const P_MARGIN: i32 = 10;         // outer space around the node (all sides)
+
+pub const P_RADIUS: i32 = 11;         // corner radius; -1 = the widget's default
+
+pub const P_COLOR: i32 = 12;          // text colour, inherited by the children; 0 = inherit
+
+pub const P_FONT_SIZE: i32 = 13;      // text size in px, inherited by the children; 0 = inherit
+
+pub const P_BOLD: i32 = 14;           // 1 bold, 0 regular, -1 inherit (inherited by the children)
+
+pub const DIR_COLUMN: i64 = 0;
+
+pub const DIR_ROW: i64 = 1;
+
+// align (cross axis) and justify (main axis) values
+pub const START: i64 = 0;
+
+pub const CENTER: i64 = 1;
+
+pub const END: i64 = 2;
+
+pub const STRETCH: i64 = 3;           // align only
+
+pub const BETWEEN: i64 = 3;           // justify only
+
+pub const AUTO: i32 = -1;
+
+//
+// An overlay is a box that floats above the rest: a dialog, a menu, a tooltip, a drop-down
+// list. It is laid out on its own after the main tree (at a window position, or next to
+// another node), painted last, and it takes every click and wheel turn over its area; Tab
+// stays inside the topmost one. Fill it like any box: use the returned id as a parent.
+pub const OVERLAY_AT: i32 = 0;            // at window position (dx, dy)
+
+pub const OVERLAY_BELOW: i32 = 1;         // under the anchor node, left edges aligned, then moved by (dx, dy)
+
+pub const OVERLAY_ABOVE: i32 = 2;         // over the anchor
+
+pub const OVERLAY_RIGHT: i32 = 3;         // to the right of the anchor
+
+pub const OVERLAY_MATCH_WIDTH: i32 = 16;  // added to a placement: at least as wide as the anchor
+
+pub const OVERLAY_FULL: i32 = 32;         // alone: the whole window (a modal backdrop)
+
+pub struct Node {
+    kind: i32;
+    // children are a linked list in insertion order
+    first: i32;
+    last: i32;
+    next: i32;
+    nchild: i32;
+    text_start: i64;
+    text_len: i64;
+    msg: i32;
+    input_id: i32;                    // Input only: the caller's stable id
+    parent: i32;                      // NONE for the root
+    scroll_id: i32;                   // scroll box only: the caller's stable id, else NONE
+    content_h: i32;                   // natural height of the content (before a fixed height)
+    scroll_off: i32;                  // scroll box: current offset in pixels (valid after layout)
+    scroll_max: i32;                  // scroll box: largest offset (content height - box height, >= 0)
+    scroll_x: bool;                   // scroll box: also scrolls horizontally (core_scroll_box_xy)
+    content_w: i32;                   // natural width of the content (before a fixed width)
+    scroll_xoff: i32;                 // scroll box: horizontal offset in pixels (valid after layout)
+    scroll_xmax: i32;                 // scroll box: largest horizontal offset (content width - box width, >= 0)
+    checked: bool;                    // Checkbox / radio: ticked; tab: the selected one
+    radio: bool;                      // a checkbox drawn and used as a radio button
+    tab: bool;                        // a button drawn as a tab
+    val: i32;                         // progress bar: the value (0..vmax); slider: the minimum
+    vmax: i32;                        // the maximum
+    overlay: bool;                    // the root of an overlay: laid out on its own, painted last, on top (core_overlay)
+    in_ov: bool;                      // this node is an overlay root or inside one
+    ov_anchor: i32;                   // overlay: the node it is placed against, or NONE (then dx / dy are window coordinates)
+    ov_place: i32;                    // overlay: OVERLAY_* placement (+ OVERLAY_MATCH_WIDTH)
+    ov_dx: i32;
+    ov_dy: i32;
+    popup: bool;                      // overlay: the list of an open drop-down (made by the core)
+    left: bool;                       // button: the label starts at the left edge (+ LEFT_PAD) instead of being centred, and is cut at the edge
+    menu: bool;                       // drop-down: a menu - its first line is the label, the rest are items that yield messages
+    sep: bool;                        // option: a separator line of a menu
+    tipbox: bool;                     // overlay: a tooltip (made by the core; never blocks the pointer)
+    tip_start: i64;                   // tooltip text of this node (core_tooltip), tip_len 0 = none
+    tip_len: i64;
+    font_size: i32;                   // text size in px for this node and its children, 0 = inherit
+    bold: i32;                        // 1 bold, 2 regular (overrides the parent's), 0 = inherit
+    eff_size: i32;                    // the size in effect (computed by layout)
+    eff_bold: bool;
+    // style
+    row: bool;
+    padding: i32;
+    gap: i32;
+    width: i32;                       // AUTO or fixed pixels
+    height: i32;                      // AUTO or fixed pixels
+    grow: i32;                        // share of the free main-axis space (0 = none)
+    align: i64;
+    justify: i64;
+    background: u32;                  // 0xAARRGGBB, 0 = none
+    border: u32;                      // 0xAARRGGBB, 0 = none
+    margin: i32;
+    radius: i32;                      // AUTO (-1) = the widget's default
+    color: u32;                       // own text colour, 0 = inherit
+    eff_color: u32;                   // colour in effect (computed by layout)
+    // computed by layout
+    nat_w: i32;
+    nat_h: i32;
+    text_w: i32;
+    x: i32;
+    y: i32;
+    w: i32;
+    h: i32;
+}
+
+// Editing state of one input; it outlives frames (the tree is rebuilt each
+// frame, inputs are found again by their id).
+pub struct Field {
+    id: i32;
+    text: ptr<u8>;                    // FIELD_MAX_BYTES + 1 bytes, kept NUL-terminated
+    len: i64;
+    cursor: i64;                      // byte offset, always on a char boundary: where typing happens
+    anchor: i64;                      // the other end of the selection; equal to `cursor` = nothing selected
+    scroll: i32;                      // horizontal scroll in pixels
+    multi: bool;                      // a multi-line text area (Enter types a newline, Up / Down move between lines)
+    scroll_y: i32;                    // text area: vertical scroll in pixels
+    want_x: i32;                      // text area: the column (pixels) Up / Down try to keep, or -1
+    seen_cursor: i64;                 // text area: where the caret was when the view last followed it
+    seen_len: i64;
+}
+
+pub struct Ctx {
+    fe: ptr<FontEngine>;
+    theme: ptr<Theme>;                // the look of the built-in widgets (theme.wave)
+    nodes: ptr<Node>;
+    nnodes: i32;
+    cap_nodes: i32;
+    fields: ptr<Field>;
+    nfields: i32;
+    cap_fields: i32;
+    scroll_ids: ptr<i32>;             // scroll id -> offset; outlives frames like `fields`
+    slider_ids: ptr<i32>;             // slider id -> value; outlives frames like `fields`
+    slider_vals: ptr<i32>;
+    nsliders: i32;
+    cap_sliders: i32;
+    scroll_vals: ptr<i32>;            // vertical offsets; scroll_xvals holds the horizontal ones
+    scroll_xvals: ptr<i32>;
+    nscrolls: i32;
+    cap_scrolls: i32;
+    focus: i32;                       // input id, or NONE
+    wfocus: i32;                      // message of the focused button / checkbox, or NONE (at most one of focus / wfocus is set)
+    focus_visible: bool;              // draw the focus ring: the focus came from the keyboard, not the mouse
+    activated: i32;                   // message of the last activation (Enter / Space on the focused widget), or NONE
+    cur_size: i32;                    // the font size text_width / text_height measure at (set per node)
+    dd_open: i32;                     // control id of the drop-down whose list is open, or NONE
+    dd_cur: i32;                      // ... and the row highlighted in it
+    tip_node: i32;                    // the node with a tooltip under the pointer, or NONE
+    tip_since: i64;                   // when the tooltip was first painted (-1: not yet)
+    tip_blocked: bool;                // a click hides the tooltip until the pointer moves to another node
+    time_ms: i64;                     // the current time, set by the app (core_set_time); drives the caret blink
+    blink_epoch: i64;                 // when the caret last moved or was typed with: it is on from then
+    drag: i32;                        // input id while the mouse button is held after pressing it, or NONE
+    bar_active: bool;                 // a scrollbar thumb is being dragged
+    bar_horiz: bool;                  // ... the horizontal one
+    bar_id: i32;                      // ... of this scroll box,
+    bar_grab: i32;                    // ... grabbed this many pixels from the thumb's start
+    root: i32;
+    texts: ptr<u8>;
+    ntexts: i64;
+    cap_texts: i64;
+    cmds: ptr<u8>;                    // DrawCmd records
+    ncmds: i64;
+    cap_cmds: i64;
+    pointer_x: i32;
+    pointer_y: i32;
+    pointer_down: bool;
+    have_hash: bool;
+    last_hash: u64;                   // fingerprint of the last painted frame
+    changed: bool;                    // did the last paint differ from the one before?
+}
+
+// The context's theme, to read or change in place: edits apply from the next
+// layout / paint on.
+pub fun core_theme(c: ptr<Ctx>) -> ptr<Theme> {
+    return c.theme;
+}
+
+// Replaces the context's theme with a copy of `t`.
+pub fun core_set_theme(c: ptr<Ctx>, t: ptr<Theme>) {
+    if (c == null || t == null) { return; }
+    var src: ptr<u8> = t as ptr<u8>;
+    var dst: ptr<u8> = c.theme as ptr<u8>;
+    var n: i64 = size_of<Theme>() as i64;
+    var i: i64 = 0;
+    while (i < n) { dst[i] = src[i]; i += 1; }
+}
+
+// The text engine a context measures and draws with (render.wave takes it too).
+pub fun core_fe(c: ptr<Ctx>) -> ptr<FontEngine> {
+    return c.fe;
+}
+
+pub fun max_i32(a: i32, b: i32) -> i32 {
+    if (a > b) { return a; }
+    return b;
+}
+
+pub fun min_i32(a: i32, b: i32) -> i32 {
+    if (a < b) { return a; }
+    return b;
+}
+
+pub fun clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+pub fun abs_i32(v: i32) -> i32 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+pub fun text_width(c: ptr<Ctx>, text: ptr<u8>, len: i64) -> i32 {
+    return font_text_width_sz(c.fe, text, len, c.cur_size);
+}
+
+pub fun text_height(c: ptr<Ctx>) -> i32 {
+    return font_text_height_sz(c.fe, c.cur_size);
+}
+
+pub fun copy_bytes(dst: ptr<u8>, src: ptr<u8>, n: i64) {
+    var i: i64 = 0;
+    while (i < n) { dst[i] = src[i]; i += 1; }
+}

@@ -1,0 +1,213 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Tests of the X11 backend (src/window/x11.wave): key and modifier mapping,
+// text events, and - when a display is available - opening a window and a real
+// clipboard round trip between two windows (two X connections, as two programs
+// would have). The windows are never mapped, so nothing appears on the screen;
+// the clipboard test briefly replaces the system clipboard and puts the old text
+// back afterwards. Without a display the display tests are skipped.
+//
+// Needs libX11. Run with:  WUI_TASK=xtest wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui::window::x11")::{XW, XEv, xw_open, xw_close, xw_width, xw_height, xw_pixels, xw_present, xw_service, xw_next_event_timeout, xw_dpi_percent,
+                            xw_clipboard_set, xw_clipboard_get, xw_clipboard_request, xw_clipboard_collect,
+                            x11_key_from_keysym, x11_mods_from_state, x11_is_text, x11_set_text, x11_new_event,
+                            x11_free_event, TEXT_MAX};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+import("std::time::clock")::{time_now_monotonic_ns};
+
+extern(c, "usleep") fun c_usleep(usec: u32) -> i32;
+
+struct T {
+    name: str;
+    checks: i32;
+    failures: i32;
+}
+
+fun eq(t: ptr<T>, what: str, got: i64, want: i64) {
+    t.checks += 1;
+    if (got != want) {
+        t.failures += 1;
+        println("FAIL {}: {}: got {} want {}", t.name, what, got, want);
+    }
+}
+
+fun ok(t: ptr<T>, what: str, cond: bool) {
+    t.checks += 1;
+    if (!cond) {
+        t.failures += 1;
+        println("FAIL {}: {}", t.name, what);
+    }
+}
+
+fun slen(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) { n += 1; }
+    return n;
+}
+
+fun test_keysyms_map_to_wui_keys(t: ptr<T>) {
+    t.name = "keysyms_map_to_wui_keys";
+    eq(t, "backspace", x11_key_from_keysym(0xff08) as i64, 8);
+    eq(t, "return", x11_key_from_keysym(0xff0d) as i64, 13);
+    eq(t, "keypad enter", x11_key_from_keysym(0xff8d) as i64, 13);
+    eq(t, "left", x11_key_from_keysym(0xff51) as i64, 1001);
+    eq(t, "tab", x11_key_from_keysym(0xff09) as i64, 9);
+    eq(t, "shift+tab (ISO_Left_Tab)", x11_key_from_keysym(0xfe20) as i64, 9);
+    eq(t, "page down", x11_key_from_keysym(0xff56) as i64, 1008);
+    eq(t, "'a' is text, not a key", x11_key_from_keysym(0x61) as i64, 0);
+}
+
+fun test_modifier_bits(t: ptr<T>) {
+    t.name = "modifier_bits";
+    eq(t, "none", x11_mods_from_state(0) as i64, 0);
+    eq(t, "shift + ctrl", x11_mods_from_state(1 + 4) as i64, 1 + 2);
+    eq(t, "alt", x11_mods_from_state(8) as i64, 4);
+    eq(t, "NumLock is not a modifier we report", x11_mods_from_state(0x10) as i64, 0);
+}
+
+fun test_text_event_never_splits_a_character(t: ptr<T>) {
+    t.name = "text_event_never_splits_a_character";
+    var e: ptr<XEv> = x11_new_event();
+    var three: ptr<u8> = "가나다" as ptr<u8>;
+    x11_set_text(e, three, 9);
+    eq(t, "kind", e.kind as i64, 8);
+    eq(t, "length", e.text_len as i64, 9);
+    var same: bool = true;
+    var i: i32 = 0;
+    while (i < 9) { if (e.text[i] != three[i as i64]) { same = false; } i += 1; }
+    ok(t, "bytes", same);
+    // 60 bytes: only 10 whole characters fit in 32
+    var long: ptr<u8> = mem_alloc(61);
+    i = 0;
+    while (i < 20) {
+        var g: ptr<u8> = "가" as ptr<u8>;
+        long[i * 3] = g[0]; long[i * 3 + 1] = g[1]; long[i * 3 + 2] = g[2];
+        i += 1;
+    }
+    long[60] = 0;
+    x11_set_text(e, long, 60);
+    eq(t, "cut at a character boundary", e.text_len as i64, 30);
+    eq(t, "within the limit", (e.text_len <= TEXT_MAX) as i64, 1);
+    mem_free(long, 61);
+    x11_free_event(e);
+}
+
+fun test_control_characters_are_not_text(t: ptr<T>) {
+    t.name = "control_characters_are_not_text";
+    ok(t, "letter", x11_is_text("a" as ptr<u8>, 1));
+    ok(t, "Hangul", x11_is_text("한" as ptr<u8>, 3));
+    ok(t, "empty", !x11_is_text("" as ptr<u8>, 0));
+    ok(t, "backspace", !x11_is_text("\x08" as ptr<u8>, 1));
+    ok(t, "carriage return", !x11_is_text("\r" as ptr<u8>, 1));
+    ok(t, "delete", !x11_is_text("\x7f" as ptr<u8>, 1));
+}
+
+fun test_window_opens_and_presents(t: ptr<T>) {
+    t.name = "window_opens_and_presents";
+    var title: ptr<u8> = "wui test" as ptr<u8>;
+    var w: ptr<XW> = xw_open(title, 8, 64, 48, false);
+    if (w == null) {
+        println("no X display; skipping the display tests");
+        return;
+    }
+    eq(t, "width", xw_width(w) as i64, 64);
+    eq(t, "height", xw_height(w) as i64, 48);
+    ok(t, "pixel buffer", xw_pixels(w) != null);
+    var px: ptr<u32> = xw_pixels(w);
+    eq(t, "background", px[0] as i64, 0xFFF0F0F0);
+    var dpi: i32 = xw_dpi_percent(w);
+    ok(t, "the dpi scale is sane", dpi >= 50 && dpi <= 400);
+    xw_present(w);
+    xw_close(w);
+    ok(t, "bad size", xw_open(title, 1, 0, 10, false) == null);
+    ok(t, "huge size", xw_open(title, 1, 20000, 10, false) == null);
+}
+
+fun test_a_timed_wait_gives_up(t: ptr<T>) {
+    t.name = "a_timed_wait_gives_up";
+    var w: ptr<XW> = xw_open("wui timer" as ptr<u8>, 9, 40, 40, false);
+    if (w == null) { return; }
+    var e: ptr<XEv> = x11_new_event();
+    // an unmapped window gets no input: the wait ends by itself, after about the time asked
+    var t0: i64 = time_now_monotonic_ns();
+    var kind: i32 = xw_next_event_timeout(w, e, 60);
+    var ms: i64 = (time_now_monotonic_ns() - t0) / 1000000;
+    eq(t, "the kind is EV_TIMEOUT", kind as i64, 11);
+    ok(t, "it waited about 60 ms", ms >= 55 && ms < 400);
+    t0 = time_now_monotonic_ns();
+    xw_next_event_timeout(w, e, 0);
+    ms = (time_now_monotonic_ns() - t0) / 1000000;
+    ok(t, "a zero wait returns at once", ms < 50);
+    x11_free_event(e);
+    xw_close(w);
+}
+
+// Reads the clipboard through `reader` while `owner` serves it: one thread, so
+// the two sides take turns.
+fun paste(reader: ptr<XW>, owner: ptr<XW>, buf: ptr<u8>, cap: i64) -> i64 {
+    if (xw_clipboard_request(reader)) { return xw_clipboard_collect(reader, buf, cap, 0); }
+    var tries: i32 = 0;
+    while (tries < 400) {
+        xw_service(owner);
+        var n: i64 = xw_clipboard_collect(reader, buf, cap, 0);
+        if (n >= 0) { return n; }
+        c_usleep(5000);
+        tries += 1;
+    }
+    return -1;
+}
+
+fun test_clipboard_round_trip_between_two_windows(t: ptr<T>) {
+    t.name = "clipboard_round_trip_between_two_windows";
+    var title: ptr<u8> = "wui reader" as ptr<u8>;
+    var reader: ptr<XW> = xw_open(title, 10, 40, 40, false);
+    if (reader == null) { return; }
+    var cap: i64 = 600;
+    var buf: ptr<u8> = mem_alloc(cap);
+    var prev: ptr<u8> = mem_alloc(cap);
+    var prev_len: i64 = xw_clipboard_get(reader, prev, cap);     // best effort: only text can be restored
+
+    var owner: ptr<XW> = xw_open("wui owner" as ptr<u8>, 9, 40, 40, false);
+    ok(t, "second window", owner != null);
+    var text: str = "복사한 text / 한글 ✓";
+    xw_clipboard_set(owner, text as ptr<u8>, slen(text));
+
+    var n: i64 = paste(reader, owner, buf, cap);
+    eq(t, "pasted length", n, slen(text));
+    var tp: ptr<u8> = text as ptr<u8>;
+    var same: bool = n == slen(text);
+    var i: i64 = 0;
+    while (same && i < n) { if (buf[i] != tp[i]) { same = false; } i += 1; }
+    ok(t, "pasted text", same);
+
+    // taking the clipboard over: the old owner is told (SelectionClear) and the new one wins
+    var second: str = "second";
+    xw_clipboard_set(reader, second as ptr<u8>, slen(second));
+    xw_service(owner);
+    ok(t, "the old owner lost it", owner.clip_text == null);
+    n = xw_clipboard_get(reader, buf, cap);
+    eq(t, "own text length", n, 6);
+    ok(t, "own text", buf[0] == 115 && buf[5] == 100);        // "second"
+
+    xw_close(owner);
+    if (prev_len >= 0) { xw_clipboard_set(reader, prev, prev_len); }
+    xw_close(reader);
+    mem_free(buf, cap);
+    mem_free(prev, cap);
+}
+
+fun main() {
+    var t: T = T { name: "", checks: 0, failures: 0 };
+    test_keysyms_map_to_wui_keys(&t);
+    test_modifier_bits(&t);
+    test_text_event_never_splits_a_character(&t);
+    test_control_characters_are_not_text(&t);
+    test_window_opens_and_presents(&t);
+    test_a_timed_wait_gives_up(&t);
+    test_clipboard_round_trip_between_two_windows(&t);
+    println("window_x11_test: {}/{} checks passed", t.checks - t.failures, t.checks);
+    if (t.failures != 0) { println("window_x11_test: {} FAILED", t.failures); }
+}

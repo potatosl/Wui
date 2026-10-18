@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// wui build driver, written in Wave. Run from the repository root:
+//
+//   wavec run build.wave                        run the tests (Wave unit tests + the X11 backend tests)
+//   WUI_TASK=wtest wavec run build.wave         only the Wave unit tests (need nothing but Wave and libc)
+//   WUI_TASK=jtest wavec run build.wave         only the theme JSON tests (wjson)
+//   WUI_TASK=xtest wavec run build.wave         only the X11 backend tests (need libX11; windows are never shown)
+//   WUI_TASK=examples wavec run build.wave      build every example (nothing is started)
+//   WUI_TASK=bench wavec run build.wave         frame-time benchmark (WUI_BENCH_FRAMES sets the frame count)
+//   WUI_TASK=package wavec run build.wave      dist/wui-<version>.tar.gz for users (WUI_VERSION, default 0.1.0; needs tar and cp)
+//   WUI_TASK=check WUI_TARGET=<triple> wavec run build.wave   compile the winplat crate and every example for another target
+//   WUI_RUN=scroll wavec run build.wave        build and start examples/scroll.wave
+//   WUI_DRY_RUN=1 wavec run build.wave          print the commands without running them
+//
+// Everything is Wave except the Windows and macOS window backends (winplat/, Rust):
+// a window procedure / Cocoa needs function addresses, which Wave cannot take. On Windows
+// (x86_64 and ARM64) and macOS (Intel and Apple silicon) this driver builds that crate
+// first and links it; on Linux / FreeBSD cargo is not needed (X11 is Wave code).
+//
+// Cross building: WUI_TARGET=<triple> (aarch64-pc-windows-msvc, x86_64-pc-windows-msvc,
+// aarch64-apple-darwin, x86_64-apple-darwin) passes --target to wavec and cargo. Linking
+// for another OS needs that OS's system libraries, so on a different machine use
+// WUI_TASK=check, which only compiles every example for the target (objects, no link).
+// Other knobs: WAVEC (default "wavec"), WAVE_STD (explicit std root), CARGO.
+//
+// Wave's `main` takes no arguments, so tasks are picked by environment
+// variables. Commands go through the C library's system().
+
+import("std::buffer::types")::{Buffer};
+import("std::buffer::alloc")::{buffer_new, buffer_free, buffer_clear};
+import("std::buffer::write")::{buffer_push, buffer_append_str};
+import("std::buffer::read")::{buffer_as_ptr};
+import("std::fs::file")::{fs_exists, create_dir};
+
+extern(c, "system") fun c_system(command: ptr<u8>) -> i32;
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
+extern(c, "fflush") fun c_fflush(stream: ptr<u8>) -> i32;
+
+static WINDOWS: bool = false;      // the machine running this driver (shell syntax, .exe)
+static TARGET: str = "";           // WUI_TARGET, "" = this machine
+static TARGET_OS: i32 = 0;         // what the programs are built for: 0 X11 (Linux / FreeBSD), 1 Windows, 2 macOS
+static DRY: bool = false;
+static FAILED: i32 = 0;
+
+// ---- small helpers -----------------------------------------------------------------
+
+fun streq(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    if (pa == null || pb == null) { return pa == pb; }
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) { i += 1; }
+    return pa[i] == pb[i];
+}
+
+fun env_or(name: str, fallback: str) -> str {
+    var v: ptr<u8> = c_getenv(name as ptr<u8>);
+    if (v == null || v[0] == 0) { return fallback; }
+    return v as str;
+}
+
+fun env_set(name: str) -> bool {
+    var v: ptr<u8> = c_getenv(name as ptr<u8>);
+    return v != null && v[0] != 0;
+}
+
+fun contains(text: str, part: str) -> bool {
+    var t: ptr<u8> = text as ptr<u8>;
+    var p: ptr<u8> = part as ptr<u8>;
+    var i: i64 = 0;
+    while (t[i] != 0) {
+        var j: i64 = 0;
+        while (p[j] != 0 && t[i + j] == p[j]) { j += 1; }
+        if (p[j] == 0) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+fun add(b: ptr<Buffer>, text: str) {
+    buffer_append_str(b, text);
+}
+
+// Path for the current shell (cmd.exe needs backslashes to execute).
+fun add_path(b: ptr<Buffer>, path: str) {
+    var p: ptr<u8> = path as ptr<u8>;
+    var i: i64 = 0;
+    while (p[i] != 0) {
+        if (WINDOWS && p[i] == 47) { buffer_push(b, 92); } else { buffer_push(b, p[i]); }
+        i += 1;
+    }
+}
+
+fun add_exe(b: ptr<Buffer>, path: str) {
+    add_path(b, path);
+    if (WINDOWS) { add(b, ".exe"); }
+}
+
+// Runs the command collected in b, then clears b. Returns the exit status.
+fun sh(b: ptr<Buffer>) -> i32 {
+    buffer_push(b, 0);
+    var text: ptr<u8> = buffer_as_ptr(b);
+    println("    $ {}", text as str);
+    if (DRY) {
+        buffer_clear(b);
+        return 0;
+    }
+    c_fflush(null);                         // keep our output ordered with the child's
+    var rc: i32 = c_system(text);
+    buffer_clear(b);
+    return rc;
+}
+
+fun step(title: str) {
+    println("\x1b[36m==>\x1b[0m {}", title);
+}
+
+fun must(b: ptr<Buffer>) -> bool {
+    if (sh(b) != 0) {
+        FAILED += 1;
+        println("\x1b[31mcommand failed\x1b[0m");
+        return false;
+    }
+    return true;
+}
+
+// ---- toolchain flags ------------------------------------------------------------------
+
+// The std root: WAVE_STD, else the installer layout (~/.wave/bin/std) when it exists.
+fun add_std_root(b: ptr<Buffer>) {
+    if (env_set("WAVE_STD")) {
+        add(b, " --std-root=");
+        add(b, env_or("WAVE_STD", ""));
+        return;
+    }
+    var home: str = env_or("HOME", "");
+    if (!streq(home, "")) {
+        var dir: Buffer = buffer_new(128);
+        add(&dir, home);
+        add(&dir, "/.wave/bin/std");
+        buffer_push(&dir, 0);
+        if (fs_exists(buffer_as_ptr(&dir) as str)) {
+            add(b, " --std-root=");
+            add(b, buffer_as_ptr(&dir) as str);
+        }
+        buffer_free(&dir);
+    }
+}
+
+// Where cargo leaves the winplat library.
+fun add_winplat_lib(b: ptr<Buffer>) {
+    add(b, " build/cargo/");
+    if (!streq(TARGET, "")) {
+        add(b, TARGET);
+        add(b, "/");
+    }
+    if (TARGET_OS == 1) { add(b, "release/wui_win.lib"); } else { add(b, "release/libwui_win.a"); }
+}
+
+// Link flags of a program that uses wui. Linux: libX11 by its runtime name (the
+// plain libX11.so symlink only exists with the -dev package). Windows: the Rust
+// window backend and the system libraries Rust's std wants (rustc --print
+// native-static-libs). macOS: the Rust backend and libSystem; the frameworks are
+// loaded at run time by the backend itself.
+fun add_link_flags(b: ptr<Buffer>) {
+    if (!streq(TARGET, "")) {
+        add(b, " --target=");
+        add(b, TARGET);
+    }
+    if (TARGET_OS == 1) {
+        add_winplat_lib(b);
+        add(b, " --link=user32 --link=gdi32 --link=kernel32 --link=ntdll --link=userenv --link=ws2_32 --link=dbghelp");
+    } else if (TARGET_OS == 2) {
+        add_winplat_lib(b);
+        add(b, " --link=System --link=c --link=m");
+    } else {
+        add(b, " --link=:libX11.so.6 --link=m --link=c");
+    }
+}
+
+// wavec build <source> --dep=wui=. --dep=wjson=third_party/wjson <flags> -o <output>
+// (wjson, the JSON library for Wave, is a copy of github.com/potatosl/wjson in
+// third_party/; no example uses it right now.)
+fun wave_build(b: ptr<Buffer>, source: str, output: str, extra: str) -> bool {
+    add(b, env_or("WAVEC", "wavec"));
+    add_std_root(b);
+    add(b, " build ");
+    add_path(b, source);
+    add(b, " --dep=wui=. --dep=wjson=third_party/wjson");
+    add_link_flags(b);
+    add(b, extra);
+    add(b, " -o ");
+    add_path(b, output);
+    return must(b);
+}
+
+fun run_exe(b: ptr<Buffer>, path: str) -> bool {
+    add(b, "./");
+    add_exe(b, path);
+    if (WINDOWS) { buffer_clear(b); add_exe(b, path); }
+    return must(b);
+}
+
+// The Win32 / Cocoa window backend (Rust), Windows and macOS only.
+fun build_winplat(b: ptr<Buffer>) -> bool {
+    if (TARGET_OS == 0) { return true; }
+    step("winplat: window backend (Rust)");
+    add(b, env_or("CARGO", "cargo"));
+    add(b, " build --quiet --release --manifest-path winplat/Cargo.toml --target-dir build/cargo");
+    if (!streq(TARGET, "")) {
+        add(b, " --target ");
+        add(b, TARGET);
+    }
+    return must(b);
+}
+
+// ---- tasks ----------------------------------------------------------------------------------
+
+// A pure-Wave test: no window library, no display needed.
+fun task_wtest(b: ptr<Buffer>) {
+    step("Wave unit tests (core, layout, inputs, scrolling, painting)");
+    if (wave_build(b, "tests/core_test.wave", "build/core_test", "")) {
+        run_exe(b, "build/core_test");
+    }
+    if (wave_build(b, "tests/dirlist_test.wave", "build/dirlist_test", "")) {
+        run_exe(b, "build/dirlist_test");
+    }
+}
+
+// The JSON theme module (needs the wjson copy in third_party/).
+fun task_jtest(b: ptr<Buffer>) {
+    step("theme JSON tests (wjson)");
+    if (wave_build(b, "tests/theme_json_test.wave", "build/theme_json_test", "")) {
+        run_exe(b, "build/theme_json_test");
+    }
+}
+
+fun task_xtest(b: ptr<Buffer>) {
+    if (WINDOWS) {
+        println("the X11 backend tests are for Linux / FreeBSD");
+        return;
+    }
+    step("X11 backend tests (a hidden window pair and the clipboard)");
+    if (wave_build(b, "tests/window_x11_test.wave", "build/window_x11_test", "")) {
+        run_exe(b, "build/window_x11_test");
+    }
+}
+
+fun example_name(i: i32) -> str {
+    if (i == 0) { return "counter"; }
+    if (i == 1) { return "counter_headless"; }
+    if (i == 2) { return "form"; }
+    if (i == 3) { return "form_headless"; }
+    if (i == 4) { return "scripts_headless"; }
+    if (i == 5) { return "scroll"; }
+    if (i == 6) { return "scroll_headless"; }
+    if (i == 7) { return "theme"; }
+    if (i == 8) { return "theme_headless"; }
+    if (i == 9) { return "timer"; }
+    if (i == 10) { return "widgets"; }
+    if (i == 11) { return "widgets_headless"; }
+    if (i == 12) { return "text_styles"; }
+    if (i == 13) { return "text_styles_headless"; }
+    if (i == 14) { return "menus"; }
+    if (i == 15) { return "menus_headless"; }
+    if (i == 16) { return "lists"; }
+    if (i == 17) { return "lists_headless"; }
+    if (i == 18) { return "files"; }
+    if (i == 19) { return "files_headless"; }
+    return "typing";
+}
+
+// Builds every example (starts none of them: most open a window).
+fun task_examples(b: ptr<Buffer>) {
+    var i: i32 = 0;
+    while (i < 21) {
+        var name: str = example_name(i);
+        step(name);
+        var src: Buffer = buffer_new(64);
+        var dst: Buffer = buffer_new(64);
+        add(&src, "examples/");
+        add(&src, name);
+        add(&src, ".wave");
+        buffer_push(&src, 0);
+        add(&dst, "build/");
+        add(&dst, name);
+        buffer_push(&dst, 0);
+        wave_build(b, buffer_as_ptr(&src) as str, buffer_as_ptr(&dst) as str, "");
+        buffer_free(&src);
+        buffer_free(&dst);
+        i += 1;
+    }
+}
+
+// Compiles every example (objects, no linking) for WUI_TARGET and builds the window library for it:
+// proves that the code generates for that OS / CPU without needing its system libraries.
+fun task_check(b: ptr<Buffer>) {
+    if (streq(TARGET, "")) {
+        println("WUI_TASK=check needs WUI_TARGET=<triple>");
+        FAILED += 1;
+        return;
+    }
+    var i: i32 = 0;
+    while (i < 21) {
+        var name: str = example_name(i);
+        step(name);
+        add(b, env_or("WAVEC", "wavec"));
+        add_std_root(b);
+        add(b, " build examples/");
+        add(b, name);
+        add(b, ".wave --dep=wui=. --dep=wjson=third_party/wjson --target=");
+        add(b, TARGET);
+        add(b, " --emit=obj --out-dir build/check/");
+        add(b, TARGET);
+        must(b);
+        i += 1;
+    }
+}
+
+fun task_run(b: ptr<Buffer>, name: str) {
+    var src: Buffer = buffer_new(64);
+    var dst: Buffer = buffer_new(64);
+    add(&src, "examples/");
+    add(&src, name);
+    add(&src, ".wave");
+    buffer_push(&src, 0);
+    add(&dst, "build/");
+    add(&dst, name);
+    buffer_push(&dst, 0);
+    step(name);
+    if (wave_build(b, buffer_as_ptr(&src) as str, buffer_as_ptr(&dst) as str, "")) {
+        run_exe(b, buffer_as_ptr(&dst) as str);
+    }
+    buffer_free(&src);
+    buffer_free(&dst);
+}
+
+// The release archive: dist/wui-<version>.tar.gz holding what a user needs (the library, the Rust window
+// crate, docs, examples, tests, the vendored wjson, the license) and nothing built. Unix shells only.
+fun task_package(b: ptr<Buffer>) {
+    var ver: str = env_or("WUI_VERSION", "0.1.0");
+    step("release archive");
+    add(b, "rm -rf dist/stage && mkdir -p dist/stage/wui-");
+    add(b, ver);
+    add(b, " && cp -r src docs examples tests third_party README.md LICENSE vex.ws build.wave dist/stage/wui-");
+    add(b, ver);
+    add(b, "/ && mkdir -p dist/stage/wui-");
+    add(b, ver);
+    add(b, "/winplat && cp -r winplat/Cargo.toml winplat/Cargo.lock winplat/src dist/stage/wui-");
+    add(b, ver);
+    add(b, "/winplat/");
+    if (!must(b)) { return; }
+    add(b, "tar -C dist/stage -czf dist/wui-");
+    add(b, ver);
+    add(b, ".tar.gz wui-");
+    add(b, ver);
+    if (!must(b)) { return; }
+    add(b, "rm -rf dist/stage");
+    must(b);
+}
+
+fun task_bench(b: ptr<Buffer>) {
+    step("frame-time benchmark");
+    if (wave_build(b, "tests/bench.wave", "build/bench", " -O2")) {
+        run_exe(b, "build/bench");
+    }
+}
+
+fun main() -> i32 {
+    WINDOWS = streq(env_or("OS", ""), "Windows_NT");
+    TARGET = env_or("WUI_TARGET", "");
+    if (!streq(TARGET, "")) {
+        if (contains(TARGET, "windows")) { TARGET_OS = 1; }
+        if (contains(TARGET, "apple")) { TARGET_OS = 2; }
+    } else if (WINDOWS) {
+        TARGET_OS = 1;
+    } else if (fs_exists("/System/Library/CoreServices/SystemVersion.plist")) {
+        TARGET_OS = 2;
+    }
+    DRY = env_set("WUI_DRY_RUN");
+    create_dir("build");
+    var b: Buffer = buffer_new(512);
+    if (!build_winplat(&b)) {
+        println("\x1b[31m{} step(s) failed\x1b[0m", FAILED);
+        return 1;
+    }
+    var task: str = env_or("WUI_TASK", "test");
+    if (env_set("WUI_RUN")) {
+        task_run(&b, env_or("WUI_RUN", ""));
+    } else if (streq(task, "wtest")) {
+        task_wtest(&b);
+    } else if (streq(task, "jtest")) {
+        task_jtest(&b);
+    } else if (streq(task, "xtest")) {
+        task_xtest(&b);
+    } else if (streq(task, "examples")) {
+        task_examples(&b);
+    } else if (streq(task, "bench")) {
+        task_bench(&b);
+    } else if (streq(task, "check")) {
+        task_check(&b);
+    } else if (streq(task, "package")) {
+        task_package(&b);
+    } else {
+        task_wtest(&b);
+        task_jtest(&b);
+        task_xtest(&b);
+        if (FAILED == 0) { step("all tests passed"); }
+    }
+    buffer_free(&b);
+    if (FAILED != 0) {
+        println("\x1b[31m{} step(s) failed\x1b[0m", FAILED);
+        return 1;
+    }
+    return 0;
+}

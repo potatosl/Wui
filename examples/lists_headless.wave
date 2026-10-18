@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Renders the lists example without a window to build/lists_*.ppm: the tree with src open and a
+// node selected, then the same with docs open and the table scrolled.
+// Run with:  WUI_RUN=lists_headless wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, ui_new, ui_free, ui_render, ui_scroll, ui_set_time};
+import("std::fs::file")::{write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./lists_view")::{Model, lists_view};
+
+const W: i32 = 420;
+const H: i32 = 430;
+
+fun save(ui: ptr<Ui>, name: str) {
+    var pixels: ptr<u8> = mem_alloc((W * H * 4) as i64);
+    ui_render(ui, pixels, W, H);
+    var n: i32 = W * H;
+    var rgb: ptr<u8> = mem_alloc((n * 3) as i64);
+    var i: i32 = 0;
+    while (i < n) {
+        rgb[i * 3] = pixels[i * 4 + 2];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4];
+        i += 1;
+    }
+    var header: str = "P6\n420 430\n255\n";
+    var hp: ptr<u8> = header as ptr<u8>;
+    var hlen: i64 = 0;
+    while (hp[hlen] != 0) { hlen += 1; }
+    var total: i64 = hlen + (n as i64) * 3;
+    var img: ptr<u8> = mem_alloc(total);
+    var k: i64 = 0;
+    while (k < hlen) { img[k] = hp[k]; k += 1; }
+    var j: i64 = 0;
+    while (j < (n as i64) * 3) { img[hlen + j] = rgb[j]; j += 1; }
+    write(name, img, total);
+    mem_free(img, total);
+    mem_free(rgb, (n * 3) as i64);
+    mem_free(pixels, (W * H * 4) as i64);
+}
+
+fun main() {
+    var ui: Ui = ui_new();
+    var m: Model = Model { src_open: true, docs_open: false, picked: 1 };
+    ui_set_time(&ui, 0);
+    lists_view(&ui, &m, W, H);
+    save(&ui, "build/lists_tree.ppm");
+    m.docs_open = true;
+    m.picked = 4;
+    lists_view(&ui, &m, W, H);
+    ui_scroll(&ui, 100, 330, 1);
+    lists_view(&ui, &m, W, H);
+    save(&ui, "build/lists_table.ppm");
+    ui_free(&ui);
+    println("wrote build/lists_tree.ppm, build/lists_table.ppm");
+}

@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Timers: a stopwatch. win_next_timeout waits for an event but gives up after the
+// time you give it (EV_TIMEOUT), so the window can update itself while the user does
+// nothing - here every 50 ms while the watch runs, and not at all (no CPU) while it
+// is stopped. Press Space or Enter on the focused button, or click. Esc quits.
+// Run with:  WUI_RUN=timer wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Window, WinEvent, ui_new, ui_free, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_layout,
+                ui_align, ui_color, ui_click, ui_set_pointer, ui_feed_text, ui_activated, ui_wake_ms,
+                win_open, win_ok, win_close, win_next_timeout, win_text, win_draw, win_pending, win_width, win_height,
+                win_feed_key, win_time_ms,
+                UI_ROOT, UI_NO_MSG, UI_CENTER, UI_ACTIVATED,
+                EV_CLOSE, EV_EXPOSE, EV_MOVE, EV_DOWN, EV_UP, EV_TEXT, EV_KEY, EV_TIMEOUT, KEY_ESCAPE};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+const MSG_TOGGLE: i32 = 1;
+const MSG_RESET: i32 = 2;
+const TICK_MS: i32 = 50;           // how often the display updates while running
+
+struct Watch {
+    running: bool;
+    started: i64;                  // win_time_ms() when it was last started
+    before: i64;                   // time gathered before that, in ms
+}
+
+fun elapsed(w: ptr<Watch>) -> i64 {
+    if (w.running) { return w.before + (win_time_ms() - w.started); }
+    return w.before;
+}
+
+fun update(w: ptr<Watch>, msg: i32) {
+    if (msg == MSG_TOGGLE) {
+        if (w.running) { w.before = elapsed(w); w.running = false; }
+        else { w.started = win_time_ms(); w.running = true; }
+    }
+    if (msg == MSG_RESET) { w.before = 0; w.started = win_time_ms(); }
+}
+
+// "mm:ss.cc" into buf
+fun format(buf: ptr<u8>, ms: i64) {
+    var cs: i64 = (ms / 10) % 100;
+    var s: i64 = (ms / 1000) % 60;
+    var m: i64 = (ms / 60000) % 100;
+    buf[0] = (48 + m / 10) as u8; buf[1] = (48 + m % 10) as u8; buf[2] = 58;
+    buf[3] = (48 + s / 10) as u8; buf[4] = (48 + s % 10) as u8; buf[5] = 46;
+    buf[6] = (48 + cs / 10) as u8; buf[7] = (48 + cs % 10) as u8; buf[8] = 0;
+}
+
+fun view(ui: ptr<Ui>, w: ptr<Watch>, buf: ptr<u8>, width: i32, height: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 20, 14);
+    ui_align(ui, page, UI_CENTER);
+    format(buf, elapsed(w));
+    var time: i32 = ui_text(ui, page, buf as str);
+    ui_color(ui, time, 0xFF1E3A8A);
+    var row: i32 = ui_row(ui, page, 0, 10);
+    if (w.running) { ui_button(ui, row, "Stop", MSG_TOGGLE); } else { ui_button(ui, row, "Start", MSG_TOGGLE); }
+    ui_button(ui, row, "Reset", MSG_RESET);
+    ui_layout(ui, width, height);
+}
+
+fun main() {
+    var win: Window = win_open("wui timer", 240, 150);
+    if (!win_ok(&win)) {
+        println("cannot open a window (no X display or libX11)");
+        return;
+    }
+    var ui: Ui = ui_new();
+    var watch: Watch = Watch { running: false, started: 0, before: 0 };
+    var buf: ptr<u8> = mem_alloc(16);
+    var piece: ptr<u8> = mem_alloc(64);
+    var ev: WinEvent = WinEvent { kind: 0, x: 0, y: 0, a: 0, width: 0, height: 0, mods: 0 };
+    view(&ui, &watch, buf, win_width(&win), win_height(&win));
+    win_draw(&win, &ui);
+
+    var running: bool = true;
+    while (running) {
+        // Running: wake up every TICK_MS to redraw the time. Stopped: wait for input.
+        var wait: i32 = -1;
+        if (watch.running) { wait = TICK_MS; }
+        var kind: i32 = win_next_timeout(&win, &ev, wait);
+        if (kind == EV_CLOSE) {
+            running = false;
+        } else {
+            if (kind == EV_MOVE) { ui_set_pointer(&ui, ev.x, ev.y, false); }
+            if (kind == EV_DOWN && ev.a == 1) {
+                ui_set_pointer(&ui, ev.x, ev.y, true);
+                var msg: i32 = ui_click(&ui, ev.x, ev.y, ev.mods);
+                if (msg != UI_NO_MSG) { update(&watch, msg); }
+            }
+            if (kind == EV_UP && ev.a == 1) { ui_set_pointer(&ui, ev.x, ev.y, false); }
+            if (kind == EV_TEXT) {
+                var n: i64 = win_text(&win, piece, 64);
+                var r: i32 = ui_feed_text(&ui, piece, n);
+                if ((r & UI_ACTIVATED) != 0) { update(&watch, ui_activated(&ui)); }
+            }
+            if (kind == EV_KEY) {
+                if (ev.a == KEY_ESCAPE) { running = false; }
+                var r: i32 = win_feed_key(&win, &ui, ev.a, ev.mods);
+                if ((r & UI_ACTIVATED) != 0) { update(&watch, ui_activated(&ui)); }
+            }
+            if (kind == EV_EXPOSE) {
+                if (!win_pending(&win)) { win_draw(&win, &ui); }
+            } else {
+                // any other event, and EV_TIMEOUT: rebuild with the time now
+                view(&ui, &watch, buf, win_width(&win), win_height(&win));
+                win_draw(&win, &ui);
+            }
+        }
+    }
+    mem_free(piece, 64);
+    mem_free(buf, 16);
+    ui_free(&ui);
+    win_close(&win);
+}

@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The view of the file picker example (examples/files.wave and its headless render): a main
+// window with an "Open file..." button, and a modal dialog that lists a directory.
+
+import("wui")::{Ui, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_dialog, ui_file_list, ui_layout, ui_align, ui_width, ui_height,
+                ui_grow, ui_color, DirList, dirlist_read, dirlist_count, dirlist_name, dirlist_is_dir, path_push, path_pop,
+                UI_ROOT, UI_STRETCH};
+
+pub const MSG_OPEN: i32 = 1;
+pub const MSG_UP: i32 = 2;
+pub const MSG_CANCEL: i32 = 3;
+pub const MSG_OK: i32 = 4;
+pub const MSG_ENTRY: i32 = 100;        // + the entry number
+pub const ID_FILES: i32 = 1;           // scroll id of the list
+pub const PATH_CAP: i64 = 1024;
+
+pub struct Model {
+    open: bool;                        // the dialog is showing
+    path: ptr<u8>;                     // the directory the dialog lists (PATH_CAP bytes)
+    list: DirList;
+    selected: i32;                     // the selected file, -1 none
+    chosen: ptr<u8>;                   // the file picked with OK, "" until then (PATH_CAP bytes)
+}
+
+// Reads the directory in m.path again (after the path changed).
+pub fun files_reload(m: ptr<Model>) {
+    dirlist_read(&m.list, m.path as str);
+    m.selected = -1;
+}
+
+// Handles a message of the dialog.
+pub fun files_update(m: ptr<Model>, msg: i32) {
+    if (msg == MSG_OPEN) { m.open = true; files_reload(m); }
+    if (msg == MSG_CANCEL) { m.open = false; }
+    if (msg == MSG_UP) { path_pop(m.path); files_reload(m); }
+    if (msg == MSG_OK && m.selected >= 0) {
+        var i: i64 = 0;
+        while (m.path[i] != 0) { m.chosen[i] = m.path[i]; i += 1; }
+        m.chosen[i] = 0;
+        path_push(m.chosen, PATH_CAP, dirlist_name(&m.list, m.selected));
+        m.open = false;
+    }
+    if (msg >= MSG_ENTRY && msg < MSG_ENTRY + dirlist_count(&m.list)) {
+        var k: i32 = msg - MSG_ENTRY;
+        if (dirlist_is_dir(&m.list, k)) {              // a folder: go in
+            path_push(m.path, PATH_CAP, dirlist_name(&m.list, k));
+            files_reload(m);
+        } else {
+            m.selected = k;
+        }
+    }
+}
+
+pub fun files_view(ui: ptr<Ui>, m: ptr<Model>, w: i32, h: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 20, 12);
+    ui_align(ui, page, UI_STRETCH);
+    ui_text(ui, page, "a file dialog / 파일 대화상자");
+    ui_button(ui, page, "Open file...", MSG_OPEN);
+    ui_text(ui, page, "chosen:");
+    if (m.chosen[0] != 0) { ui_text(ui, page, m.chosen as str); }
+    if (m.open) {
+        var box: i32 = ui_dialog(ui, w - 40);
+        ui_text(ui, box, "Open a file");
+        var where: i32 = ui_text(ui, box, m.path as str);
+        ui_color(ui, where, 0xFF1E3A8A);
+        var files: i32 = ui_file_list(ui, box, ID_FILES, &m.list, m.selected, MSG_ENTRY);
+        ui_width(ui, files, (w - 76) as i64);
+        ui_height(ui, files, (h - 190) as i64);
+        var foot: i32 = ui_row(ui, box, 0, 8);
+        ui_button(ui, foot, "Up / 위로", MSG_UP);
+        ui_button(ui, foot, "Open", MSG_OK);
+        ui_button(ui, foot, "Cancel", MSG_CANCEL);
+    }
+    ui_layout(ui, w, h);
+}

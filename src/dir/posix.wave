@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Directory reading for Linux and FreeBSD: libc's opendir / readdir through extern(c).
+// Wave's std has no directory listing. `struct dirent` is read by byte offsets, which differ
+// per OS: d_type is at 18 on both, d_name at 19 (Linux, glibc and musl) or 24 (FreeBSD 12+).
+//
+// The same three functions exist in native.wave for Windows and macOS.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+extern(c, "opendir") fun c_opendir(path: ptr<u8>) -> ptr<u8>;
+extern(c, "readdir") fun c_readdir(dir: ptr<u8>) -> ptr<u8>;
+extern(c, "closedir") fun c_closedir(dir: ptr<u8>) -> i32;
+
+#[target(os="linux")]
+const NAME_OFFSET: i32 = 19;
+#[target(os="freebsd")]
+const NAME_OFFSET: i32 = 24;
+const TYPE_OFFSET: i32 = 18;
+const DT_DIR: u8 = 4;
+const DT_UNKNOWN: u8 = 0;
+const DT_LNK: u8 = 10;
+
+// Opens a directory (a NUL-terminated path). Null when it cannot be read.
+pub fun dir_open(path: ptr<u8>) -> ptr<u8> {
+    return c_opendir(path);
+}
+
+// The next entry: its name (NUL-terminated) goes to buf, is_dir[0] is 1 for a directory, 0 for
+// another kind of file and -1 when only a stat could tell (the caller then tries to open it).
+// Returns the length of the name, or -1 at the end. Names that do not fit are skipped.
+pub fun dir_next(dir: ptr<u8>, buf: ptr<u8>, cap: i64, is_dir: ptr<i32>) -> i64 {
+    while (true) {
+        var e: ptr<u8> = c_readdir(dir);
+        if (e == null) { return -1; }
+        var name: ptr<u8> = &e[NAME_OFFSET];
+        var n: i64 = 0;
+        while (name[n] != 0) { n += 1; }
+        if (n + 1 > cap) { continue; }
+        var i: i64 = 0;
+        while (i <= n) { buf[i] = name[i]; i += 1; }
+        var t: u8 = e[TYPE_OFFSET];
+        if (t == DT_DIR) { is_dir[0] = 1; }
+        else if (t == DT_UNKNOWN || t == DT_LNK) { is_dir[0] = -1; }
+        else { is_dir[0] = 0; }
+        return n;
+    }
+    return -1;
+}
+
+pub fun dir_close(dir: ptr<u8>) {
+    c_closedir(dir);
+}

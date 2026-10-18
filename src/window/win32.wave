@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Windows and macOS window backend: a thin Wave layer over the C ABI of the winplat crate
+// (winplat/, Rust), which holds the Win32 code (platform/win32.rs) and the Cocoa code
+// (platform/macos.rs). A Win32 window needs a window
+// procedure - a function whose address is handed to the OS - and Wave (0.2.x)
+// cannot take a function's address, so this one part stays in Rust. Programs
+// built for Windows link build/cargo/release/wui_win.lib, programs for macOS
+// build/cargo/release/libwui_win.a (see build.wave).
+//
+// The API is the one x11.wave has, so lib.wave does not care which it uses.
+//
+// NOTE: not tested on a real Windows or macOS machine so far (only type-checked).
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("std::mem::layout")::{size_of};
+
+extern(c, "wui_win_open") fun c_win_open(title: ptr<u8>, len: i64, width: i32, height: i32) -> ptr<u8>;
+extern(c, "wui_win_close") fun c_win_close(win: ptr<u8>);
+extern(c, "wui_win_next") fun c_win_next(win: ptr<u8>, raw: ptr<i32>) -> i32;
+extern(c, "wui_win_next_timeout") fun c_win_next_timeout(win: ptr<u8>, raw: ptr<i32>, ms: i32) -> i32;
+extern(c, "wui_win_text") fun c_win_text(win: ptr<u8>, buf: ptr<u8>, cap: i64) -> i64;
+extern(c, "wui_win_pending") fun c_win_pending(win: ptr<u8>) -> i32;
+extern(c, "wui_win_pixels") fun c_win_pixels(win: ptr<u8>, width: ptr<i32>, height: ptr<i32>) -> ptr<u32>;
+extern(c, "wui_win_clipboard_set") fun c_win_clipboard_set(win: ptr<u8>, text: ptr<u8>, len: i64) -> i32;
+extern(c, "wui_win_clipboard_get") fun c_win_clipboard_get(win: ptr<u8>, buf: ptr<u8>, cap: i64) -> i64;
+extern(c, "wui_win_present") fun c_win_present(win: ptr<u8>);
+extern(c, "wui_win_dpi_percent") fun c_win_dpi_percent(win: ptr<u8>) -> i32;
+
+const EV_TEXT: i32 = 8;
+pub const TEXT_MAX: i32 = 32;
+
+// One decoded event, same fields as in x11.wave.
+pub struct XEv {
+    kind: i32;
+    x: i32;
+    y: i32;
+    a: i32;
+    width: i32;
+    height: i32;
+    mods: i32;
+    text: ptr<u8>;                    // TEXT_MAX bytes
+    text_len: i32;
+}
+
+pub struct XW {
+    h: ptr<u8>;                       // the Rust window
+    raw: ptr<i32>;                    // 7 ints for wui_win_next
+}
+
+pub fun x11_new_event() -> ptr<XEv> {
+    var e: ptr<XEv> = mem_alloc(size_of<XEv>() as i64) as ptr<XEv>;
+    e.text = mem_alloc((TEXT_MAX + 1) as i64);
+    e.kind = 0; e.x = 0; e.y = 0; e.a = 0; e.width = 0; e.height = 0; e.mods = 0; e.text_len = 0;
+    return e;
+}
+
+pub fun x11_free_event(e: ptr<XEv>) {
+    mem_free(e.text, (TEXT_MAX + 1) as i64);
+    mem_free(e as ptr<u8>, size_of<XEv>() as i64);
+}
+
+// Opens a window; `visible` is not used on Windows. Null when it cannot be opened.
+pub fun xw_open(title: ptr<u8>, len: i64, width: i32, height: i32, visible: bool) -> ptr<XW> {
+    var h: ptr<u8> = c_win_open(title, len, width, height);
+    if (h == null) { return null; }
+    var w: ptr<XW> = mem_alloc(size_of<XW>() as i64) as ptr<XW>;
+    w.h = h;
+    w.raw = mem_alloc(28) as ptr<i32>;
+    return w;
+}
+
+pub fun xw_close(w: ptr<XW>) {
+    if (w == null) { return; }
+    c_win_close(w.h);
+    mem_free(w.raw as ptr<u8>, 28);
+    mem_free(w as ptr<u8>, size_of<XW>() as i64);
+}
+
+pub fun xw_width(w: ptr<XW>) -> i32 {
+    var cw: i32 = 0;
+    var ch: i32 = 0;
+    c_win_pixels(w.h, &cw, &ch);
+    return cw;
+}
+
+pub fun xw_height(w: ptr<XW>) -> i32 {
+    var cw: i32 = 0;
+    var ch: i32 = 0;
+    c_win_pixels(w.h, &cw, &ch);
+    return ch;
+}
+
+// The pixel buffer; replaced on resize, so fetch it again after every resize event.
+pub fun xw_pixels(w: ptr<XW>) -> ptr<u32> {
+    var cw: i32 = 0;
+    var ch: i32 = 0;
+    return c_win_pixels(w.h, &cw, &ch);
+}
+
+pub fun xw_pending(w: ptr<XW>) -> bool { return c_win_pending(w.h) != 0; }
+
+pub fun xw_next_event(w: ptr<XW>, outp: ptr<XEv>) -> i32 {
+    var i: i32 = 0;
+    while (i < 7) { w.raw[i] = 0; i += 1; }
+    var kind: i32 = c_win_next(w.h, w.raw);
+    outp.kind = w.raw[0]; outp.x = w.raw[1]; outp.y = w.raw[2];
+    outp.a = w.raw[3]; outp.width = w.raw[4]; outp.height = w.raw[5]; outp.mods = w.raw[6];
+    outp.text_len = 0;
+    if (kind == EV_TEXT) {
+        var n: i64 = c_win_text(w.h, outp.text, (TEXT_MAX + 1) as i64);
+        outp.text_len = n as i32;
+    }
+    return kind;
+}
+
+pub fun xw_next_event_timeout(w: ptr<XW>, outp: ptr<XEv>, ms: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < 7) { w.raw[i] = 0; i += 1; }
+    var kind: i32 = c_win_next_timeout(w.h, w.raw, ms);
+    outp.kind = w.raw[0]; outp.x = w.raw[1]; outp.y = w.raw[2];
+    outp.a = w.raw[3]; outp.width = w.raw[4]; outp.height = w.raw[5]; outp.mods = w.raw[6];
+    outp.text_len = 0;
+    if (kind == EV_TEXT) {
+        var n: i64 = c_win_text(w.h, outp.text, (TEXT_MAX + 1) as i64);
+        outp.text_len = n as i32;
+    }
+    return kind;
+}
+
+// The scale the backend reports: 100 on Windows (the process is not DPI aware yet), 100 / 200 on macOS.
+pub fun xw_dpi_percent(w: ptr<XW>) -> i32 { return c_win_dpi_percent(w.h); }
+
+pub fun xw_present(w: ptr<XW>) { c_win_present(w.h); }
+
+pub fun xw_clipboard_set(w: ptr<XW>, text: ptr<u8>, len: i64) {
+    c_win_clipboard_set(w.h, text, len);
+}
+
+pub fun xw_clipboard_get(w: ptr<XW>, buf: ptr<u8>, cap: i64) -> i64 {
+    return c_win_clipboard_get(w.h, buf, cap);
+}

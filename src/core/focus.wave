@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Keyboard focus and time: Tab order, activation, revealing the focused widget and the caret blink.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./ctx")::{scroll_put, scroll_put_x, slider_find};
+import("./field")::{field_index};
+import("./pick")::{input_node};
+import("./types")::{Ctx, K_BUTTON, K_CHECKBOX, K_DROPDOWN, K_INPUT, K_SLIDER, K_TEXTAREA, NONE, Node,
+    TIP_DELAY_MS, clamp_i64};
+
+//
+// The core has no clock of its own: the app (win_draw does it for you) tells it the
+// current time. The text caret is on for theme.caret_blink_ms, then off, and so on;
+// typing, moving the caret or focusing an input restarts it in the "on" phase.
+// core_wake_ms says when the picture will next change by itself.
+// Sets the current time in milliseconds (any steady clock; only differences matter).
+pub fun core_set_time(c: ptr<Ctx>, ms: i64) {
+    if (c == null) { return; }
+    c.time_ms = ms;
+}
+
+pub fun touch_blink(c: ptr<Ctx>) {
+    c.blink_epoch = c.time_ms;
+}
+
+pub fun caret_on(c: ptr<Ctx>) -> bool {
+    var period: i64 = c.theme.caret_blink_ms as i64;
+    if (period <= 0 || c.time_ms <= c.blink_epoch) { return true; }
+    return ((c.time_ms - c.blink_epoch) / period) % 2 == 0;
+}
+
+// Milliseconds from now until the picture changes without any input (the caret
+// of a focused input blinks), or -1 when it will not. Wait at most this long for
+// the next event (win_next_timeout), then redraw.
+pub fun core_wake_ms(c: ptr<Ctx>) -> i32 {
+    if (c == null) { return NONE; }
+    var wake: i32 = NONE;
+    if (c.tip_node != NONE && !c.tip_blocked && c.tip_since >= 0 && c.time_ms - c.tip_since < TIP_DELAY_MS) {
+        wake = (TIP_DELAY_MS - (c.time_ms - c.tip_since)) as i32;      // the tooltip is about to show
+    }
+    var period: i64 = c.theme.caret_blink_ms as i64;
+    if (period <= 0 || c.focus == NONE || input_node(c, c.focus) == NONE) { return wake; }
+    var since: i64 = c.time_ms - c.blink_epoch;
+    if (since < 0) { since = 0; }
+    var blink: i32 = (period - since % period) as i32;
+    if (wake != NONE && wake < blink) { return wake; }
+    return blink;
+}
+
+//
+// One widget has the keyboard focus: an input (found again after a rebuild by its
+// input id) or a button / checkbox (found by its message number, so give every
+// focusable button and checkbox its own message). Tab and Shift+Tab walk the
+// focusable widgets in tree order; Enter or Space presses the focused button
+// or checkbox. The focus ring is drawn when the focus came from the keyboard.
+// Appends, depth first, the nodes that can take the focus: inputs, and buttons
+// and checkboxes that have a message.
+pub fun collect_focusable(c: ptr<Ctx>, id: i32, list: ptr<i32>, count: ptr<i32>) {
+    var n: ptr<Node> = &c.nodes[id];
+    var can: bool = n.kind == K_INPUT || n.kind == K_TEXTAREA || n.kind == K_SLIDER || n.kind == K_DROPDOWN || ((n.kind == K_BUTTON || n.kind == K_CHECKBOX) && n.msg >= 0);
+    if (can) {
+        list[count[0]] = id;
+        count[0] += 1;
+    }
+    var ch: i32 = n.first;
+    while (ch != NONE) {
+        var next: i32 = c.nodes[ch].next;
+        collect_focusable(c, ch, list, count);
+        ch = next;
+    }
+}
+
+pub fun has_focus(c: ptr<Ctx>, n: ptr<Node>) -> bool {
+    if (n.kind == K_INPUT || n.kind == K_TEXTAREA || n.kind == K_SLIDER || n.kind == K_DROPDOWN) { return c.focus != NONE && c.focus == n.input_id; }
+    if (n.kind == K_BUTTON || n.kind == K_CHECKBOX) { return c.wfocus != NONE && c.wfocus == n.msg; }
+    return false;
+}
+
+// Scrolls the boxes around node `id` just enough to show it.
+pub fun reveal(c: ptr<Ctx>, id: i32) {
+    var n: ptr<Node> = &c.nodes[id];
+    var nx: i32 = n.x;
+    var ny: i32 = n.y;
+    var p: i32 = n.parent;
+    while (p != NONE) {
+        var a: ptr<Node> = &c.nodes[p];
+        if (a.scroll_id != NONE) {
+            var off: i32 = a.scroll_off;
+            if (ny < a.y) { off = off - (a.y - ny); }
+            else if (ny + n.h > a.y + a.h) { off = off + (ny + n.h - (a.y + a.h)); }
+            off = clamp_i64(off as i64, 0, a.scroll_max as i64) as i32;
+            if (off != a.scroll_off) {
+                ny = ny + a.scroll_off - off;                  // the node moves as the box scrolls
+                scroll_put(c, a.scroll_id, off);
+                a.scroll_off = off;
+            }
+            if (a.scroll_x) {
+                var xoff: i32 = a.scroll_xoff;
+                if (nx < a.x) { xoff = xoff - (a.x - nx); }
+                else if (nx + n.w > a.x + a.w) { xoff = xoff + (nx + n.w - (a.x + a.w)); }
+                xoff = clamp_i64(xoff as i64, 0, a.scroll_xmax as i64) as i32;
+                if (xoff != a.scroll_xoff) {
+                    nx = nx + a.scroll_xoff - xoff;
+                    scroll_put_x(c, a.scroll_id, xoff);
+                    a.scroll_xoff = xoff;
+                }
+            }
+        }
+        p = a.parent;
+    }
+}
+
+// Moves the focus to the next (or previous) focusable widget, wrapping around.
+// With nothing focused, the first (or last) one gets it. False when there is none.
+pub fun focus_move(c: ptr<Ctx>, backward: bool) -> bool {
+    var top: i32 = c.root;                             // Tab stays inside the topmost overlay, when there is one
+    var o: i32 = 0;
+    while (o < c.nnodes) {
+        if (c.nodes[o].overlay && !c.nodes[o].popup) { top = o; }     // (a drop-down's open list is not a place to Tab to)
+        o += 1;
+    }
+    c.dd_open = NONE;                                  // moving the focus closes an open list
+    if (top == NONE) { return false; }
+    var list: ptr<i32> = mem_alloc((c.nnodes * 4) as i64) as ptr<i32>;
+    var count: array<i32, 1>;
+    count[0] = 0;
+    collect_focusable(c, top, list, &count[0]);
+    var total: i32 = count[0];
+    var moved: bool = false;
+    if (total > 0) {
+        var cur: i32 = -1;
+        var i: i32 = 0;
+        while (cur < 0 && i < total) {
+            if (has_focus(c, &c.nodes[list[i]])) { cur = i; }
+            i += 1;
+        }
+        var pick: i32 = 0;
+        if (cur < 0) {
+            if (backward) { pick = total - 1; }
+        } else if (backward) {
+            pick = (cur + total - 1) % total;
+        } else {
+            pick = (cur + 1) % total;
+        }
+        var target: ptr<Node> = &c.nodes[list[pick]];
+        if (target.kind == K_INPUT || target.kind == K_TEXTAREA) { c.focus = target.input_id; c.wfocus = NONE; touch_blink(c); }
+        else if (target.kind == K_SLIDER || target.kind == K_DROPDOWN) { c.focus = target.input_id; c.wfocus = NONE; }
+        else { c.focus = NONE; c.wfocus = target.msg; }
+        c.drag = NONE;
+        c.focus_visible = true;
+        reveal(c, list[pick]);
+        moved = true;
+    }
+    mem_free(list as ptr<u8>, (c.nnodes * 4) as i64);
+    return moved;
+}
+
+// Tab (or Shift+Tab with `backward`): the focus moves to the next focusable
+// widget. Returns 1 when it moved (redraw). core_key_input does this for KEY_TAB.
+pub fun core_focus_next(c: ptr<Ctx>, backward: bool) -> i32 {
+    if (c == null) { return 0; }
+    if (focus_move(c, backward)) { return 1; }
+    return 0;
+}
+
+// Presses the focused button or checkbox: its message becomes core_activated.
+pub fun activate(c: ptr<Ctx>) -> bool {
+    if (c.wfocus == NONE) { return false; }
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        var n: ptr<Node> = &c.nodes[i];
+        if ((n.kind == K_BUTTON || n.kind == K_CHECKBOX) && n.msg == c.wfocus) {
+            c.activated = c.wfocus;
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// The message of the widget the last INPUT_ACTIVATED pressed, or -1.
+pub fun core_activated(c: ptr<Ctx>) -> i32 {
+    if (c == null) { return NONE; }
+    return c.activated;
+}
+
+// The message of the focused button or checkbox, or -1 (an input may have the focus instead).
+pub fun core_focused_msg(c: ptr<Ctx>) -> i32 {
+    if (c == null) { return NONE; }
+    return c.wfocus;
+}
+
+// Gives keyboard focus to an input (NONE / -1 removes focus).
+pub fun core_input_focus(c: ptr<Ctx>, input_id: i32) {
+    if (c == null) { return; }
+    c.wfocus = NONE;
+    if (field_index(c, input_id) >= 0) { c.focus = input_id; touch_blink(c); }
+    else if (slider_find(c, input_id) >= 0) { c.focus = input_id; }
+    else { c.focus = NONE; }
+    c.dd_open = NONE;
+}
+
+// The focused input's id, or -1.
+pub fun core_focused(c: ptr<Ctx>) -> i32 {
+    if (c == null) { return NONE; }
+    return c.focus;
+}

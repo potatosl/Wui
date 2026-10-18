@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The text style page without a window, at 100% and at 150%, to build/text_100.ppm and text_150.ppm.
+// Run with:  WUI_RUN=text_styles_headless wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui")::{Ui, Theme, ui_new, ui_free, ui_render, ui_set_theme, theme_light, theme_scale};
+import("std::fs::file")::{write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./text_view")::{text_view};
+
+const W: i32 = 460;
+const H: i32 = 560;
+
+fun save(ui: ptr<Ui>, name: str) {
+    var pixels: ptr<u8> = mem_alloc((W * H * 4) as i64);
+    ui_render(ui, pixels, W, H);
+    var n: i32 = W * H;
+    var rgb: ptr<u8> = mem_alloc((n * 3) as i64);
+    var i: i32 = 0;
+    while (i < n) {
+        rgb[i * 3] = pixels[i * 4 + 2];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4];
+        i += 1;
+    }
+    var header: str = "P6\n460 560\n255\n";
+    var hp: ptr<u8> = header as ptr<u8>;
+    var hlen: i64 = 0;
+    while (hp[hlen] != 0) { hlen += 1; }
+    var total: i64 = hlen + (n as i64) * 3;
+    var img: ptr<u8> = mem_alloc(total);
+    var k: i64 = 0;
+    while (k < hlen) { img[k] = hp[k]; k += 1; }
+    var j: i64 = 0;
+    while (j < (n as i64) * 3) { img[hlen + j] = rgb[j]; j += 1; }
+    write(name, img, total);
+    mem_free(img, total);
+    mem_free(rgb, (n * 3) as i64);
+    mem_free(pixels, (W * H * 4) as i64);
+}
+
+fun render_at(ui: ptr<Ui>, percent: i32, name: str, heading: str) {
+    var t: Theme = Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                           placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                           radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                           field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                           scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0,
+                           slider_thumb: 0, slider_track: 0, font_size: 0 };
+    theme_light(&t);
+    theme_scale(&t, percent);
+    ui_set_theme(ui, &t);
+    text_view(ui, heading, W, H);
+    save(ui, name);
+}
+
+fun main() {
+    var ui: Ui = ui_new();
+    render_at(&ui, 100, "build/text_100.ppm", "Scale 100%");
+    render_at(&ui, 150, "build/text_150.ppm", "Scale 150%");
+    ui_free(&ui);
+    println("wrote build/text_100.ppm and build/text_150.ppm");
+}

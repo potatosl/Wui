@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Hit testing: which node is under a point, scrollbar geometry, overlays and scroll boxes that
+// hide nodes from the pointer.
+
+import("./types")::{Ctx, K_BUTTON, K_CHECKBOX, K_DROPDOWN, K_INPUT, K_OPTION, K_SLIDER, K_TEXTAREA, NONE, Node,
+    max_i32, min_i32};
+
+pub fun contains(n: ptr<Node>, x: i32, y: i32) -> bool {
+    return x >= n.x && y >= n.y && x < n.x + n.w && y < n.y + n.h;
+}
+
+// The vertical scrollbar of a scroll box that can scroll: res = [track x, thumb
+// y, thumb height, track length]. When the horizontal bar is shown too, the
+// vertical track stops above it.
+pub fun scrollbar(c: ptr<Ctx>, n: ptr<Node>, res: ptr<i32>) -> bool {
+    if (n.scroll_id == NONE || n.scroll_max <= 0) { return false; }
+    var tlen: i32 = n.h;
+    if (n.scroll_xmax > 0) { tlen = max_i32(n.h - c.theme.scrollbar_w - 1, 1); }
+    var thumb: i32 = tlen * tlen / (tlen + n.scroll_max);
+    var lo: i32 = min_i32(c.theme.scrollbar_min, tlen);
+    if (thumb < lo) { thumb = lo; }
+    if (thumb > tlen) { thumb = tlen; }
+    res[0] = n.x + n.w - c.theme.scrollbar_w - 1;
+    res[1] = n.y + (tlen - thumb) * n.scroll_off / n.scroll_max;
+    res[2] = thumb;
+    res[3] = tlen;
+    return true;
+}
+
+// The horizontal scrollbar: res = [track y, thumb x, thumb width, track length].
+// It runs along the bottom edge and stops before the vertical bar, if any.
+pub fun hscrollbar(c: ptr<Ctx>, n: ptr<Node>, res: ptr<i32>) -> bool {
+    if (n.scroll_id == NONE || !n.scroll_x || n.scroll_xmax <= 0) { return false; }
+    var tlen: i32 = n.w;
+    if (n.scroll_max > 0) { tlen = max_i32(n.w - c.theme.scrollbar_w - 1, 1); }
+    var thumb: i32 = tlen * tlen / (tlen + n.scroll_xmax);
+    var lo: i32 = min_i32(c.theme.scrollbar_min, tlen);
+    if (thumb < lo) { thumb = lo; }
+    if (thumb > tlen) { thumb = tlen; }
+    res[0] = n.y + n.h - c.theme.scrollbar_w - 1;
+    res[1] = n.x + (tlen - thumb) * n.scroll_xoff / n.scroll_xmax;
+    res[2] = thumb;
+    res[3] = tlen;
+    return true;
+}
+
+// Is the point under an overlay? Nodes that are not part of an overlay cannot be hit there.
+pub fun covered_by_overlay(c: ptr<Ctx>, x: i32, y: i32) -> bool {
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        var n: ptr<Node> = &c.nodes[i];
+        if (n.overlay && !n.tipbox && contains(n, x, y)) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+// Is the point outside a scroll box that contains node `id`? Such a node is
+// scrolled out of view there and cannot be hit.
+pub fun clipped(c: ptr<Ctx>, id: i32, x: i32, y: i32) -> bool {
+    var p: i32 = c.nodes[id].parent;
+    while (p != NONE) {
+        var a: ptr<Node> = &c.nodes[p];
+        if (a.scroll_id != NONE && !contains(a, x, y)) { return true; }
+        p = a.parent;
+    }
+    if (!c.nodes[id].in_ov && covered_by_overlay(c, x, y)) { return true; }     // an overlay is in the way
+    return false;
+}
+
+// The scroll box whose scrollbar is under the point; res = [node index, thumb
+// start, thumb length, axis (0 vertical, 1 horizontal)] (the grab zone is a few
+// pixels wider than the bar).
+pub fun scrollbar_at(c: ptr<Ctx>, x: i32, y: i32, res: ptr<i32>) -> bool {
+    var bar: array<i32, 4>;
+    bar[0] = 0; bar[1] = 0; bar[2] = 0; bar[3] = 0;
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {
+        var n: ptr<Node> = &c.nodes[i];
+        if (scrollbar(c, n, &bar[0])) {
+            if (x >= bar[0] - c.theme.scrollbar_grab && x < n.x + n.w && y >= n.y && y < n.y + bar[3] && !clipped(c, i, x, y)) {
+                res[0] = i;
+                res[1] = bar[1];
+                res[2] = bar[2];
+                res[3] = 0;
+                return true;
+            }
+        }
+        if (hscrollbar(c, n, &bar[0])) {
+            if (y >= bar[0] - c.theme.scrollbar_grab && y < n.y + n.h && x >= n.x && x < n.x + bar[3] && !clipped(c, i, x, y)) {
+                res[0] = i;
+                res[1] = bar[1];
+                res[2] = bar[2];
+                res[3] = 1;
+                return true;
+            }
+        }
+        i -= 1;
+    }
+    return false;
+}
+
+// Topmost button or checkbox under the point, or NONE.
+pub fun button_at(c: ptr<Ctx>, x: i32, y: i32) -> i32 {
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {
+        var n: ptr<Node> = &c.nodes[i];
+        if ((n.kind == K_BUTTON || n.kind == K_CHECKBOX) && contains(n, x, y) && !clipped(c, i, x, y)) { return i; }
+        i -= 1;
+    }
+    return NONE;
+}
+
+// Topmost clickable (button, checkbox or input) under the point, or NONE.
+pub fun clickable_at(c: ptr<Ctx>, x: i32, y: i32) -> i32 {
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {
+        var n: ptr<Node> = &c.nodes[i];
+        if ((n.kind == K_BUTTON || n.kind == K_CHECKBOX || n.kind == K_INPUT || n.kind == K_TEXTAREA || n.kind == K_SLIDER || n.kind == K_DROPDOWN || n.kind == K_OPTION) && !n.sep && contains(n, x, y) && !clipped(c, i, x, y)) { return i; }
+        i -= 1;
+    }
+    return NONE;
+}
+
+// The node of the input with this id in the current tree, or NONE.
+pub fun input_node(c: ptr<Ctx>, input_id: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        if ((c.nodes[i].kind == K_INPUT || c.nodes[i].kind == K_TEXTAREA) && c.nodes[i].input_id == input_id) { return i; }
+        i += 1;
+    }
+    return NONE;
+}
+
+// The node of the slider with this id in the current tree, or NONE.
+pub fun slider_node(c: ptr<Ctx>, id: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        if (c.nodes[i].kind == K_SLIDER && c.nodes[i].input_id == id) { return i; }
+        i += 1;
+    }
+    return NONE;
+}

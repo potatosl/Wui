@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Pixel helpers shared by the rasterizer (render.wave) and the text engine
+// (font.wave). Pixels are 0xAARRGGBB in a u32 buffer.
+
+// Source-over blend of `src` (straight alpha) onto the opaque pixel `dst`.
+pub fun gfx_blend(dst: u32, src: u32) -> u32 {
+    var a: u32 = src >> 24;
+    if (a == 255) { return src | 0xFF000000; }
+    if (a == 0) { return dst; }
+    var inv: u32 = 255 - a;
+    var r: u32 = (((src >> 16) & 255) * a + ((dst >> 16) & 255) * inv + 127) / 255;
+    var g: u32 = (((src >> 8) & 255) * a + ((dst >> 8) & 255) * inv + 127) / 255;
+    var b: u32 = ((src & 255) * a + (dst & 255) * inv + 127) / 255;
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+// Blends `color` into pixel (x, y) when it lies inside the clip rectangle
+// [cx0, cx1) x [cy0, cy1).
+pub fun gfx_put(px: ptr<u32>, bw: i32, cx0: i32, cy0: i32, cx1: i32, cy1: i32, x: i32, y: i32, color: u32) {
+    if (x < cx0 || x >= cx1 || y < cy0 || y >= cy1) { return; }
+    var at: i64 = (y as i64) * (bw as i64) + (x as i64);
+    px[at] = gfx_blend(px[at], color);
+}

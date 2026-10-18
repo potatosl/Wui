@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Widget behaviour: sliders, drop-downs and menus (value, keys, the popup list) and tooltips.
+
+import("./build")::{core_overlay};
+import("./ctx")::{new_node, option_range, slider_find, slider_slot};
+import("./pick")::{clipped, contains, slider_node};
+import("./types")::{Ctx, INPUT_ACTIVATED, INPUT_CHANGED, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESCAPE, KEY_HOME,
+    KEY_LEFT, KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_RIGHT, KEY_UP, K_DROPDOWN, K_OPTION, K_TEXT, NONE, Node, OVERLAY_AT,
+    OVERLAY_BELOW, OVERLAY_MATCH_WIDTH, STRETCH, clamp_i64, max_i32, min_i32};
+
+// Stores `v` (clamped to the slider's range) as the value of slider node `ni`; true when it changed.
+pub fun slider_store(c: ptr<Ctx>, ni: i32, v: i32) -> bool {
+    var n: ptr<Node> = &c.nodes[ni];
+    var si: i32 = slider_slot(c, n.input_id, n.val);
+    var nv: i32 = clamp_i64(v as i64, n.val as i64, n.vmax as i64) as i32;
+    var changed: bool = nv != c.slider_vals[si];
+    c.slider_vals[si] = nv;
+    return changed;
+}
+
+// The value a press at pixel `x` means: the handle's centre goes under the pointer.
+pub fun slider_value_at(c: ptr<Ctx>, n: ptr<Node>, x: i32) -> i32 {
+    var th: i32 = c.theme.slider_thumb;
+    var usable: i64 = max_i32(n.w - th, 1) as i64;
+    var range: i64 = (n.vmax - n.val) as i64;
+    var along: i64 = clamp_i64((x - (n.x + th / 2)) as i64, 0, usable);
+    return (n.val as i64 + (along * range + usable / 2) / usable) as i32;
+}
+
+// A key for the focused slider: arrows step, Home / End jump, PageUp / PageDown move a tenth.
+pub fun slider_key(c: ptr<Ctx>, key: i32) -> i32 {
+    var ni: i32 = slider_node(c, c.focus);
+    if (ni == NONE) { return 0; }
+    var n: ptr<Node> = &c.nodes[ni];
+    var cur: i32 = c.slider_vals[slider_slot(c, n.input_id, n.val)];
+    var page: i32 = max_i32((n.vmax - n.val) / 10, 1);
+    var target: i32 = cur;
+    if (key == KEY_LEFT || key == KEY_DOWN) { target = cur - 1; }
+    else if (key == KEY_RIGHT || key == KEY_UP) { target = cur + 1; }
+    else if (key == KEY_PAGE_DOWN) { target = cur - page; }
+    else if (key == KEY_PAGE_UP) { target = cur + page; }
+    else if (key == KEY_HOME) { target = n.val; }
+    else if (key == KEY_END) { target = n.vmax; }
+    else { return 0; }
+    if (slider_store(c, ni, target)) { return INPUT_CHANGED; }
+    return 0;
+}
+
+// Sets a slider's value (it is clamped to the range at the next layout).
+pub fun core_slider_set(c: ptr<Ctx>, slider_id: i32, value: i32) {
+    if (c == null || slider_id < 0) { return; }
+    c.slider_vals[slider_slot(c, slider_id, value)] = value;
+}
+
+// A slider's value, or 0 for an unknown id.
+pub fun core_slider_get(c: ptr<Ctx>, slider_id: i32) -> i32 {
+    if (c == null) { return 0; }
+    var i: i32 = slider_find(c, slider_id);
+    if (i < 0) { return 0; }
+    return c.slider_vals[i];
+}
+
+pub fun dropdown_node(c: ptr<Ctx>, id: i32) -> i32 {
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        if (c.nodes[i].kind == K_DROPDOWN && c.nodes[i].input_id == id) { return i; }
+        i += 1;
+    }
+    return NONE;
+}
+
+// Makes option `index` the drop-down node's value; true when that changed it.
+pub fun dropdown_pick(c: ptr<Ctx>, dn: i32, index: i32) -> bool {
+    var n: ptr<Node> = &c.nodes[dn];
+    var si: i32 = slider_slot(c, n.input_id, 0);
+    var v: i32 = clamp_i64(index as i64, 0, max_i32(n.val - 1, 0) as i64) as i32;
+    var changed: bool = v != c.slider_vals[si];
+    c.slider_vals[si] = v;
+    return changed;
+}
+
+// The next row (from `from`, in `step` direction) of menu node `dn` that is an item, not a
+// separator; `from` itself when there is none.
+pub fun menu_step(c: ptr<Ctx>, dn: i32, from: i32, step: i32) -> i32 {
+    var n: ptr<Node> = &c.nodes[dn];
+    var k: i32 = from + step;
+    if (k < 1 && step > 0) { k = 1; }
+    while (k >= 1 && k < n.val) {
+        var r: array<i64, 2>;
+        r[0] = 0; r[1] = 0;
+        option_range(c, n, k, &r[0]);
+        if (!(r[1] == 1 && c.texts[r[0]] == 45)) { return k; }
+        k += step;
+    }
+    return from;
+}
+
+// The menu node `step` places after (or before) menu node `dn` in the tree, wrapping around.
+pub fun menu_neighbour(c: ptr<Ctx>, dn: i32, step: i32) -> i32 {
+    var k: i32 = dn + step;
+    var guard: i32 = 0;
+    while (guard <= c.nnodes) {
+        if (k >= c.nnodes) { k = 0; }
+        if (k < 0) { k = c.nnodes - 1; }
+        if (c.nodes[k].kind == K_DROPDOWN && c.nodes[k].menu) { return k; }
+        k += step;
+        guard += 1;
+    }
+    return dn;
+}
+
+// A key for a focused menu. Closed: Enter / Down open it. Open: Up / Down move the highlight over
+// the items, Enter picks (the message is ui_activated), Left / Right go to the neighbouring menu,
+// Escape closes.
+pub fun menu_key(c: ptr<Ctx>, dn: i32, key: i32) -> i32 {
+    var n: ptr<Node> = &c.nodes[dn];
+    if (c.dd_open != n.input_id) {
+        if (key == KEY_ENTER || key == KEY_DOWN) {
+            c.dd_open = n.input_id;
+            c.dd_cur = menu_step(c, dn, 0, 1);
+        }
+        return 0;
+    }
+    if (key == KEY_ESCAPE) { c.dd_open = NONE; return 0; }
+    if (key == KEY_DOWN) { c.dd_cur = menu_step(c, dn, c.dd_cur, 1); }
+    else if (key == KEY_UP) { c.dd_cur = menu_step(c, dn, c.dd_cur, -1); }
+    else if (key == KEY_HOME) { c.dd_cur = menu_step(c, dn, 0, 1); }
+    else if (key == KEY_END) { c.dd_cur = menu_step(c, dn, n.val, -1); }
+    else if (key == KEY_LEFT || key == KEY_RIGHT) {
+        var step: i32 = 1;
+        if (key == KEY_LEFT) { step = -1; }
+        var other: i32 = menu_neighbour(c, dn, step);
+        c.dd_open = c.nodes[other].input_id;
+        c.focus = c.nodes[other].input_id;
+        c.dd_cur = menu_step(c, other, 0, 1);
+    }
+    else if (key == KEY_ENTER) {
+        var msg: i32 = n.msg + c.dd_cur - 1;
+        c.dd_open = NONE;
+        c.activated = msg;
+        return INPUT_ACTIVATED;
+    }
+    return 0;
+}
+
+// A key for the focused drop-down. Closed: Up / Down / Home / End change the choice, Enter
+// (or Space) opens the list. Open: Up / Down / Home / End move the highlight, Enter picks it,
+// Escape closes the list.
+pub fun dropdown_key(c: ptr<Ctx>, key: i32) -> i32 {
+    var dn: i32 = dropdown_node(c, c.focus);
+    if (dn == NONE) { return 0; }
+    var n: ptr<Node> = &c.nodes[dn];
+    if (n.menu) { return menu_key(c, dn, key); }
+    var last: i32 = max_i32(n.val - 1, 0);
+    var cur: i32 = c.slider_vals[slider_slot(c, n.input_id, 0)];
+    if (c.dd_open == n.input_id) {
+        if (key == KEY_ESCAPE) { c.dd_open = NONE; return 0; }
+        if (key == KEY_ENTER) {
+            var picked: bool = dropdown_pick(c, dn, c.dd_cur);
+            c.dd_open = NONE;
+            if (picked) { return INPUT_CHANGED; }
+            return 0;
+        }
+        if (key == KEY_DOWN) { c.dd_cur = min_i32(c.dd_cur + 1, last); }
+        else if (key == KEY_UP) { c.dd_cur = max_i32(c.dd_cur - 1, 0); }
+        else if (key == KEY_HOME) { c.dd_cur = 0; }
+        else if (key == KEY_END) { c.dd_cur = last; }
+        return 0;
+    }
+    if (key == KEY_ENTER) {
+        c.dd_open = n.input_id;
+        c.dd_cur = cur;
+        return 0;
+    }
+    var target: i32 = cur;
+    if (key == KEY_DOWN) { target = cur + 1; }
+    else if (key == KEY_UP) { target = cur - 1; }
+    else if (key == KEY_HOME) { target = 0; }
+    else if (key == KEY_END) { target = last; }
+    else { return 0; }
+    if (dropdown_pick(c, dn, target)) { return INPUT_CHANGED; }
+    return 0;
+}
+
+pub fun core_dropdown_set(c: ptr<Ctx>, dropdown_id: i32, index: i32) {
+    core_slider_set(c, dropdown_id, index);
+}
+
+// The chosen option's number (0 when unknown).
+pub fun core_dropdown_get(c: ptr<Ctx>, dropdown_id: i32) -> i32 {
+    return core_slider_get(c, dropdown_id);
+}
+
+// The id of the drop-down whose list is open, or -1.
+pub fun core_dropdown_open(c: ptr<Ctx>) -> i32 {
+    if (c == null) { return NONE; }
+    return c.dd_open;
+}
+
+// The topmost node with a tooltip under the point, or NONE.
+pub fun tip_at(c: ptr<Ctx>, x: i32, y: i32) -> i32 {
+    var i: i32 = c.nnodes - 1;
+    while (i >= 0) {
+        var n: ptr<Node> = &c.nodes[i];
+        if (n.tip_len > 0 && !n.in_ov && contains(n, x, y) && !clipped(c, i, x, y)) { return i; }
+        i -= 1;
+    }
+    return NONE;
+}
+
+// Builds the tooltip of the node under the pointer as an overlay at the pointer. It exists
+// from the moment the pointer is on the node but is only painted after TIP_DELAY_MS.
+pub fun ensure_tip(c: ptr<Ctx>) {
+    var tn: i32 = tip_at(c, c.pointer_x, c.pointer_y);
+    if (tn != c.tip_node) {                            // the pointer came to another node (or left): start over
+        c.tip_node = tn;
+        c.tip_since = -1;
+        c.tip_blocked = false;
+    }
+    if (tn == NONE || c.tip_blocked || c.dd_open != NONE) { return; }
+    var ov: i32 = core_overlay(c, NONE, OVERLAY_AT, c.pointer_x + 10, c.pointer_y + 22);
+    var box: ptr<Node> = &c.nodes[ov];
+    box.tipbox = true;
+    box.padding = 5;
+    box.background = c.theme.text;
+    box.radius = c.theme.radius_field;
+    var t: i32 = new_node(c, ov, K_TEXT, false);
+    c.nodes[t].text_start = c.nodes[tn].tip_start;
+    c.nodes[t].text_len = c.nodes[tn].tip_len;
+    c.nodes[t].color = c.theme.field;
+}
+
+// Builds the list of the open drop-down as an overlay under it (once per frame).
+pub fun ensure_popup(c: ptr<Ctx>) {
+    if (c.dd_open == NONE) { return; }
+    var i: i32 = 0;
+    while (i < c.nnodes) {
+        if (c.nodes[i].overlay && c.nodes[i].popup) { return; }
+        i += 1;
+    }
+    var dn: i32 = dropdown_node(c, c.dd_open);
+    if (dn == NONE) {                                  // the drop-down is gone from the tree
+        c.dd_open = NONE;
+        return;
+    }
+    var gap: i32 = 2;
+    var first: i32 = 0;
+    if (c.nodes[dn].menu) { gap = 0; first = 1; }      // a menu's list hangs right under its label; line 0 is the label
+    var ov: i32 = core_overlay(c, dn, OVERLAY_BELOW + OVERLAY_MATCH_WIDTH, 0, gap);
+    var box: ptr<Node> = &c.nodes[ov];
+    box.popup = true;
+    box.padding = 3;
+    box.align = STRETCH;
+    box.background = c.theme.field;
+    box.border = c.theme.border;
+    box.radius = c.theme.radius_field;
+    var count: i32 = c.nodes[dn].val;
+    var k: i32 = first;
+    while (k < count) {
+        var range: array<i64, 2>;
+        range[0] = 0; range[1] = 0;
+        option_range(c, &c.nodes[dn], k, &range[0]);
+        var row: i32 = new_node(c, ov, K_OPTION, false);
+        var r: ptr<Node> = &c.nodes[row];
+        r.input_id = c.dd_open;
+        r.val = k;
+        r.text_start = range[0];
+        r.text_len = range[1];
+        r.sep = c.nodes[dn].menu && range[1] == 1 && c.texts[range[0]] == 45;     // "-" is a separator line
+        k += 1;
+    }
+}

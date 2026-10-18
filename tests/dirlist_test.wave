@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Tests of the directory listing and the path helpers (src/dirlist.wave): folders first, names
+// sorted without regard to case, "." and ".." left out, a missing directory, push / pop of paths.
+// The listing is read from a small tree this test creates under build/dirlist_data.
+// Run with:  WUI_TASK=wtest wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui::dirlist")::{DirList, dirlist_new, dirlist_free, dirlist_read, dirlist_count, dirlist_name, dirlist_is_dir,
+                         path_push, path_pop, path_cwd};
+import("std::fs::file")::{create_dir, write, fs_exists};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+
+fun same(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) { i += 1; }
+    return pa[i] == pb[i];
+}
+
+fun ok(what: str, cond: bool) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        println("FAIL {}", what);
+    }
+}
+
+fun is_str(what: str, got: str, want: str) {
+    CHECKS += 1;
+    if (!same(got, want)) {
+        FAILURES += 1;
+        println("FAIL {}: got '{}' want '{}'", what, got, want);
+    }
+}
+
+fun touch(path: str) {
+    var data: ptr<u8> = mem_alloc(1);
+    data[0] = 120;
+    write(path, data, 1);
+    mem_free(data, 1);
+}
+
+fun test_listing() {
+    create_dir("build");
+    create_dir("build/dirlist_data");
+    create_dir("build/dirlist_data/sub");
+    create_dir("build/dirlist_data/Archive");
+    touch("build/dirlist_data/banana.txt");
+    touch("build/dirlist_data/Apple.txt");
+    touch("build/dirlist_data/cherry.txt");
+    touch("build/dirlist_data/한글.txt");
+    var l: DirList = dirlist_new();
+    ok("the directory can be read", dirlist_read(&l, "build/dirlist_data"));
+    ok("six entries, no . or ..", dirlist_count(&l) == 6);
+    is_str("folders first, by name (case ignored)", dirlist_name(&l, 0), "Archive");
+    is_str("second folder", dirlist_name(&l, 1), "sub");
+    is_str("then files by name", dirlist_name(&l, 2), "Apple.txt");
+    is_str("case does not matter", dirlist_name(&l, 3), "banana.txt");
+    is_str("cherry", dirlist_name(&l, 4), "cherry.txt");
+    is_str("non-ASCII names come after ASCII", dirlist_name(&l, 5), "한글.txt");
+    ok("a folder is a folder", dirlist_is_dir(&l, 0) && dirlist_is_dir(&l, 1));
+    ok("a file is not", !dirlist_is_dir(&l, 2) && !dirlist_is_dir(&l, 5));
+    is_str("a bad index is empty", dirlist_name(&l, 99), "");
+    ok("and no folder", !dirlist_is_dir(&l, -1));
+    ok("a missing directory cannot be read", !dirlist_read(&l, "build/dirlist_data/nope"));
+    ok("and leaves the list empty", dirlist_count(&l) == 0);
+    ok("a file is not a directory", !dirlist_read(&l, "build/dirlist_data/Apple.txt"));
+    ok("it can be read again after a failure", dirlist_read(&l, "build/dirlist_data/sub") && dirlist_count(&l) == 0);
+    // enough entries to grow the buffers
+    create_dir("build/dirlist_many");
+    var name: ptr<u8> = mem_alloc(64);
+    var i: i32 = 0;
+    while (i < 150) {
+        var p: str = "build/dirlist_many/file_";
+        var pp: ptr<u8> = p as ptr<u8>;
+        var k: i32 = 0;
+        while (pp[k] != 0) { name[k] = pp[k]; k += 1; }
+        name[k] = (48 + i / 100) as u8;
+        name[k + 1] = (48 + (i / 10) % 10) as u8;
+        name[k + 2] = (48 + i % 10) as u8;
+        name[k + 3] = 0;
+        touch(name as str);
+        i += 1;
+    }
+    mem_free(name, 64);
+    ok("150 entries", dirlist_read(&l, "build/dirlist_many") && dirlist_count(&l) == 150);
+    is_str("the first", dirlist_name(&l, 0), "file_000");
+    is_str("the last", dirlist_name(&l, 149), "file_149");
+    dirlist_free(&l);
+}
+
+fun test_paths() {
+    var buf: ptr<u8> = mem_alloc(32);
+    buf[0] = 47; buf[1] = 97; buf[2] = 0;
+    ok("push", path_push(buf, 32, "b"));
+    is_str("adds a slash", buf as str, "/a/b");
+    path_pop(buf);
+    is_str("pop", buf as str, "/a");
+    path_pop(buf);
+    is_str("pop to the root", buf as str, "/");
+    path_pop(buf);
+    is_str("the root stays", buf as str, "/");
+    ok("push on the root", path_push(buf, 32, "usr"));
+    is_str("no double slash", buf as str, "/usr");
+    ok("a name that does not fit is refused", !path_push(buf, 8, "very_long_name"));
+    is_str("and nothing changed", buf as str, "/usr");
+    var rel: str = "docs";
+    var rp: ptr<u8> = rel as ptr<u8>;
+    var i: i32 = 0;
+    while (rp[i] != 0) { buf[i] = rp[i]; i += 1; }
+    buf[i] = 0;
+    path_pop(buf);
+    is_str("a relative path becomes .", buf as str, ".");
+    var win: str = "C:/Users/me";
+    var wp: ptr<u8> = win as ptr<u8>;
+    i = 0;
+    while (wp[i] != 0) { buf[i] = wp[i]; i += 1; }
+    buf[i] = 0;
+    path_pop(buf);
+    is_str("a Windows path", buf as str, "C:/Users");
+    path_pop(buf);
+    is_str("up to the drive", buf as str, "C:/");
+    mem_free(buf, 32);
+    var big: ptr<u8> = mem_alloc(1024);
+    ok("the current directory is found", path_cwd(big, 1024) && big[0] != 0);
+    mem_free(big, 1024);
+}
+
+fun main() {
+    test_listing();
+    test_paths();
+    if (FAILURES == 0) {
+        println("dirlist_test: {}/{} checks passed", CHECKS, CHECKS);
+    } else {
+        println("dirlist_test: {} FAILED of {}", FAILURES, CHECKS);
+    }
+}

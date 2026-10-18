@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The look of the built-in widgets: colours, corner radii, paddings and the
+// scrollbar's size. A Ui has one Theme (ui_theme / ui_set_theme in lib.wave);
+// theme_light and theme_dark fill one in, and every field can be changed after
+// that:
+//
+//   var t: Theme = ui_theme_copy(&ui);         // or start from theme_dark(&t)
+//   t.accent = 0xFF22C55E;                      // green focus rings and ticks
+//   t.radius_button = 10;                       // rounder buttons
+//   ui_set_theme(&ui, &t);
+//
+// Colours are 0xAARRGGBB, sizes are pixels. Styles set on a single node
+// (ui_background, ui_color, ui_radius, ...) still win over the theme.
+
+pub struct Theme {
+    // colours
+    bg: u32;                          // the window background
+    text: u32;                        // text, inherited down the tree
+    button: u32;                      // a button at rest, hovered and pressed
+    button_hover: u32;
+    button_down: u32;
+    border: u32;                      // outline of buttons, inputs and checkboxes
+    field: u32;                       // input and checkbox background
+    field_focus: u32;                 // focused input outline and the focus ring
+    placeholder: u32;                 // an empty, unfocused input's hint
+    selection: u32;                   // selected text
+    scroll_track: u32;                // scrollbars
+    scroll_thumb: u32;
+    accent: u32;                      // a ticked checkbox
+    check_mark: u32;                  // the tick itself
+    // shape
+    radius_button: i32;               // corner radii of the built-in widgets
+    radius_field: i32;
+    radius_check: i32;
+    button_pad_x: i32;                // space between a button's edge and its label
+    button_pad_y: i32;
+    field_pad_x: i32;                 // the same for an input
+    field_pad_y: i32;
+    field_width: i32;                 // natural width of an input
+    check_box: i32;                   // the checkbox square
+    check_gap: i32;                   // between the square and its label
+    scrollbar_w: i32;                 // scrollbar thickness
+    scrollbar_min: i32;               // shortest thumb
+    scrollbar_grab: i32;              // extra pixels beside a bar that still grab it
+    scroll_step: i32;                 // pixels per wheel notch / arrow key
+    caret_blink_ms: i32;              // the text caret is on for this long, then off (0: it never blinks)
+    progress_h: i32;                  // thickness of a progress bar
+    slider_thumb: i32;                // a slider's round handle (its height too)
+    slider_track: i32;                // thickness of the slider's groove
+    font_size: i32;                   // the default text size in px
+}
+
+// The default colours (the light theme), also used by the tests.
+pub const COLOR_BG: u32 = 0xFFF0F0F0;
+pub const COLOR_TEXT: u32 = 0xFF202020;
+pub const COLOR_BUTTON: u32 = 0xFFE1E1E1;
+pub const COLOR_BUTTON_HOVER: u32 = 0xFFD2E6FA;
+pub const COLOR_BUTTON_DOWN: u32 = 0xFFA8CBF5;
+pub const COLOR_BORDER: u32 = 0xFF808080;
+pub const COLOR_FIELD: u32 = 0xFFFFFFFF;
+pub const COLOR_FIELD_FOCUS: u32 = 0xFF3B82F6;
+pub const COLOR_PLACEHOLDER: u32 = 0xFF909090;
+pub const COLOR_SELECTION: u32 = 0xFFB4D5FE;
+pub const COLOR_SCROLL_TRACK: u32 = 0xFFE2E2E2;
+pub const COLOR_SCROLL_THUMB: u32 = 0xFFA8A8A8;
+pub const COLOR_ACCENT: u32 = 0xFF3B82F6;
+pub const COLOR_CHECK_MARK: u32 = 0xFFFFFFFF;
+pub const RADIUS_BUTTON: i32 = 4;
+pub const FIELD_PAD_X: i32 = 6;
+
+fun shape_defaults(t: ptr<Theme>) {
+    t.radius_button = RADIUS_BUTTON;
+    t.radius_field = 4;
+    t.radius_check = 3;
+    t.button_pad_x = 12;
+    t.button_pad_y = 6;
+    t.field_pad_x = FIELD_PAD_X;
+    t.field_pad_y = 5;
+    t.field_width = 200;
+    t.check_box = 16;
+    t.check_gap = 8;
+    t.scrollbar_w = 6;
+    t.scrollbar_min = 24;
+    t.scrollbar_grab = 4;
+    t.scroll_step = 40;
+    t.caret_blink_ms = 530;
+    t.progress_h = 10;
+    t.slider_thumb = 16;
+    t.slider_track = 4;
+    t.font_size = 16;
+}
+
+// Fills `t` with the light theme (the default).
+pub fun theme_light(t: ptr<Theme>) {
+    t.bg = COLOR_BG;
+    t.text = COLOR_TEXT;
+    t.button = COLOR_BUTTON;
+    t.button_hover = COLOR_BUTTON_HOVER;
+    t.button_down = COLOR_BUTTON_DOWN;
+    t.border = COLOR_BORDER;
+    t.field = COLOR_FIELD;
+    t.field_focus = COLOR_FIELD_FOCUS;
+    t.placeholder = COLOR_PLACEHOLDER;
+    t.selection = COLOR_SELECTION;
+    t.scroll_track = COLOR_SCROLL_TRACK;
+    t.scroll_thumb = COLOR_SCROLL_THUMB;
+    t.accent = COLOR_ACCENT;
+    t.check_mark = COLOR_CHECK_MARK;
+    shape_defaults(t);
+}
+
+// Fills `t` with a dark theme. Colours you set yourself on nodes (a white card,
+// say) are not touched by it.
+pub fun theme_dark(t: ptr<Theme>) {
+    t.bg = 0xFF1E1E1E;
+    t.text = 0xFFE6E6E6;
+    t.button = 0xFF3A3A3A;
+    t.button_hover = 0xFF454B55;
+    t.button_down = 0xFF2F4A6B;
+    t.border = 0xFF6B6B6B;
+    t.field = 0xFF2B2B2B;
+    t.field_focus = 0xFF60A5FA;
+    t.placeholder = 0xFF8A8A8A;
+    t.selection = 0xFF2F4F7F;
+    t.scroll_track = 0xFF2B2B2B;
+    t.scroll_thumb = 0xFF5A5A5A;
+    t.accent = 0xFF3B82F6;
+    t.check_mark = 0xFFFFFFFF;
+    shape_defaults(t);
+}
+
+fun scaled(v: i32, percent: i32) -> i32 {
+    return (((v as i64) * (percent as i64) + 50) / 100) as i32;
+}
+
+// Scales every pixel size of the theme - radii, paddings, the checkbox, scrollbars, sliders and the
+// text size - by `percent` (150 = one and a half times), for high-resolution screens (see
+// win_dpi_percent). Scale a fresh theme, not a scaled one. Sizes you set on single nodes
+// (ui_width, ui_padding, ...) are yours to scale.
+pub fun theme_scale(t: ptr<Theme>, percent: i32) {
+    t.radius_button = scaled(t.radius_button, percent);
+    t.radius_field = scaled(t.radius_field, percent);
+    t.radius_check = scaled(t.radius_check, percent);
+    t.button_pad_x = scaled(t.button_pad_x, percent);
+    t.button_pad_y = scaled(t.button_pad_y, percent);
+    t.field_pad_x = scaled(t.field_pad_x, percent);
+    t.field_pad_y = scaled(t.field_pad_y, percent);
+    t.field_width = scaled(t.field_width, percent);
+    t.check_box = scaled(t.check_box, percent);
+    t.check_gap = scaled(t.check_gap, percent);
+    t.scrollbar_w = scaled(t.scrollbar_w, percent);
+    t.scrollbar_min = scaled(t.scrollbar_min, percent);
+    t.scrollbar_grab = scaled(t.scrollbar_grab, percent);
+    t.scroll_step = scaled(t.scroll_step, percent);
+    t.progress_h = scaled(t.progress_h, percent);
+    t.slider_thumb = scaled(t.slider_thumb, percent);
+    t.slider_track = scaled(t.slider_track, percent);
+    t.font_size = scaled(t.font_size, percent);
+}
+

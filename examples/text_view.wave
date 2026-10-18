@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The view of the text style examples: text sizes, bold, and widgets that follow the size.
+
+import("wui")::{Ui, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_checkbox, ui_input, ui_layout, ui_align, ui_font_size,
+                ui_bold, ui_color, ui_gap, UI_ROOT, UI_STRETCH};
+
+pub const MSG_BIGGER: i32 = 1;
+pub const MSG_SMALLER: i32 = 2;
+
+// Builds the page; `percent` is the scale shown in the first line.
+pub fun text_view(ui: ptr<Ui>, percent_text: str, w: i32, h: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 16, 8);
+    ui_align(ui, page, UI_STRETCH);
+    var head: i32 = ui_text(ui, page, percent_text);
+    ui_bold(ui, head, true);
+    var row: i32 = ui_row(ui, page, 0, 8);
+    ui_button(ui, row, "Smaller", MSG_SMALLER);
+    ui_button(ui, row, "Bigger", MSG_BIGGER);
+    var t12: i32 = ui_text(ui, page, "12 px: The quick brown fox");
+    ui_font_size(ui, t12, 12);
+    ui_text(ui, page, "16 px (default): 빠른 갈색 여우가");
+    var t24: i32 = ui_text(ui, page, "24 px 큰 글자");
+    ui_font_size(ui, t24, 24);
+    var t32: i32 = ui_text(ui, page, "32 px");
+    ui_font_size(ui, t32, 32);
+    var b16: i32 = ui_text(ui, page, "Bold text / 굵은 글씨");
+    ui_bold(ui, b16, true);
+    var b24: i32 = ui_text(ui, page, "Bold 24 px");
+    ui_bold(ui, b24, true);
+    ui_font_size(ui, b24, 24);
+    // a group: everything inside follows its size
+    var group: i32 = ui_column(ui, page, 0, 6);
+    ui_font_size(ui, group, 20);
+    ui_text(ui, group, "A 20 px group:");
+    ui_checkbox(ui, group, "a checkbox", true, 10);
+    ui_input(ui, group, 1, "an input");
+    ui_layout(ui, w, h);
+}

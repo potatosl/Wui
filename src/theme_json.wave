@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Themes as JSON files, with wjson (third_party/wjson, the JSON library for Wave).
+// This module is optional: lib.wave does not import it, so a program only needs
+// wjson when it imports "wui::theme_json" (build with --dep=wjson=<path>).
+//
+//   {
+//     "base": "dark",                  // start from "light" (default) or "dark"
+//     "accent": "#22C55E",             // colours: "#RRGGBB" or "#AARRGGBB" (or a number)
+//     "button": "#2B3340",
+//     "radius_button": 10              // sizes: numbers of pixels
+//   }
+//
+// Every field of Theme (theme.wave) can appear under its own name; the ones that
+// are missing keep the value of the base theme.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("wjson")::{JsonDoc, Json, JsonWriter, JSON_STRICT, json_parse_bytes, json_ok, json_root, json_get, json_is_object,
+                  json_is_string, json_is_number, json_as_str, json_i64_or, json_str_or, json_free, json_writer_new,
+                  json_writer_free, json_writer_finish, json_begin_object, json_end_object, json_field_str,
+                  json_field_i64, json_str_is_null};
+import("./theme")::{Theme, theme_light, theme_dark};
+import("./wjson_glue");                    // the one C symbol wjson wants (no C++ layer needed)
+
+fun hex_digit(c: u8) -> i32 {
+    if (c >= 48 && c <= 57) { return (c - 48) as i32; }
+    if (c >= 65 && c <= 70) { return (c - 55) as i32; }
+    if (c >= 97 && c <= 102) { return (c - 87) as i32; }
+    return -1;
+}
+
+// "#RRGGBB" (opaque) or "#AARRGGBB" -> 0xAARRGGBB. False when it is neither.
+pub fun theme_parse_color(text: str, result: ptr<u32>) -> bool {
+    var p: ptr<u8> = text as ptr<u8>;
+    if (p[0] != 35) { return false; }
+    var n: i32 = 0;
+    var v: u32 = 0;
+    while (p[1 + n] != 0) {
+        var d: i32 = hex_digit(p[1 + n]);
+        if (d < 0 || n >= 8) { return false; }
+        v = (v << 4) | (d as u32);
+        n += 1;
+    }
+    if (n == 6) { result[0] = 0xFF000000 | v; return true; }
+    if (n == 8) { result[0] = v; return true; }
+    return false;
+}
+
+// The colour at `key`: a "#..." string or a number; `cur` when it is missing or malformed.
+fun color_of(obj: Json, key: str, cur: u32) -> u32 {
+    var v: Json = json_get(obj, key);
+    if (json_is_string(v)) {
+        var parsed: array<u32, 1>;
+        parsed[0] = cur;
+        if (theme_parse_color(json_as_str(v), &parsed[0])) { return parsed[0]; }
+        return cur;
+    }
+    if (json_is_number(v)) { return json_i64_or(v, cur as i64) as u32; }
+    return cur;
+}
+
+fun size_of_key(obj: Json, key: str, cur: i32) -> i32 {
+    return json_i64_or(json_get(obj, key), cur as i64) as i32;
+}
+
+fun same_text(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) { i += 1; }
+    return pa[i] == pb[i];
+}
+
+// Reads a theme from JSON text into `t`: starts from the "base" theme (light
+// unless it says "dark") and overrides the fields the object has. Returns false
+// (leaving `t` as it was) when the text is not a JSON object.
+pub fun theme_from_json(t: ptr<Theme>, text: ptr<u8>, len: i64) -> bool {
+    var doc: JsonDoc = json_parse_bytes(text, len, 16, JSON_STRICT);
+    if (!json_ok(doc)) {
+        json_free(&doc);
+        return false;
+    }
+    var obj: Json = json_root(doc);
+    if (!json_is_object(obj)) {
+        json_free(&doc);
+        return false;
+    }
+    if (same_text(json_str_or(json_get(obj, "base"), "light"), "dark")) { theme_dark(t); } else { theme_light(t); }
+    t.bg = color_of(obj, "bg", t.bg);
+    t.text = color_of(obj, "text", t.text);
+    t.button = color_of(obj, "button", t.button);
+    t.button_hover = color_of(obj, "button_hover", t.button_hover);
+    t.button_down = color_of(obj, "button_down", t.button_down);
+    t.border = color_of(obj, "border", t.border);
+    t.field = color_of(obj, "field", t.field);
+    t.field_focus = color_of(obj, "field_focus", t.field_focus);
+    t.placeholder = color_of(obj, "placeholder", t.placeholder);
+    t.selection = color_of(obj, "selection", t.selection);
+    t.scroll_track = color_of(obj, "scroll_track", t.scroll_track);
+    t.scroll_thumb = color_of(obj, "scroll_thumb", t.scroll_thumb);
+    t.accent = color_of(obj, "accent", t.accent);
+    t.check_mark = color_of(obj, "check_mark", t.check_mark);
+    t.radius_button = size_of_key(obj, "radius_button", t.radius_button);
+    t.radius_field = size_of_key(obj, "radius_field", t.radius_field);
+    t.radius_check = size_of_key(obj, "radius_check", t.radius_check);
+    t.button_pad_x = size_of_key(obj, "button_pad_x", t.button_pad_x);
+    t.button_pad_y = size_of_key(obj, "button_pad_y", t.button_pad_y);
+    t.field_pad_x = size_of_key(obj, "field_pad_x", t.field_pad_x);
+    t.field_pad_y = size_of_key(obj, "field_pad_y", t.field_pad_y);
+    t.field_width = size_of_key(obj, "field_width", t.field_width);
+    t.check_box = size_of_key(obj, "check_box", t.check_box);
+    t.check_gap = size_of_key(obj, "check_gap", t.check_gap);
+    t.scrollbar_w = size_of_key(obj, "scrollbar_w", t.scrollbar_w);
+    t.scrollbar_min = size_of_key(obj, "scrollbar_min", t.scrollbar_min);
+    t.scrollbar_grab = size_of_key(obj, "scrollbar_grab", t.scrollbar_grab);
+    t.scroll_step = size_of_key(obj, "scroll_step", t.scroll_step);
+    t.caret_blink_ms = size_of_key(obj, "caret_blink_ms", t.caret_blink_ms);
+    t.progress_h = size_of_key(obj, "progress_h", t.progress_h);
+    t.slider_thumb = size_of_key(obj, "slider_thumb", t.slider_thumb);
+    t.slider_track = size_of_key(obj, "slider_track", t.slider_track);
+    t.font_size = size_of_key(obj, "font_size", t.font_size);
+    json_free(&doc);
+    return true;
+}
+
+// Writes "#AARRGGBB" into buf[0..10] (NUL-terminated).
+fun put_color(buf: ptr<u8>, v: u32) {
+    buf[0] = 35;
+    var i: i32 = 0;
+    while (i < 8) {
+        var shift: u32 = ((7 - i) * 4) as u32;
+        var d: u32 = (v >> shift) & 15;
+        var ch: u32 = 48 + d;
+        if (d >= 10) { ch = 55 + d; }
+        buf[1 + i] = ch as u8;
+        i += 1;
+    }
+    buf[9] = 0;
+}
+
+fun field_color(w: ptr<JsonWriter>, key: str, v: u32) {
+    var buf: ptr<u8> = mem_alloc(10);
+    put_color(buf, v);
+    json_field_str(w, key, buf as str);
+    mem_free(buf, 10);
+}
+
+// Writes the whole theme as JSON (indented by 2) into buf (NUL-terminated).
+// Returns its length in bytes, or -1 when `cap` is too small.
+pub fun theme_to_json(t: ptr<Theme>, buf: ptr<u8>, cap: i64) -> i64 {
+    var w: JsonWriter = json_writer_new(2);
+    json_begin_object(&w);
+    field_color(&w, "bg", t.bg);
+    field_color(&w, "text", t.text);
+    field_color(&w, "button", t.button);
+    field_color(&w, "button_hover", t.button_hover);
+    field_color(&w, "button_down", t.button_down);
+    field_color(&w, "border", t.border);
+    field_color(&w, "field", t.field);
+    field_color(&w, "field_focus", t.field_focus);
+    field_color(&w, "placeholder", t.placeholder);
+    field_color(&w, "selection", t.selection);
+    field_color(&w, "scroll_track", t.scroll_track);
+    field_color(&w, "scroll_thumb", t.scroll_thumb);
+    field_color(&w, "accent", t.accent);
+    field_color(&w, "check_mark", t.check_mark);
+    json_field_i64(&w, "radius_button", t.radius_button as i64);
+    json_field_i64(&w, "radius_field", t.radius_field as i64);
+    json_field_i64(&w, "radius_check", t.radius_check as i64);
+    json_field_i64(&w, "button_pad_x", t.button_pad_x as i64);
+    json_field_i64(&w, "button_pad_y", t.button_pad_y as i64);
+    json_field_i64(&w, "field_pad_x", t.field_pad_x as i64);
+    json_field_i64(&w, "field_pad_y", t.field_pad_y as i64);
+    json_field_i64(&w, "field_width", t.field_width as i64);
+    json_field_i64(&w, "check_box", t.check_box as i64);
+    json_field_i64(&w, "check_gap", t.check_gap as i64);
+    json_field_i64(&w, "scrollbar_w", t.scrollbar_w as i64);
+    json_field_i64(&w, "scrollbar_min", t.scrollbar_min as i64);
+    json_field_i64(&w, "scrollbar_grab", t.scrollbar_grab as i64);
+    json_field_i64(&w, "scroll_step", t.scroll_step as i64);
+    json_field_i64(&w, "caret_blink_ms", t.caret_blink_ms as i64);
+    json_field_i64(&w, "progress_h", t.progress_h as i64);
+    json_field_i64(&w, "slider_thumb", t.slider_thumb as i64);
+    json_field_i64(&w, "slider_track", t.slider_track as i64);
+    json_field_i64(&w, "font_size", t.font_size as i64);
+    json_end_object(&w);
+    var text: str = json_writer_finish(&w);
+    var n: i64 = -1;
+    if (!json_str_is_null(text)) {
+        var p: ptr<u8> = text as ptr<u8>;
+        var len: i64 = 0;
+        while (p[len] != 0) { len += 1; }
+        if (len + 1 <= cap) {
+            var i: i64 = 0;
+            while (i <= len) { buf[i] = p[i]; i += 1; }
+            n = len;
+        }
+    }
+    json_writer_free(&w);
+    return n;
+}

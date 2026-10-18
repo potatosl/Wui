@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The view of the menu example (examples/menus.wave and its headless render): a menu bar
+// with three menus, and two buttons with tooltips.
+
+import("wui")::{Ui, ui_clear, ui_column, ui_row, ui_text, ui_button, ui_menu_bar, ui_menu, ui_tooltip, ui_layout, ui_align,
+                ui_background, UI_ROOT, UI_STRETCH};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+pub const MSG_FILE: i32 = 100;         // + item number: 0 New, 1 Open, 2 (separator), 3 Quit
+pub const MSG_EDIT: i32 = 200;         // + 0 Copy, 1 Paste
+pub const MSG_HELP: i32 = 300;         // + 0 About
+pub const MSG_SAVE: i32 = 1;
+pub const MSG_RUN: i32 = 2;
+pub const MSG_QUIT: i32 = 103;         // File > Quit
+
+pub const ID_FILE: i32 = 1;
+pub const ID_EDIT: i32 = 2;
+pub const ID_HELP: i32 = 3;
+
+pub struct Model {
+    last: i32;                         // the last message picked, 0 = none yet
+}
+
+fun put_num(buf: ptr<u8>, at: i32, v: i32) -> i32 {
+    if (v >= 10) {
+        var m: i32 = put_num(buf, at, v / 10);
+        buf[m] = (48 + v % 10) as u8;
+        return m + 1;
+    }
+    buf[at] = (48 + v) as u8;
+    return at + 1;
+}
+
+pub fun menus_view(ui: ptr<Ui>, m: ptr<Model>, w: i32, h: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 0, 0);
+    ui_align(ui, page, UI_STRETCH);
+    var bar: i32 = ui_menu_bar(ui, page);
+    ui_menu(ui, bar, ID_FILE, "File\nNew\nOpen\n-\nQuit", MSG_FILE);
+    ui_menu(ui, bar, ID_EDIT, "Edit\nCopy\nPaste", MSG_EDIT);
+    ui_menu(ui, bar, ID_HELP, "Help\nAbout", MSG_HELP);
+    var body: i32 = ui_column(ui, page, 16, 12);
+    ui_text(ui, body, "menus and tooltips / 메뉴와 툴팁");
+    var row: i32 = ui_row(ui, body, 0, 8);
+    var save: i32 = ui_button(ui, row, "Save", MSG_SAVE);
+    ui_tooltip(ui, save, "Writes the file (Ctrl+S)");
+    var run: i32 = ui_button(ui, row, "Run", MSG_RUN);
+    ui_tooltip(ui, run, "Builds and starts it");
+    var buf: ptr<u8> = mem_alloc(32);
+    var at: i32 = 0;
+    var head: str = "picked message: ";
+    var hp: ptr<u8> = head as ptr<u8>;
+    while (hp[at] != 0) { buf[at] = hp[at]; at += 1; }
+    at = put_num(buf, at, m.last);
+    buf[at] = 0;
+    ui_text(ui, body, buf as str);
+    mem_free(buf, 32);
+    ui_layout(ui, w, h);
+}

@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The view of the lists example (examples/lists.wave and its headless render): a tree whose
+// nodes open and close, and a table with a header, zebra rows and a scroll box.
+
+import("wui")::{Ui, ui_clear, ui_column, ui_text, ui_scroll_box, ui_tree_item, ui_table_row, ui_cell, ui_cell_button, ui_layout,
+                ui_align, ui_grow, ui_gap, ui_padding, ui_background, ui_border, ui_height,
+                UI_ROOT, UI_STRETCH, UI_LEAF, UI_COLLAPSED, UI_EXPANDED, UI_NO_MSG};
+
+pub const MSG_TOGGLE: i32 = 10;        // + 0 src, + 1 docs
+pub const MSG_PICK: i32 = 20;          // + tree node number
+pub const MSG_ROW: i32 = 40;           // + table row number
+pub const ID_ROWS: i32 = 1;            // scroll id of the table
+
+pub struct Model {
+    src_open: bool;
+    docs_open: bool;
+    picked: i32;                       // the selected tree node, -1 none
+}
+
+fun row_name(i: i32) -> str {
+    if (i == 0) { return "core.wave"; }
+    if (i == 1) { return "render.wave"; }
+    if (i == 2) { return "a_rather_long_file_name.wave"; }
+    if (i == 3) { return "theme.wave"; }
+    if (i == 4) { return "font.wave"; }
+    if (i == 5) { return "lib.wave"; }
+    if (i == 6) { return "gfx.wave"; }
+    return "unicode.wave";
+}
+
+fun row_size(i: i32) -> str {
+    if (i % 3 == 0) { return "120 KB"; }
+    if (i % 3 == 1) { return "34 KB"; }
+    return "8 KB";
+}
+
+pub fun lists_view(ui: ptr<Ui>, m: ptr<Model>, w: i32, h: i32) {
+    ui_clear(ui);
+    var page: i32 = ui_column(ui, UI_ROOT, 16, 10);
+    ui_align(ui, page, UI_STRETCH);
+    ui_text(ui, page, "a tree / 트리");
+    var tree: i32 = ui_column(ui, page, 0, 0);
+    var st: i32 = UI_COLLAPSED;
+    if (m.src_open) { st = UI_EXPANDED; }
+    ui_tree_item(ui, tree, 0, "src", st, m.picked == 0, MSG_TOGGLE, MSG_PICK);
+    if (m.src_open) {
+        ui_tree_item(ui, tree, 1, "core.wave", UI_LEAF, m.picked == 1, UI_NO_MSG, MSG_PICK + 1);
+        ui_tree_item(ui, tree, 1, "lib.wave", UI_LEAF, m.picked == 2, UI_NO_MSG, MSG_PICK + 2);
+    }
+    st = UI_COLLAPSED;
+    if (m.docs_open) { st = UI_EXPANDED; }
+    ui_tree_item(ui, tree, 0, "docs", st, m.picked == 3, MSG_TOGGLE + 1, MSG_PICK + 3);
+    if (m.docs_open) { ui_tree_item(ui, tree, 1, "API.md", UI_LEAF, m.picked == 4, UI_NO_MSG, MSG_PICK + 4); }
+    ui_tree_item(ui, tree, 0, "README.md", UI_LEAF, m.picked == 5, UI_NO_MSG, MSG_PICK + 5);
+
+    ui_text(ui, page, "a table / 테이블");
+    var head: i32 = ui_table_row(ui, page, -1);
+    ui_cell(ui, head, "Name", 160);
+    ui_cell(ui, head, "Size", 70);
+    ui_cell(ui, head, "Kind", 90);
+    var body: i32 = ui_scroll_box(ui, page, ID_ROWS);
+    ui_grow(ui, body, 1);
+    ui_align(ui, body, UI_STRETCH);
+    ui_border(ui, body, 0xFFC8C8C8);
+    var i: i32 = 0;
+    while (i < 8) {
+        var r: i32 = ui_table_row(ui, body, i);
+        ui_cell_button(ui, r, row_name(i), 160, MSG_ROW + i);
+        ui_cell(ui, r, row_size(i), 70);
+        ui_cell(ui, r, "Wave", 90);
+        i += 1;
+    }
+    ui_layout(ui, w, h);
+}

@@ -1,0 +1,9 @@
+# build output
+/build/
+/dist/
+target/
+*.o
+*.a
+*.lib
+*.ppm
+*.png

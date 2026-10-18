@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Multi-line text areas: lines, vertical caret movement and the text area's keys.
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./field")::{char_len, field_insert, field_move_to};
+import("./pick")::{input_node};
+import("./types")::{Ctx, Field, INPUT_CHANGED, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_PAGE_DOWN,
+    KEY_PAGE_UP, KEY_UP, K_TEXTAREA, MOD_CTRL, MOD_SHIFT, NONE, Node, abs_i32, max_i32, text_height, text_width};
+
+//
+// A text area edits the same Field as an input; its lines are the pieces between newlines
+// (there is no wrapping: a long line scrolls sideways, as in an input).
+// Start of the line that contains byte offset `pos`.
+pub fun line_start_of(f: ptr<Field>, pos: i64) -> i64 {
+    var i: i64 = pos;
+    while (i > 0 && f.text[i - 1] != 10) { i -= 1; }
+    return i;
+}
+
+// End (the newline, or the end of the text) of the line that contains `pos`.
+pub fun line_end_of(f: ptr<Field>, pos: i64) -> i64 {
+    var i: i64 = pos;
+    while (i < f.len && f.text[i] != 10) { i += 1; }
+    return i;
+}
+
+pub fun line_count(f: ptr<Field>) -> i32 {
+    var k: i32 = 1;
+    var i: i64 = 0;
+    while (i < f.len) { if (f.text[i] == 10) { k += 1; } i += 1; }
+    return k;
+}
+
+// The number (from 0) of the line that holds byte offset `pos`.
+pub fun line_of(f: ptr<Field>, pos: i64) -> i32 {
+    var k: i32 = 0;
+    var i: i64 = 0;
+    while (i < pos && i < f.len) { if (f.text[i] == 10) { k += 1; } i += 1; }
+    return k;
+}
+
+// Start of line number `line` (the last line when there are fewer).
+pub fun line_start_index(f: ptr<Field>, line: i32) -> i64 {
+    var s: i64 = 0;
+    var k: i32 = 0;
+    while (k < line) {
+        var e: i64 = line_end_of(f, s);
+        if (e >= f.len) { return s; }
+        s = e + 1;
+        k += 1;
+    }
+    return s;
+}
+
+// The byte offset a press at (x, y) means in the field of node `n`.
+pub fun field_pos_at(c: ptr<Ctx>, n: ptr<Node>, f: ptr<Field>, x: i32, y: i32) -> i64 {
+    c.cur_size = n.eff_size;
+    var px: i32 = x - (n.x + c.theme.field_pad_x) + f.scroll;
+    if (n.kind != K_TEXTAREA) { return cursor_at(c, f.text, f.len, px); }
+    var line: i32 = (y - (n.y + c.theme.field_pad_y) + f.scroll_y) / text_height(c);
+    if (y < n.y + c.theme.field_pad_y - f.scroll_y) { line = 0; }
+    if (line < 0) { line = 0; }
+    var s: i64 = line_start_index(f, line);
+    var e: i64 = line_end_of(f, s);
+    return s + cursor_at(c, &f.text[s], e - s, px);
+}
+
+// Moves the caret one line up (dir < 0) or down, keeping its column; with `extend` the selection grows.
+pub fun textarea_vmove(c: ptr<Ctx>, f: ptr<Field>, dir: i32, extend: bool) {
+    var ls: i64 = line_start_of(f, f.cursor);
+    var x: i32 = f.want_x;
+    if (x < 0) { x = text_width(c, &f.text[ls], f.cursor - ls); }
+    var pos: i64 = f.cursor;
+    if (dir < 0) {
+        if (ls == 0) { pos = 0; }
+        else {
+            var pe: i64 = ls - 1;
+            var ps: i64 = line_start_of(f, pe);
+            pos = ps + cursor_at(c, &f.text[ps], pe - ps, x);
+        }
+    } else {
+        var e: i64 = line_end_of(f, f.cursor);
+        if (e >= f.len) { pos = f.len; }
+        else {
+            var ns: i64 = e + 1;
+            var ne: i64 = line_end_of(f, ns);
+            pos = ns + cursor_at(c, &f.text[ns], ne - ns, x);
+        }
+    }
+    field_move_to(f, pos, extend);
+    f.want_x = x;
+}
+
+// Keys that mean something else in a text area than in an input; -1 when it is not one of them.
+pub fun textarea_key(c: ptr<Ctx>, f: ptr<Field>, key: i32, mods: i32) -> i32 {
+    var shift: bool = (mods & MOD_SHIFT) != 0;
+    var ctrl: bool = (mods & MOD_CTRL) != 0;
+    if (key == KEY_ENTER) {
+        if (ctrl) { return -1; }                               // Ctrl+Enter submits, like Enter in an input
+        var nl: ptr<u8> = mem_alloc(1);
+        nl[0] = 10;
+        var ok: bool = field_insert(f, nl, 1, true);
+        mem_free(nl, 1);
+        if (ok) { return INPUT_CHANGED; }
+        return 0;
+    }
+    if (key == KEY_UP) { textarea_vmove(c, f, -1, shift); return 0; }
+    if (key == KEY_DOWN) { textarea_vmove(c, f, 1, shift); return 0; }
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        var ni: i32 = input_node(c, c.focus);
+        var rows: i32 = 5;
+        if (ni != NONE) { rows = max_i32(c.nodes[ni].val - 1, 1); }
+        var dir: i32 = 1;
+        if (key == KEY_PAGE_UP) { dir = -1; }
+        var k: i32 = 0;
+        while (k < rows) { textarea_vmove(c, f, dir, shift); k += 1; }
+        return 0;
+    }
+    if (key == KEY_HOME) {
+        var to: i64 = line_start_of(f, f.cursor);
+        if (ctrl) { to = 0; }
+        field_move_to(f, to, shift);
+        f.want_x = -1;
+        return 0;
+    }
+    if (key == KEY_END) {
+        var to: i64 = line_end_of(f, f.cursor);
+        if (ctrl) { to = f.len; }
+        field_move_to(f, to, shift);
+        f.want_x = -1;
+        return 0;
+    }
+    return -1;
+}
+
+// Byte offset in text[0..len] whose caret position is nearest to pixel `px`.
+pub fun cursor_at(c: ptr<Ctx>, text: ptr<u8>, len: i64, px: i32) -> i64 {
+    var best: i64 = 0;
+    var best_d: i32 = 2147483647;
+    var i: i64 = 0;
+    while (i <= len) {
+        var d: i32 = abs_i32(text_width(c, text, i) - px);
+        if (d < best_d) { best = i; best_d = d; }
+        if (i < len) { i += char_len(text[i]); } else { i += 1; }
+    }
+    return best;
+}

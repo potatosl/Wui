@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Tests of src/theme_json.wave: themes read from and written to JSON with wjson.
+// Run with:  WUI_TASK=wtest wavec --std-root=$HOME/.wave/bin/std run build.wave
+
+import("wui::theme")::{Theme, theme_light, theme_dark};
+import("wui::theme_json")::{theme_from_json, theme_to_json, theme_parse_color};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+struct T {
+    checks: i32;
+    failures: i32;
+}
+
+fun eq(t: ptr<T>, what: str, got: i64, want: i64) {
+    t.checks += 1;
+    if (got != want) {
+        t.failures += 1;
+        println("FAIL {}: got {} want {}", what, got, want);
+    }
+}
+
+fun slen(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) { n += 1; }
+    return n;
+}
+
+fun blank() -> Theme {
+    return Theme { bg: 0, text: 0, button: 0, button_hover: 0, button_down: 0, border: 0, field: 0, field_focus: 0,
+                   placeholder: 0, selection: 0, scroll_track: 0, scroll_thumb: 0, accent: 0, check_mark: 0,
+                   radius_button: 0, radius_field: 0, radius_check: 0, button_pad_x: 0, button_pad_y: 0,
+                   field_pad_x: 0, field_pad_y: 0, field_width: 0, check_box: 0, check_gap: 0, scrollbar_w: 0,
+                   scrollbar_min: 0, scrollbar_grab: 0, scroll_step: 0, caret_blink_ms: 0, progress_h: 0, slider_thumb: 0, slider_track: 0, font_size: 0 };
+}
+
+fun parse(t: ptr<T>, th: ptr<Theme>, text: str) -> bool {
+    return theme_from_json(th, text as ptr<u8>, slen(text));
+}
+
+fun main() {
+    var t: T = T { checks: 0, failures: 0 };
+
+    // colours
+    var c: array<u32, 1>;
+    c[0] = 0;
+    eq(&t, "#RRGGBB is opaque", theme_parse_color("#22C55E", &c[0]) as i64, 1);
+    eq(&t, "  value", c[0] as i64, 0xFF22C55E);
+    eq(&t, "#AARRGGBB keeps its alpha", theme_parse_color("#80FF0000", &c[0]) as i64, 1);
+    eq(&t, "  value", c[0] as i64, 0x80FF0000);
+    eq(&t, "lower case digits", theme_parse_color("#abcdef", &c[0]) as i64, 1);
+    eq(&t, "  value", c[0] as i64, 0xFFABCDEF);
+    eq(&t, "no #", theme_parse_color("22C55E", &c[0]) as i64, 0);
+    eq(&t, "too short", theme_parse_color("#22C5", &c[0]) as i64, 0);
+    eq(&t, "not hex", theme_parse_color("#22C5ZZ", &c[0]) as i64, 0);
+
+    // a partial theme on the light base
+    var th: Theme = blank();
+    eq(&t, "parses", parse(&t, &th, "{\"accent\": \"#22C55E\", \"radius_button\": 10, \"button\": 4278190335}") as i64, 1);
+    var light: Theme = blank();
+    theme_light(&light);
+    eq(&t, "accent overridden", th.accent as i64, 0xFF22C55E);
+    eq(&t, "radius overridden", th.radius_button as i64, 10);
+    eq(&t, "a numeric colour", th.button as i64, 0xFF0000FF);
+    eq(&t, "the rest is the light theme", th.bg as i64, light.bg as i64);
+    eq(&t, "(sizes too)", th.scroll_step as i64, light.scroll_step as i64);
+
+    // the dark base, with one override
+    var dk: Theme = blank();
+    eq(&t, "dark base", parse(&t, &dk, "{\"base\": \"dark\", \"accent\": \"#FF8800\"}") as i64, 1);
+    var dark: Theme = blank();
+    theme_dark(&dark);
+    eq(&t, "dark background", dk.bg as i64, dark.bg as i64);
+    eq(&t, "accent on dark", dk.accent as i64, 0xFFFF8800);
+
+    // malformed input leaves the theme alone
+    var keep: Theme = blank();
+    theme_light(&keep);
+    keep.accent = 0xFF123456;
+    eq(&t, "not JSON", parse(&t, &keep, "{oops") as i64, 0);
+    eq(&t, "not an object", parse(&t, &keep, "[1, 2]") as i64, 0);
+    eq(&t, "untouched on failure", keep.accent as i64, 0xFF123456);
+    var odd: Theme = blank();
+    eq(&t, "a bad colour keeps the base value", parse(&t, &odd, "{\"accent\": \"nonsense\", \"bg\": true}") as i64, 1);
+    eq(&t, "accent stays", odd.accent as i64, light.accent as i64);
+    eq(&t, "bg stays", odd.bg as i64, light.bg as i64);
+
+    // writing and reading it back
+    var src: Theme = blank();
+    theme_dark(&src);
+    src.accent = 0xFF22C55E;
+    src.radius_field = 9;
+    src.scroll_step = 25;
+    var buf: ptr<u8> = mem_alloc(4096);
+    var n: i64 = theme_to_json(&src, buf, 4096);
+    eq(&t, "written", (n > 100) as i64, 1);
+    var back: Theme = blank();
+    eq(&t, "reads back", theme_from_json(&back, buf, n) as i64, 1);
+    eq(&t, "accent", back.accent as i64, src.accent as i64);
+    eq(&t, "button hover", back.button_hover as i64, src.button_hover as i64);
+    eq(&t, "radius", back.radius_field as i64, 9);
+    eq(&t, "scroll step", back.scroll_step as i64, 25);
+    eq(&t, "bg", back.bg as i64, src.bg as i64);
+    eq(&t, "a buffer that is too small", theme_to_json(&src, buf, 20), -1);
+    mem_free(buf, 4096);
+
+    println("theme_json_test: {}/{} checks passed", t.checks - t.failures, t.checks);
+    if (t.failures != 0) { println("theme_json_test: {} FAILED", t.failures); }
+}
